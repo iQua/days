@@ -108,6 +108,12 @@ const PARAM_PFC_OFFSET: usize = 31;
 /// Params word holding the RoCE receiver region offset in `tcp_state`, or `NONE` without queue-pair
 /// receivers (P15).
 const PARAM_ROCE_OFFSET: usize = 32;
+/// Params word holding the stage region offset in `tcp_state`, or `NONE` without stages (P16 G1).
+const PARAM_STAGE_OFFSET: usize = 33;
+/// Test hooks only (P16 H4): params word holding the RESUME-scan counter rows' offset in
+/// `scheduler_state`, appended after every production params word.
+#[cfg(feature = "cuda-test-hooks")]
+const PARAM_RESUME_SCAN_COUNT_OFFSET: usize = 34;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -180,6 +186,45 @@ fn select_cuda_provisioning(
     } else {
         CudaProvisioning::Device
     }
+}
+
+/// The smallest share of a managed device's total memory a plan may not use (P16 D2 fix 2).
+const MANAGED_MEMORY_RESERVE_FLOOR_BYTES: usize = 8 << 30;
+
+/// The part of a managed (integrated) device's total memory a plan may not use: the larger of
+/// 8 GiB and a sixteenth of the total. The operating system, the driver and the host side of the
+/// run keep using that memory; without the reserve a 127 GB plan on madrid's 130.6 GB GB10 passed
+/// the check and the kernel OOM-killed the process during the managed upload (review M2). On
+/// madrid the floor binds: 8 GiB, a limit of 122,004,221,952 B.
+fn managed_memory_reserve(total: usize) -> usize {
+    MANAGED_MEMORY_RESERVE_FLOOR_BYTES.max(total / 16)
+}
+
+/// The device-memory limit one plan is checked against before allocation (P16 D2), from
+/// `cuMemGetInfo`'s `free` and `total` and the optional [`CudaConfig::max_device_bytes`], which
+/// can only lower it.
+///
+/// - **Device** (a discrete GPU): `free`, the device memory a plan can still allocate.
+/// - **Managed** (an integrated GPU sharing system memory, such as GB10): `total` less
+///   [`managed_memory_reserve`]. There `free` is the kernel's MemFree, which leaves out
+///   reclaimable page cache, so it moves with host state: on an idle madrid it read 83.1 GB while
+///   a 102 GB managed allocation succeeded, and 127.9 GB right after (review M1). The total is a
+///   fixed property of the device, so whether a plan is refused does not depend on what the host
+///   cached last.
+///
+/// Neither limit can see memory that other processes allocate after the check, so a plan under it
+/// can still run out of memory when the host is shared.
+fn plan_memory_limit(
+    provisioning: CudaProvisioning,
+    free: usize,
+    total: usize,
+    configured: Option<usize>,
+) -> usize {
+    let device = match provisioning {
+        CudaProvisioning::Device => free,
+        CudaProvisioning::Managed => total.saturating_sub(managed_memory_reserve(total)),
+    };
+    configured.map_or(device, |configured| configured.min(device))
 }
 
 #[cfg(feature = "cuda-test-hooks")]
@@ -544,29 +589,29 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, CudaEr
         5 if metadata[1..] == [0, 0] => Ok(PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
             trigger_payload: PayloadId(metadata[0]),
         })),
-        6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
         7 if metadata[2] <= 1 => Ok(PacketKind::RoceData(crate::RoceDataHeader {
             psn: metadata[0],
             sent_time_ns: metadata[1],
             retransmission: metadata[2] != 0,
         })),
-        8 => Ok(PacketKind::RoceAck(roce_ack_header(metadata))),
-        9 => Ok(PacketKind::RoceNack(roce_ack_header(metadata))),
+        8 => crate::device_mechanism::roce_ack_header_of_words(metadata)
+            .map(PacketKind::RoceAck)
+            .ok_or(CudaError::DeviceExecution {
+                code: 93,
+                node: None,
+            }),
+        9 => crate::device_mechanism::roce_ack_header_of_words(metadata)
+            .map(PacketKind::RoceNack)
+            .ok_or(CudaError::DeviceExecution {
+                code: 93,
+                node: None,
+            }),
         10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
+        11 if metadata == [0, 0, 0] => Ok(PacketKind::StageNotify),
         _ => Err(CudaError::DeviceExecution {
             code: 93,
             node: None,
         }),
-    }
-}
-
-/// The RoCE ACK/NACK header in `packet_metadata`'s word order.
-#[inline(always)]
-fn roce_ack_header(metadata: &[u64]) -> crate::RoceAckHeader {
-    crate::RoceAckHeader {
-        acknowledgment: metadata[0],
-        echoed_sent_time_ns: metadata[1],
-        acknowledged_bytes: metadata[2],
     }
 }
 
@@ -718,6 +763,14 @@ pub enum CudaError {
         code: u64,
         node: Option<NodeId>,
     },
+    /// P16 D2: the plan needs more device memory than the device's limit (free memory on a
+    /// discrete GPU, total memory less a fixed reserve under managed provisioning) or [`CudaConfig::max_device_bytes`]
+    /// allows, so nothing was allocated. Without this check the
+    /// run failed a plane upload out of memory.
+    DeviceMemoryExceeded {
+        planned_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 impl fmt::Display for CudaError {
@@ -790,6 +843,15 @@ impl fmt::Display for CudaError {
                     "; the image requires the mechanisms round kernel"
                 )
             }
+            Self::DeviceMemoryExceeded {
+                planned_bytes,
+                limit_bytes,
+            } => write!(
+                formatter,
+                "CUDA plan needs {planned_bytes} bytes of device memory, over its limit of \
+                 {limit_bytes} bytes; cut the run earlier, use Summary observation, or cap the \
+                 arenas"
+            ),
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -860,6 +922,11 @@ pub struct CudaConfig {
     pub attempts_per_graph_wave: usize,
     /// Optional hard cap overriding the conservative semantic round bound.
     pub max_rounds: Option<usize>,
+    /// Optional limit on the bytes one plan may place on the device, below the device's own limit
+    /// (which always applies): the memory free when the attempt is planned on a discrete GPU, the
+    /// total memory less a fixed reserve under managed provisioning. A plan over the limit is
+    /// refused with [`CudaError::DeviceMemoryExceeded`] before any buffer is allocated.
+    pub max_device_bytes: Option<usize>,
     /// Test-only zero-capacity injection for device arenas without a public sizing override.
     #[doc(hidden)]
     #[cfg(feature = "cuda-test-hooks")]
@@ -888,6 +955,7 @@ impl Default for CudaConfig {
             round_threads_per_block: DEFAULT_ROUND_THREADS_PER_BLOCK,
             attempts_per_graph_wave: DEFAULT_ATTEMPTS_PER_GRAPH_WAVE,
             max_rounds: None,
+            max_device_bytes: None,
             #[cfg(feature = "cuda-test-hooks")]
             fault_injection: None,
             #[cfg(feature = "cuda-test-hooks")]
@@ -1432,6 +1500,8 @@ impl CudaExecutor {
         observation_mode: ObservationMode,
         warm_start: &CapacityWarmStart,
     ) -> Result<CudaRun, CudaError> {
+        #[cfg(feature = "cuda-test-hooks")]
+        crate::device_pfc::take_resume_scan_counts_for_testing();
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
         let direct = self.direct_for(config.device_index)?;
@@ -1479,6 +1549,18 @@ impl CudaExecutor {
                 // buffer, capture or launch.
                 if round_kernel == RoundKernel::Plain {
                     plan.refuse_plain_round_kernel()?;
+                }
+                // P16 D2: refuse, before allocating, a plan the device cannot hold. The previous
+                // attempt's buffers were dropped with its closure; `device_memory_limit`
+                // synchronizes so their memory counts as free.
+                let limit_bytes = direct.device_memory_limit(attempt_config.max_device_bytes)?;
+                let planned_bytes = plan.device_bytes();
+                if planned_bytes > limit_bytes {
+                    return Err(CudaError::DeviceMemoryExceeded {
+                        planned_bytes,
+                        limit_bytes,
+                    }
+                    .into());
                 }
                 // The module was loaded under the guard before this run planned, so it is loaded
                 // before any buffer or graph, and no other run's module is in the context.
@@ -1749,36 +1831,7 @@ pub fn size_cuda_plan_for_testing(
     validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
-    let words = [
-        plan.control.len(),
-        plan.params.len(),
-        plan.node_state.len(),
-        plan.generators.len(),
-        plan.flows.len(),
-        plan.routes.len(),
-        plan.links.len(),
-        plan.fel_meta.len(),
-        plan.fel_records.len(),
-        plan.queue_meta.len(),
-        plan.queue_records.len(),
-        plan.in_service.len(),
-        plan.outbox.len(),
-        plan.worklist.len(),
-        plan.summary.len(),
-        plan.observed.len(),
-        plan.departures.len(),
-        plan.arrivals.len(),
-        plan.lp_state.len(),
-        plan.remote_meta.len(),
-        plan.remote_staging.len(),
-        plan.observation_meta.len(),
-        plan.inbound_meta.len(),
-        plan.inbound_producers.len(),
-        plan.merge_cursors.len(),
-        plan.stream_state.len(),
-        plan.stream_records.len(),
-        plan.scheduler_state.len(),
-    ];
+    let words = plan.plane_words();
     crate::device_sizing::exact_plan_report(
         words,
         plan.tcp_state.len(),
@@ -1857,6 +1910,51 @@ fn injected_capacity(config: CudaConfig, arena: CudaArena, default: usize) -> us
 }
 
 impl CudaPlan {
+    /// Words of the 28 established planes, in plane order.
+    fn plane_words(&self) -> [usize; 28] {
+        [
+            self.control.len(),
+            self.params.len(),
+            self.node_state.len(),
+            self.generators.len(),
+            self.flows.len(),
+            self.routes.len(),
+            self.links.len(),
+            self.fel_meta.len(),
+            self.fel_records.len(),
+            self.queue_meta.len(),
+            self.queue_records.len(),
+            self.in_service.len(),
+            self.outbox.len(),
+            self.worklist.len(),
+            self.summary.len(),
+            self.observed.len(),
+            self.departures.len(),
+            self.arrivals.len(),
+            self.lp_state.len(),
+            self.remote_meta.len(),
+            self.remote_staging.len(),
+            self.observation_meta.len(),
+            self.inbound_meta.len(),
+            self.inbound_producers.len(),
+            self.merge_cursors.len(),
+            self.stream_state.len(),
+            self.stream_records.len(),
+            self.scheduler_state.len(),
+        ]
+    }
+
+    /// Bytes the plan places on the device: every plane and `tcp_state`, as
+    /// `size_cuda_plan_for_testing` reports them (P16 D2).
+    fn device_bytes(&self) -> usize {
+        self.plane_words()
+            .into_iter()
+            .chain([self.tcp_state.len()])
+            .fold(0_usize, |total, words| {
+                total.saturating_add(words.saturating_mul(std::mem::size_of::<u64>()))
+            })
+    }
+
     /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
     /// state a `MECHANISMS`-guarded kernel branch would act on
     /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
@@ -1864,6 +1962,7 @@ impl CudaPlan {
         let plan = crate::device_mechanism::UploadedPlan {
             pfc_offset: self.params[PARAM_PFC_OFFSET],
             roce_offset: self.params[PARAM_ROCE_OFFSET],
+            stage_offset: self.params[PARAM_STAGE_OFFSET],
             receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
             // `P_NODE_COUNT` and `P_FLOW_COUNT`.
             node_count: self.params[0] as usize,
@@ -1969,6 +2068,8 @@ struct TcpLayout {
     ledger_meta_offset: usize,
     /// The RoCE receiver region, a tail of `tcp_state`; `None` without queue-pair receivers.
     roce_offset: Option<usize>,
+    /// The stage region (P16 G1), just before the RoCE region; `None` without stages.
+    stage_offset: Option<usize>,
 }
 
 fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
@@ -2003,6 +2104,7 @@ fn encode_control(control: TcpCongestionControl, words: &mut [u64]) {
 
 fn prepare_tcp_state(
     image: &SimulationImage,
+    has_stages: bool,
     capacity_context: &PlannerCapacityContext,
     data_counts: &[usize],
     capacity_caps: DeviceCapacityCaps,
@@ -2133,6 +2235,9 @@ fn prepare_tcp_state(
         }
     }
 
+    // P16 G1: the stage region precedes the RoCE region, which stays the tail of `tcp_state`.
+    let stage_offset = crate::device_stage::append_stage_region(image, has_stages, &mut state)
+        .map_err(|error| CudaError::Validation(error.into()))?;
     let roce_offset =
         crate::device_mechanism::append_roce_region(image, receiver_offset, &mut state);
     Ok((
@@ -2141,6 +2246,7 @@ fn prepare_tcp_state(
             receiver_offset,
             ledger_meta_offset,
             roce_offset,
+            stage_offset,
         },
     ))
 }
@@ -2238,6 +2344,9 @@ impl CudaPlan {
             TcpMinimumPacketSize::One,
             capacity_mode,
         );
+        // P16 G2: which flows share a concurrency bound (ruling G7: a host's unfinished stages),
+        // decided once. `None`, with nothing allocated, without stages or windowed queue pairs.
+        let concurrency = crate::stage_sizing::SizingConcurrency::for_image(image);
         let initial_by_payload = image
             .initial_packets
             .iter()
@@ -2257,6 +2366,8 @@ impl CudaPlan {
         let mut minimum_queue_packet_bytes = vec![u64::MAX; node_count];
         let mut legacy_fel_caps = vec![8_usize; node_count];
         let mut initial_fel_counts = vec![0_usize; node_count];
+        let mut queue_charges = crate::stage_sizing::ConcurrentCharges::default();
+        let mut fel_charges = crate::stage_sizing::ConcurrentCharges::default();
         for event in &image.initial_events {
             let target = event.target.0 as usize;
             legacy_fel_caps[target] = legacy_fel_caps[target].saturating_add(1);
@@ -2267,18 +2378,47 @@ impl CudaPlan {
             let feedback_count = flow_feedback_counts[flow_index];
             let data_count = packet_count.saturating_sub(feedback_count);
             let source_slot = flow.source.0 as usize;
-            queue_caps[source_slot] = queue_caps[source_slot].saturating_add(
-                capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+            let group = concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.group(flow_index));
+            // Ruling G8: a windowed queue pair holds at most a window of its data in its source
+            // host's queue and a window of its feedback in its receiver's, however long a pause.
+            let window = concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.window_packets(flow_index));
+            crate::stage_sizing::charge(
+                &mut queue_caps,
+                &mut queue_charges,
+                concurrency
+                    .as_ref()
+                    .and_then(|concurrency| concurrency.host_queue_group(flow_index)),
+                source_slot,
+                crate::stage_sizing::CLASS_DATA,
+                window.map_or_else(
+                    || capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+                    |window| data_count.min(window),
+                ),
             );
+            if let Some(window) = window {
+                crate::stage_sizing::charge(
+                    &mut queue_caps,
+                    &mut queue_charges,
+                    group,
+                    flow.target.0 as usize,
+                    crate::stage_sizing::CLASS_FEEDBACK,
+                    feedback_count.min(window),
+                );
+            }
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
             if capacity_context.dcqcn_generator(image, flow_index) {
-                // A DCQCN source owns two live timer chains, pacing and control.
-                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+                // A DCQCN source owns one live timer chain, pacing (the Mellanox-form controller
+                // has no timer event, P16).
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(1);
             }
             if capacity_context.roce_generator(image, flow_index) {
-                // A queue-pair source owns three live timers: pacing, control and the
-                // retransmission timeout (one live record under the live-state contract).
-                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(3);
+                // A queue-pair source owns two live timers: pacing and the retransmission
+                // timeout (one live record under the live-state contract).
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
             }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // Timeout events are intentionally heap-class. Under the live-state contract
@@ -2294,6 +2434,8 @@ impl CudaPlan {
 
             let mut route_capacities = FlowRouteCapacities {
                 lookahead: minimum_lookahead_ns,
+                group,
+                fel_charges: &mut fel_charges,
                 fel: &mut legacy_fel_caps,
                 queue: &mut queue_caps,
                 aggregate_queue_packets: &mut aggregate_queue_packets,
@@ -2315,6 +2457,19 @@ impl CudaPlan {
                 PacketKind::Feedback,
                 &mut route_capacities,
             );
+        }
+        if let Some(concurrency) = &concurrency {
+            queue_charges.apply(concurrency, &mut queue_caps);
+            fel_charges.apply(concurrency, &mut legacy_fel_caps);
+            concurrency.add_compute_timers(&mut legacy_fel_caps);
+        }
+        // P16 H2: an unfired stage notify holds a timer at its source and, without streams, its
+        // arrival in its target's heap; with streams the arrival rides its lane's stream.
+        let notify = crate::device_sizing::notify_capacities(image);
+        if let Some(notify) = &notify {
+            for &(node, count) in notify.sources.iter().chain(&notify.targets) {
+                legacy_fel_caps[node] = legacy_fel_caps[node].saturating_add(count);
+            }
         }
 
         for node in &image.nodes {
@@ -2346,7 +2501,7 @@ impl CudaPlan {
                                         .unwrap_or(usize::MAX),
                                 );
                             }
-                            crate::DropMarkPolicy::EcnThreshold(policy) => {
+                            crate::DropMarkPolicy::EcnRamp(policy) => {
                                 queue_caps[slot] = crate::device_sizing::ecn_queue_packet_bound(
                                     aggregate_queue_packets[slot],
                                     policy,
@@ -2355,7 +2510,7 @@ impl CudaPlan {
                                 .max(initial)
                                 .max(1);
                             }
-                            crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::Red(_) => {}
+                            crate::DropMarkPolicy::TailDrop => {}
                         }
                     }
                 }
@@ -2418,6 +2573,14 @@ impl CudaPlan {
                     );
                     let source = descriptor.source.0 as usize;
                     capacities[source] = capacities[source].saturating_add(attempts);
+                }
+            }
+            if let Some(concurrency) = &concurrency {
+                concurrency.add_compute_timers(&mut capacities);
+            }
+            if let Some(notify) = &notify {
+                for &(node, count) in &notify.sources {
+                    capacities[node] = capacities[node].saturating_add(count);
                 }
             }
             capacities
@@ -2649,13 +2812,24 @@ impl CudaPlan {
             links[offset + 3] = link.propagation_ns;
         }
 
-        let remote_bound = derived_remote_capacity(
+        let mut remote_capacities = derived_remote_capacities(
             image,
             &capacity_context,
+            concurrency.as_ref(),
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
         );
+        if let Some(notify) = &notify {
+            for &(node, count) in &notify.sources {
+                remote_capacities[node] = remote_capacities[node].saturating_add(count);
+            }
+        }
+        // The derived outbox capacity is the whole-plan sum of the per-producer capacities (their
+        // seed of 2 per node included), before any cap or floor.
+        let remote_bound = remote_capacities
+            .iter()
+            .fold(0_usize, |total, capacity| total.saturating_add(*capacity));
         let outbox_capacity = config.max_outbox_events.map_or_else(
             || {
                 crate::device_capacity::bound_derived_capacity(
@@ -2676,13 +2850,6 @@ impl CudaPlan {
         } else {
             outbox_capacity
         };
-        let mut remote_capacities = derived_remote_capacities(
-            image,
-            &capacity_context,
-            &flow_packet_counts,
-            &flow_feedback_counts,
-            minimum_lookahead_ns,
-        );
         if let Some(capacity) = config.max_outbox_events {
             remote_capacities
                 .fill(capacity.max(config.capacity_floors.remote_staging_events_per_lp));
@@ -2711,6 +2878,7 @@ impl CudaPlan {
             &fel_records,
             remote_staging_slots,
             channel_capacity_floors,
+            notify.as_ref(),
         )?;
         let event_bound = derived_transition_bound(image, &flow_packet_counts, pfc_state)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
@@ -2725,7 +2893,17 @@ impl CudaPlan {
             injected_capacity(config, CudaArena::Departures, observation_capacity);
         let arrival_capacity = injected_capacity(config, CudaArena::Arrivals, observation_capacity);
         let mut observation_capacities = if observation_mode == ObservationMode::Full {
-            derived_observation_capacities(image, &flow_packet_counts, &flow_feedback_counts)
+            let (counts, feedback_counts) = crate::planner_capacity::observation_packet_counts(
+                image,
+                &flow_packet_counts,
+                &flow_feedback_counts,
+                exclusive_horizon_ns,
+            );
+            crate::planner_capacity::derived_observation_capacities(
+                image,
+                &counts,
+                &feedback_counts,
+            )
         } else {
             vec![0; node_count]
         };
@@ -2758,6 +2936,9 @@ impl CudaPlan {
         }
         let (mut tcp_state, tcp_layout) = prepare_tcp_state(
             image,
+            concurrency
+                .as_ref()
+                .is_some_and(|concurrency| concurrency.has_stages()),
             &capacity_context,
             &flow_data_counts,
             config.capacity_caps,
@@ -2771,7 +2952,8 @@ impl CudaPlan {
             tcp_layout.ledger_meta_offset,
             &mut tcp_state,
         );
-        let (inbound_meta, inbound_producers) = remote_inbound_producers(image, pfc_state);
+        let (inbound_meta, inbound_producers) =
+            remote_inbound_producers(image, pfc_state, notify.as_ref());
         let round_capacity = config
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
@@ -2822,6 +3004,7 @@ impl CudaPlan {
             streams.layout.round_scratch_offset as u64,
             pfc_offset.map_or(NONE, |offset| offset as u64),
             tcp_layout.roce_offset.map_or(NONE, |offset| offset as u64),
+            tcp_layout.stage_offset.map_or(NONE, |offset| offset as u64),
         ];
 
         Ok(Self {
@@ -2879,12 +3062,7 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
-        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
-        // frame travels on its reverse control lane, never on its flow's route.
-        if matches!(
-            packet.kind,
-            PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer | PacketKind::Pfc(_)
-        ) {
+        if !crate::device_sizing::initial_packet_is_routed(packet) {
             continue;
         }
         let counts = if packet.kind.is_data() {
@@ -2993,10 +3171,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     for state in &image.host_states {
         for generator in &state.generators {
             // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
-            // answers a data arrival with at most one ACK or NACK and one CNP.
+            // answers a data arrival with at most one ACK or NACK (P16: no CNP).
             let per_packet = match generator.kind {
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
-                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Tcp(_)
+                | FlowGeneratorKind::Dcqcn(_)
+                | FlowGeneratorKind::Roce(_) => 1,
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
             };
             if per_packet != 0 {
@@ -3016,6 +3195,9 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
 
 struct FlowRouteCapacities<'a> {
     lookahead: Option<u64>,
+    /// The flow's concurrency group if it is an unfinished stage (P16 G2, ruling G7).
+    group: Option<u32>,
+    fel_charges: &'a mut crate::stage_sizing::ConcurrentCharges,
     fel: &'a mut [usize],
     queue: &'a mut [usize],
     aggregate_queue_packets: &'a mut [usize],
@@ -3043,15 +3225,15 @@ fn add_flow_route_capacities(
             unreachable!("PFC frames travel on control lanes, never on a flow route")
         }
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
-        PacketKind::DcqcnControlTimer => {
-            unreachable!("the zero-byte DCQCN control-timer token is never routed")
-        }
         PacketKind::RoceData(_) => (flow.route.as_slice(), flow.target),
         PacketKind::RoceAck(_) | PacketKind::RoceNack(_) => {
             (flow.reverse_route.as_slice(), flow.source)
         }
         PacketKind::RocePacingTimer => {
             unreachable!("the zero-byte RoCE pacing token is never routed")
+        }
+        PacketKind::StageNotify => {
+            unreachable!("a stage notify crosses its host pair's lane, never a flow route")
         }
     };
     for index in 0..route.len() {
@@ -3069,7 +3251,14 @@ fn add_flow_route_capacities(
             route[index],
             capacities.lookahead,
         );
-        capacities.fel[target_slot] = capacities.fel[target_slot].saturating_add(burst);
+        crate::stage_sizing::charge(
+            capacities.fel,
+            capacities.fel_charges,
+            capacities.group,
+            target_slot,
+            crate::stage_sizing::charge_class(packet_kind),
+            burst,
+        );
         if image.nodes[target_slot].kind == NodeKind::Switch {
             capacities.aggregate_queue_packets[target_slot] =
                 capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
@@ -3079,9 +3268,9 @@ fn add_flow_route_capacities(
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
                 .first();
-            let contribution = if queue.is_some_and(|queue| {
-                matches!(queue.drop_mark, crate::DropMarkPolicy::EcnThreshold(_))
-            }) {
+            let contribution = if queue
+                .is_some_and(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::EcnRamp(_)))
+            {
                 capacity_context.horizon_queue_packet_bound(
                     image,
                     flow_index,
@@ -3206,60 +3395,25 @@ fn flow_link_fel_bound(
     )
 }
 
-fn derived_remote_capacity(
-    image: &SimulationImage,
-    capacity_context: &PlannerCapacityContext,
-    counts: &[usize],
-    feedback_counts: &[usize],
-    lookahead: Option<u64>,
-) -> usize {
-    image
-        .flows
-        .iter()
-        .enumerate()
-        .map(|(index, flow)| {
-            let feedback_count = feedback_counts[index];
-            let data_count = counts[index].saturating_sub(feedback_count);
-            flow.route
-                .iter()
-                .map(|link| {
-                    flow_link_round_bound(
-                        image,
-                        capacity_context,
-                        index,
-                        data_count,
-                        PacketKind::Data,
-                        *link,
-                        lookahead,
-                    )
-                })
-                .chain(flow.reverse_route.iter().map(|link| {
-                    flow_link_round_bound(
-                        image,
-                        capacity_context,
-                        index,
-                        feedback_count,
-                        PacketKind::Feedback,
-                        *link,
-                        lookahead,
-                    )
-                }))
-                .fold(0, usize::saturating_add)
-        })
-        .fold(image.nodes.len().saturating_mul(2), usize::saturating_add)
-}
-
+/// Per-producer remote staging capacities: 2 per node, plus every flow's round bound on each link
+/// it crosses, the bounds of a host's unfinished stages charged together (P16 G2, ruling G7).
 fn derived_remote_capacities(
     image: &SimulationImage,
     capacity_context: &PlannerCapacityContext,
+    concurrency: Option<&crate::stage_sizing::SizingConcurrency>,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
 ) -> Vec<usize> {
     let mut capacities = vec![2_usize; image.nodes.len()];
+    let mut charges = crate::stage_sizing::ConcurrentCharges::default();
     for (index, flow) in image.flows.iter().enumerate() {
         let feedback_count = feedback_counts[index];
         let data_count = counts[index].saturating_sub(feedback_count);
+        let group = concurrency.and_then(|concurrency| concurrency.group(index));
+        // A windowed pair with its timeout off has at most its window's packets, and as many
+        // feedback packets, in the network at once (ruling R11 (b)).
+        let window = concurrency.and_then(|concurrency| concurrency.window_packets(index));
         for (route, packet_count, packet_kind) in [
             (flow.route.as_slice(), data_count, PacketKind::Data),
             (
@@ -3270,7 +3424,7 @@ fn derived_remote_capacities(
         ] {
             for link_id in route {
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
-                capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
+                let bound = flow_link_round_bound(
                     image,
                     capacity_context,
                     index,
@@ -3278,9 +3432,20 @@ fn derived_remote_capacities(
                     packet_kind,
                     *link_id,
                     lookahead,
-                ));
+                );
+                crate::stage_sizing::charge(
+                    &mut capacities,
+                    &mut charges,
+                    group,
+                    producer,
+                    crate::stage_sizing::charge_class(packet_kind),
+                    window.map_or(bound, |window| bound.min(window)),
+                );
             }
         }
+    }
+    if let Some(concurrency) = concurrency {
+        charges.apply(concurrency, &mut capacities);
     }
     capacities
 }
@@ -3306,6 +3471,7 @@ fn prepare_streams(
     fel_records: &[u64],
     remote_staging_slots: usize,
     channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
+    notify: Option<&crate::device_sizing::NotifyCapacities>,
 ) -> Result<PreparedStreams, CudaError> {
     let legacy_heap_event_slots = checked_sum_usize(legacy_fel_caps, "legacy FEL slots")?;
     let fallback_heap_event_slots = checked_sum_usize(fallback_fel_caps, "fallback FEL slots")?;
@@ -3359,6 +3525,10 @@ fn prepare_streams(
         feedback_counts,
         lookahead,
     )?;
+    // P16 H2: each unfired stage notify puts one event on its host pair's lane.
+    for &(channel, count) in notify.map_or(&[][..], |notify| &notify.lanes) {
+        channel_caps[channel] = channel_caps[channel].saturating_add(count);
+    }
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity.max(config.capacity_floors.channel_events_per_stream));
     } else {
@@ -3699,60 +3869,11 @@ fn take_words(next: &mut usize, records: usize, words: usize) -> Result<usize, C
     Ok(start)
 }
 
-fn derived_observation_capacities(
+fn remote_inbound_producers(
     image: &SimulationImage,
-    counts: &[usize],
-    feedback_counts: &[usize],
-) -> Vec<usize> {
-    let mut capacities = vec![1_usize; image.nodes.len()];
-    for event in &image.initial_events {
-        let target = event.target.0 as usize;
-        capacities[target] = capacities[target].saturating_add(1);
-    }
-    for (index, flow) in image.flows.iter().enumerate() {
-        let feedback_count = feedback_counts[index];
-        let data_count = counts[index].saturating_sub(feedback_count);
-        capacities[flow.source.0 as usize] =
-            capacities[flow.source.0 as usize].saturating_add(data_count);
-        capacities[flow.target.0 as usize] =
-            capacities[flow.target.0 as usize].saturating_add(feedback_count);
-        add_route_observation_capacities(
-            image,
-            &flow.route,
-            flow.target,
-            data_count,
-            &mut capacities,
-        );
-        add_route_observation_capacities(
-            image,
-            &flow.reverse_route,
-            flow.source,
-            feedback_count,
-            &mut capacities,
-        );
-    }
-    capacities
-}
-
-fn add_route_observation_capacities(
-    image: &SimulationImage,
-    route: &[crate::LinkId],
-    terminal: NodeId,
-    packet_count: usize,
-    capacities: &mut [usize],
-) {
-    for (step, link_id) in route.iter().enumerate() {
-        let producer = image.links[link_id.0 as usize].source.0 as usize;
-        capacities[producer] = capacities[producer].saturating_add(packet_count.saturating_mul(2));
-        let target = route
-            .get(step + 1)
-            .map_or(terminal, |next| image.links[next.0 as usize].source)
-            .0 as usize;
-        capacities[target] = capacities[target].saturating_add(packet_count);
-    }
-}
-
-fn remote_inbound_producers(image: &SimulationImage, pfc_state: PfcState) -> (Vec<u64>, Vec<u64>) {
+    pfc_state: PfcState,
+    notify: Option<&crate::device_sizing::NotifyCapacities>,
+) -> (Vec<u64>, Vec<u64>) {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -3773,6 +3894,10 @@ fn remote_inbound_producers(image: &SimulationImage, pfc_state: PfcState) -> (Ve
         for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
             inbound[target].insert(producer);
         }
+    }
+    // P16 H2: a stage notify's lane delivers from its source host to its target host.
+    for (producer, target) in crate::device_sizing::notify_lane_producers(image, notify) {
+        inbound[target].insert(producer);
     }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
     let mut producers = Vec::new();
@@ -3852,9 +3977,7 @@ fn derived_transition_bound(
             }
             FlowGeneratorKind::Dcqcn(dcqcn) => {
                 let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
-                Ok(bound
-                    .saturating_add(work.pacing_ticks)
-                    .saturating_add(work.control_ticks))
+                Ok(bound.saturating_add(work.pacing_ticks))
             }
             FlowGeneratorKind::Roce(roce) => Ok(bound
                 .saturating_add(crate::device_mechanism::roce_transition_bound(
@@ -4086,7 +4209,6 @@ fn packet_metadata(kind: PacketKind) -> [u64; 3] {
             u64::from(header.pause),
         ],
         PacketKind::DcqcnCnp(header) => [header.trigger_payload.0, 0, 0],
-        PacketKind::DcqcnControlTimer => [0; 3],
         PacketKind::RoceData(header) => [
             header.psn,
             header.sent_time_ns,
@@ -4095,9 +4217,9 @@ fn packet_metadata(kind: PacketKind) -> [u64; 3] {
         PacketKind::RoceAck(header) | PacketKind::RoceNack(header) => [
             header.acknowledgment,
             header.echoed_sent_time_ns,
-            header.acknowledged_bytes,
+            crate::device_mechanism::roce_ack_size_echo_word(header),
         ],
-        PacketKind::RocePacingTimer => [0; 3],
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => [0; 3],
     }
 }
 
@@ -4393,6 +4515,22 @@ impl CudaBuffers {
         plan: CudaPlan,
         provisioning: CudaProvisioning,
     ) -> Result<Self, CudaError> {
+        // P16 H4 (test hooks only): the RESUME-scan counter rows, one per LP, zeroed, after every
+        // production word of `scheduler_state`, at params word 34 (`P_RESUME_SCAN_COUNT_OFFSET`).
+        #[cfg(feature = "cuda-test-hooks")]
+        let plan = {
+            let mut plan = plan;
+            let offset = plan.scheduler_state.len();
+            plan.scheduler_state.resize(
+                offset
+                    + (plan.params[0] as usize)
+                        .saturating_mul(crate::device_pfc::RESUME_SCAN_COUNT_WORDS),
+                0,
+            );
+            assert_eq!(plan.params.len(), PARAM_RESUME_SCAN_COUNT_OFFSET);
+            plan.params.push(offset as u64);
+            plan
+        };
         let round_capacity = plan.round_capacity;
         let dispatch_capacity = plan.dispatch_capacity;
         let orphan_packets = plan.orphan_packets;
@@ -4565,6 +4703,14 @@ impl CudaBuffers {
         ]: [Vec<u64>; 10] = whole
             .try_into()
             .expect("one readback per decoded fixed-width plane");
+        #[cfg(feature = "cuda-test-hooks")]
+        {
+            let offset = params[PARAM_RESUME_SCAN_COUNT_OFFSET] as usize;
+            crate::device_pfc::record_resume_scan_counts(
+                &scheduler_state
+                    [offset..offset + self.node_count * crate::device_pfc::RESUME_SCAN_COUNT_WORDS],
+            );
+        }
 
         let node_count = image.nodes.len();
         let flow_count = image.flows.len();
@@ -4599,6 +4745,22 @@ impl CudaBuffers {
                 ),
             ],
         )?;
+        // P16 G1: the stage rows, read only when the plan holds a stage region (a stageless image
+        // issues the same readback requests as before).
+        let stage_rows = if params[PARAM_STAGE_OFFSET] != NONE {
+            let [rows] = bounded_plane_words(
+                stream,
+                [(
+                    tcp_plane,
+                    params[PARAM_STAGE_OFFSET] as usize,
+                    crate::device_stage::stage_row_words(image),
+                    "stage region rows",
+                )],
+            )?;
+            Some(rows)
+        } else {
+            None
+        };
         // P15: the RoCE receiver region, read only when the plan holds one (a non-QP image issues
         // the same readback requests as before).
         let roce_region = if params[PARAM_ROCE_OFFSET] != NONE {
@@ -4770,6 +4932,16 @@ impl CudaBuffers {
             .expect("compaction returns one buffer per request");
 
         let mut host_states = image.host_states.clone();
+        // P16 G1: stage state first, so the queue-pair decoder knows which anchors a release moved
+        // and the parked-set recomputation sees the decoded releases (design note §1.5).
+        if let Some(rows) = &stage_rows {
+            crate::device_stage::decode_stage_rows(rows, image, &mut host_states).map_err(
+                |_| CudaError::DeviceExecution {
+                    code: 96,
+                    node: None,
+                },
+            )?;
+        }
         let mut switch_states = image.switch_states.clone();
         let mut resident = self
             .orphan_packets
@@ -4811,7 +4983,8 @@ impl CudaBuffers {
                     state.sourced_packets = node_state[base + 7];
                     state.departed_packets = node_state[base + 8];
                     state.received_packets = node_state[base + 9];
-                    for generator in &mut state.generators {
+                    let input = &image.host_states[node.state_slot as usize];
+                    for (position, generator) in state.generators.iter_mut().enumerate() {
                         let offset = generator.flow.0 as usize * GENERATOR_WORDS;
                         generator.packets_emitted = generators[offset + 2];
                         generator.bytes_emitted = generators[offset + 3];
@@ -4876,6 +5049,10 @@ impl CudaBuffers {
                                 crate::device_mechanism::decode_roce_generator(
                                     &generators[offset..offset + GENERATOR_WORDS],
                                     roce,
+                                    crate::device_stage::released_during_run(
+                                        input.stage(position),
+                                        state.stages.get(position).copied().flatten(),
+                                    ),
                                 )
                                 .map_err(|_| {
                                     CudaError::DeviceExecution {
@@ -4932,8 +5109,14 @@ impl CudaBuffers {
                         switch_queue.queue = queue.iter().map(|packet| packet.id).collect();
                         switch_queue.in_service = service.map(|packet| packet.id);
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
-                        restore_device_scheduler(lp, &queue_meta, &scheduler_state, switch_queue)
-                            .map_err(CudaError::Validation)?;
+                        restore_device_scheduler(
+                            lp,
+                            image.seed,
+                            &queue_meta,
+                            &scheduler_state,
+                            switch_queue,
+                        )
+                        .map_err(CudaError::Validation)?;
                         if params[PARAM_PFC_OFFSET] != NONE {
                             crate::device_pfc::restore_pfc_queue(
                                 &scheduler_state,
@@ -5430,6 +5613,29 @@ impl RoundModule {
 }
 
 impl DirectCuda {
+    /// The most bytes one plan may place on the device ([`plan_memory_limit`]) (P16 D2).
+    ///
+    /// The stream is synchronized first; the free figure it matters for is the discrete-GPU limit. A discarded attempt's buffers are freed with
+    /// stream-ordered `cuMemFreeAsync` when the context supports it; the freed memory stays in the
+    /// device's default pool, and reaches the free count only once a synchronization releases it
+    /// (release threshold 0). Without the synchronization a capacity retry could see the previous
+    /// attempt's memory as still in use and refuse a plan that fits.
+    fn device_memory_limit(&self, configured: Option<usize>) -> Result<usize, CudaError> {
+        self.stream
+            .synchronize()
+            .map_err(|error| driver_error("device memory query synchronization", error))?;
+        let (free, total) = self
+            .context
+            .mem_get_info()
+            .map_err(|error| driver_error("device memory query", error))?;
+        Ok(plan_memory_limit(
+            self.provisioning,
+            free,
+            total,
+            configured,
+        ))
+    }
+
     fn execution_guard(&self) -> MutexGuard<'_, ()> {
         self.execution
             .lock()
@@ -5924,7 +6130,7 @@ fn duration_ns(duration: Duration) -> u64 {
 mod tests {
     use super::{
         CudaArena, CudaError, CudaProvisioning, decode_arena, decode_device_error,
-        select_cuda_provisioning,
+        plan_memory_limit, select_cuda_provisioning,
     };
     use crate::CapacityRetryRecord;
 
@@ -5957,6 +6163,70 @@ mod tests {
         assert_eq!(
             select_cuda_provisioning(true, false, true),
             CudaProvisioning::Device
+        );
+    }
+
+    /// P16 D2 fix 1 (review M1): under Managed provisioning (an integrated GPU such as madrid's
+    /// GB10) `cuMemGetInfo`'s free figure is the kernel's MemFree, which leaves out reclaimable
+    /// page cache: on an idle madrid it read 83.1 GB, while a 102 GB managed allocation succeeded.
+    /// The limit there is derived from the total, a fixed property of the device.
+    ///
+    /// Fix 2 (review M2): the total itself is not usable, since the host keeps part of it (a
+    /// 127 GB plan on madrid's 130.6 GB was OOM-killed during upload). The limit keeps a fixed
+    /// reserve of `max(8 GiB, total / 16)`.
+    #[test]
+    fn managed_provisioning_checks_plans_against_total_memory_less_a_reserve() {
+        const GIB: usize = 1 << 30;
+        // madrid: total / 16 = 8,162,134,784 B is under the 8 GiB floor.
+        let (free, total) = (83_136_438_272, 130_594_156_544);
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None),
+            total - 8 * GIB
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None),
+            122_004_221_952
+        );
+        // A small device keeps the 8 GiB floor.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 32 * GIB, None),
+            24 * GIB
+        );
+        // A large device keeps a sixteenth.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 512 * GIB, None),
+            480 * GIB
+        );
+        // A device smaller than the reserve admits nothing.
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, 0, 4 * GIB, None),
+            0
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(1_000)),
+            1_000
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(usize::MAX)),
+            total - 8 * GIB
+        );
+    }
+
+    /// On a discrete GPU the free figure is the memory a plan can still allocate.
+    #[test]
+    fn device_provisioning_checks_plans_against_free_memory() {
+        let (free, total) = (20_818_296_832, 21_464_350_720);
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, None),
+            free
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, Some(1_000)),
+            1_000
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, Some(usize::MAX)),
+            free
         );
     }
 

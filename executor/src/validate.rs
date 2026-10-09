@@ -161,13 +161,19 @@ struct StageLookups {
     generator_slots: Vec<Option<(usize, usize)>>,
     /// Generators whose flow falls outside the dense flow table, in the same order.
     unindexed_generators: Vec<(usize, usize)>,
-    /// The first collective stage generator at each `(collective, phase, rank, step)` position,
+    /// The first collective stage generator at each `(collective, phase, channel, rank, step)`
+    /// position,
     /// in the same `host_states`-then-`generators` order. Empty on an image without collectives.
     collective_stages: BTreeMap<CollectivePosition, (usize, usize)>,
+    /// The latency of the first channel along each host-to-host link, by `(source, target)`: the
+    /// stage-notify lane candidates (P16 H2), which `validate_notify_lanes` pins to one per pair.
+    notify_lanes: BTreeMap<(NodeId, NodeId), u64>,
+    /// The initial events of each stage-notify payload, as `(kind, target, time)` in event order.
+    notify_events: BTreeMap<PayloadId, Vec<(EventKind, NodeId, u64)>>,
 }
 
-/// A collective stage's position: `(collective_id, phase, rank, step)`.
-type CollectivePosition = (u64, crate::CollectivePhase, u32, u32);
+/// A collective stage's position: `(collective_id, phase, channel, rank, step)`.
+type CollectivePosition = (u64, crate::CollectivePhase, u32, u32, u32);
 
 /// Returns the dense flow-table slot of `id`, exactly when `flow(image, id)` resolves.
 fn dense_flow_slot(image: &SimulationImage, id: crate::FlowId) -> Option<usize> {
@@ -330,6 +336,48 @@ impl FlowIndex {
                 .is_some_and(is_compute_generator)
     }
 
+    /// The latency of the stage-notify lane from `source` to `target`, if one is declared.
+    fn notify_lane(&self, source: NodeId, target: NodeId) -> Option<u64> {
+        self.stage_lookups
+            .as_ref()?
+            .notify_lanes
+            .get(&(source, target))
+            .copied()
+    }
+
+    /// How many initial events of `kind` at `target` carry the stage-notify `payload`, at `time`
+    /// when given.
+    fn notify_event_count(
+        &self,
+        payload: PayloadId,
+        kind: EventKind,
+        target: NodeId,
+        time: Option<u64>,
+    ) -> usize {
+        self.stage_lookups
+            .as_ref()
+            .and_then(|lookups| lookups.notify_events.get(&payload))
+            .map_or(0, |events| {
+                events
+                    .iter()
+                    .filter(|(event_kind, event_target, event_time)| {
+                        *event_kind == kind
+                            && *event_target == target
+                            && time.is_none_or(|time| *event_time == time)
+                    })
+                    .count()
+            })
+    }
+
+    /// Whether a stage notify (P16 H2) owns this flow: a same-server collective message, whose
+    /// stage rides a constant timer generator. `false` without a lookup on a stageless image.
+    fn is_notify_flow(&self, image: &SimulationImage, id: crate::FlowId) -> bool {
+        self.has_stage_generators()
+            && self
+                .generator_for_flow(image, id)
+                .is_some_and(is_notify_generator)
+    }
+
     /// Yields the initial packets of `id`, in `initial_packets` order.
     ///
     /// Exactly equivalent to `initial_packets.iter().filter(|packet| packet.flow == id)`: a dense
@@ -405,8 +453,50 @@ impl StageLookups {
                 }
                 if let Some(stage) = collective_identity(generator) {
                     collective_stages
-                        .entry((stage.collective_id, stage.phase, stage.rank, stage.step))
+                        .entry((
+                            stage.collective_id,
+                            stage.phase,
+                            stage.channel,
+                            stage.rank,
+                            stage.step,
+                        ))
                         .or_insert((host, index));
+                }
+            }
+        }
+        let is_host = |id: NodeId| {
+            usize::try_from(id.0)
+                .ok()
+                .and_then(|slot| image.nodes.get(slot))
+                .is_some_and(|node| node.id == id && node.kind == NodeKind::Host)
+        };
+        let mut notify_lanes = BTreeMap::new();
+        for channel in &image.channels {
+            let Some(link) = link(image, channel.link) else {
+                continue;
+            };
+            if is_host(link.source)
+                && is_host(link.target)
+                && channel.source == link.source
+                && channel.target == link.target
+            {
+                notify_lanes
+                    .entry((link.source, link.target))
+                    .or_insert(channel.min_delay_ns);
+            }
+        }
+        let mut notify_events = BTreeMap::<PayloadId, Vec<_>>::new();
+        if !notify_lanes.is_empty() {
+            for event in &image.initial_events {
+                if event.kind != EventKind::RetransmissionTimeout
+                    && packet(image, event.payload)
+                        .is_some_and(|packet| packet.kind == PacketKind::StageNotify)
+                {
+                    notify_events.entry(event.payload).or_default().push((
+                        event.kind,
+                        event.target,
+                        event.key.time_ns,
+                    ));
                 }
             }
         }
@@ -414,6 +504,8 @@ impl StageLookups {
             generator_slots,
             unindexed_generators,
             collective_stages,
+            notify_lanes,
+            notify_events,
         }
     }
 }
@@ -529,13 +621,19 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_links(image)?;
     validate_flows(image, &flow_index)?;
     validate_generators(image, &flow_index)?;
-    validate_backend_capabilities(image, &flow_index, backend)?;
+    validate_backend_capabilities(image, backend)?;
     let derived_delays = validate_packets_and_derive_delays(image, &flow_index)?;
     validate_tcp_segment_ledger(image, &flow_index)?;
     validate_owned_service_state(image, &flow_index, backend)?;
     let pfc_channels = validate_pfc(image)?;
-    validate_channels(image, backend, &derived_delays, &pfc_channels)?;
-    validate_events(image, &pfc_channels)?;
+    let lane_channels = validate_notify_lanes(image, &flow_index, &derived_delays)?;
+    let out_of_band_channels = if lane_channels.is_empty() {
+        pfc_channels
+    } else {
+        pfc_channels.union(&lane_channels).copied().collect()
+    };
+    validate_channels(image, backend, &derived_delays, &out_of_band_channels)?;
+    validate_events(image, &out_of_band_channels, &lane_channels)?;
     validate_pfc_causal_consistency(image)?;
     // `future_work` is a pure function of the image and was previously recomputed by
     // `validate_counters`. It is computed at its first consumer so that a rejection raised while
@@ -543,7 +641,6 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     let future_work = validate_global_time_capacity(image, &flow_index, backend)?;
     validate_service_event_consistency(image)?;
     validate_counters(image, &future_work)?;
-    validate_dcqcn_arithmetic_capacity(image, &future_work)?;
     validate_origin_sequences(image, &flow_index, &future_work)?;
     validate_payload_sequences(image, &flow_index, &future_work)?;
     validate_preloaded_arrival_capacity(image)?;
@@ -553,31 +650,34 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
 
 fn validate_backend_capabilities(
     image: &SimulationImage,
-    flow_index: &FlowIndex,
     backend: Backend,
 ) -> Result<(), ValidationError> {
     if !matches!(backend, Backend::Metal | Backend::Cuda) {
         return Ok(());
     }
     // P14 Lane B: both device backends run the DCQCN reaction and notification points and PFC
-    // per-priority link pause, so neither needs a refusal here. The flow index already knows
-    // whether any generator carries a stage, so this refusal does not walk the generators again.
-    if flow_index.has_stage_generators() {
-        return Err(ValidationError::new(format!(
-            "backend {backend} does not support collective generators; use Scalar or Cpu"
-        )));
-    }
+    // per-priority link pause, so neither needs a refusal here. P16 G1: both run collective and
+    // compute stages over TCP and RoCE (`days-gpu/evidence/P16/colldev-design.md`), so stages need
+    // none either.
     // P15 lane R4: both device backends run RoCE queue pairs, host-link PFC and a feedback class
     // apart from the data class (`evidence/P15/device-design.md`), so none needs a refusal here.
-    for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
-        match queue.drop_mark {
-            crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::EcnThreshold(_) => {}
-            crate::DropMarkPolicy::Red(_) => {
-                return Err(ValidationError::new(format!(
-                    "backend {backend} does not support RED admission; use Scalar or Cpu"
-                )));
-            }
+    //
+    // P16 H2: both run the stage notify (a same-server message), so it needs none either.
+    // P16 H1: both device backends count stage joins, up to 65,535 local predecessors per stage;
+    // an image without a join has nothing to check.
+    for stage in image
+        .host_states
+        .iter()
+        .filter(|_| !image.stage_joins.is_empty())
+        .flat_map(|state| state.stages.iter().flatten())
+    {
+        if stage.dependencies.local.count() > 0xffff {
+            return Err(ValidationError::new(format!(
+                "backend {backend} counts at most 65535 local predecessors of a stage"
+            )));
         }
+    }
+    for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
         match queue.scheduler {
             SchedulerKind::Fifo
             | SchedulerKind::StaticPriority { .. }
@@ -795,6 +895,9 @@ fn validate_links(image: &SimulationImage) -> Result<(), ValidationError> {
 }
 
 fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(), ValidationError> {
+    // Whether each host's generator table is strictly ascending by flow, checked once per host
+    // at its first lookup (P16 H3 part 2B).
+    let mut ascending = BTreeMap::<u32, bool>::new();
     for flow in &image.flows {
         if flow.priority > 7 {
             return Err(ValidationError::new(format!(
@@ -813,15 +916,29 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
         if flow.feedback_priority != flow.priority
             && !node(image, flow.source)
                 .filter(|source| source.kind == NodeKind::Host)
-                .and_then(|source| image.host_states.get(source.state_slot as usize))
-                .is_some_and(|state| {
-                    state.generators.iter().any(|generator| {
-                        generator.flow == flow.id
-                            && matches!(
-                                generator.kind,
-                                FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
-                            )
-                    })
+                .and_then(|source| {
+                    image
+                        .host_states
+                        .get(source.state_slot as usize)
+                        .map(|state| (source.state_slot, state))
+                })
+                .is_some_and(|(slot, state)| {
+                    let feedback_transport = |generator: &crate::FlowGeneratorState| {
+                        matches!(
+                            generator.kind,
+                            FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
+                        )
+                    };
+                    if *ascending
+                        .entry(slot)
+                        .or_insert_with(|| generators_ascend(state))
+                    {
+                        ascending_generator(state, flow.id).is_some_and(feedback_transport)
+                    } else {
+                        scan_generators(state).any(|generator| {
+                            generator.flow == flow.id && feedback_transport(generator)
+                        })
+                    }
                 })
         {
             return Err(ValidationError::new(format!(
@@ -855,6 +972,19 @@ fn validate_flows(image: &SimulationImage, flow_index: &FlowIndex) -> Result<(),
             {
                 return Err(ValidationError::new(format!(
                     "compute flow {:?} must stay on its host with empty routes",
+                    flow.id
+                )));
+            }
+            continue;
+        }
+        if flow_index.is_notify_flow(image, flow.id) {
+            // A stage notify crosses its host pair's lane out of band: no fabric route.
+            if flow.source == flow.target
+                || !flow.route.is_empty()
+                || !flow.reverse_route.is_empty()
+            {
+                return Err(ValidationError::new(format!(
+                    "stage notify flow {:?} must join two hosts with empty routes",
                     flow.id
                 )));
             }
@@ -970,11 +1100,21 @@ fn physical_location(image: &SimulationImage, id: NodeId) -> PhysicalLocation {
     }
 }
 
+/// The largest frame each priority can still put on each of `links`, for the PFC headroom
+/// check: from the resident packets that can still cross the link and the generators whose
+/// route (data) or reverse route (feedback) holds it.
+///
+/// One pass over the image's packets and generators serves every controlled link: a rail
+/// switch monitors each ingress link at every egress queue, so a pass per monitor would cost
+/// O(monitors x flows) (P16 H3 part 2B).
 fn derived_pfc_max_frame_bytes(
     image: &SimulationImage,
-    controlled_link: LinkId,
-) -> Result<[u64; 8], ValidationError> {
-    let mut maximum = [0_u64; 8];
+    links: &BTreeSet<LinkId>,
+) -> Result<BTreeMap<LinkId, [u64; 8]>, ValidationError> {
+    let mut maxima = links
+        .iter()
+        .map(|&link| (link, [0_u64; 8]))
+        .collect::<BTreeMap<_, _>>();
     let resident_packets = executable_resident_packets(image);
     let live_dcqcn_cnp_flows = resident_packets
         .iter()
@@ -983,11 +1123,18 @@ fn derived_pfc_max_frame_bytes(
         .collect::<BTreeSet<_>>();
     for packet in resident_packets {
         let flow = flow(image, packet.flow).expect("packet validation established the flow");
-        if packet_route(flow, packet.kind).contains(&controlled_link)
-            && packet_can_still_cross_link(image, packet, controlled_link)
-        {
-            let priority = usize::from(flow.packet_priority(packet.kind));
-            maximum[priority] = maximum[priority].max(packet.size_bytes);
+        let route = packet_route(flow, packet.kind);
+        for (index, &link) in route.iter().enumerate() {
+            if route[..index].contains(&link) {
+                continue;
+            }
+            let Some(maximum) = maxima.get_mut(&link) else {
+                continue;
+            };
+            if packet_can_still_cross_link(image, packet, link) {
+                let priority = usize::from(flow.packet_priority(packet.kind));
+                maximum[priority] = maximum[priority].max(packet.size_bytes);
+            }
         }
     }
     for generator in image.host_states.iter().flat_map(staged_generators) {
@@ -995,7 +1142,7 @@ fn derived_pfc_max_frame_bytes(
         let flow = flow(image, generator.flow).expect("generator validation established the flow");
         let priority = usize::from(flow.priority);
         let feedback_priority = usize::from(flow.feedback_priority);
-        if executable && flow.route.contains(&controlled_link) {
+        if executable {
             let size = match generator.kind {
                 FlowGeneratorKind::Constant(constant) => constant.packet_size_bytes,
                 FlowGeneratorKind::Tcp(tcp) => tcp.mss_bytes,
@@ -1008,38 +1155,45 @@ fn derived_pfc_max_frame_bytes(
                     .min(dcqcn.rate.total_bytes - generator.bytes_emitted),
                 FlowGeneratorKind::Roce(roce) => roce_future_data_max_bytes(roce),
             };
-            maximum[priority] = maximum[priority].max(size);
+            for (index, link) in flow.route.iter().enumerate() {
+                if flow.route[..index].contains(link) {
+                    continue;
+                }
+                if let Some(maximum) = maxima.get_mut(link) {
+                    maximum[priority] = maximum[priority].max(size);
+                }
+            }
         }
-        if flow.reverse_route.contains(&controlled_link) {
-            match generator.kind {
-                FlowGeneratorKind::Tcp(tcp) => {
-                    if executable || tcp.bytes_in_flight != 0 {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(tcp.ack_size_bytes);
-                    }
+        let feedback = match generator.kind {
+            FlowGeneratorKind::Tcp(tcp) => {
+                (executable || tcp.bytes_in_flight != 0).then_some(tcp.ack_size_bytes)
+            }
+            FlowGeneratorKind::Dcqcn(dcqcn) => (executable
+                || live_dcqcn_cnp_flows.contains(&flow.id))
+            .then_some(dcqcn.cnp_size_bytes),
+            // Every data arrival at the receiver can answer with an ACK or NACK and a CNP, so
+            // feedback is live while data can still be sent or is in flight.
+            FlowGeneratorKind::Roce(roce) => (executable || roce.snd_una < generator.bytes_emitted)
+                .then(|| roce_feedback_max_bytes(image, flow)),
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => None,
+        };
+        if let Some(size) = feedback {
+            for (index, link) in flow.reverse_route.iter().enumerate() {
+                if flow.reverse_route[..index].contains(link) {
+                    continue;
                 }
-                FlowGeneratorKind::Dcqcn(dcqcn) => {
-                    if executable || live_dcqcn_cnp_flows.contains(&flow.id) {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(dcqcn.cnp_size_bytes);
-                    }
+                if let Some(maximum) = maxima.get_mut(link) {
+                    maximum[feedback_priority] = maximum[feedback_priority].max(size);
                 }
-                FlowGeneratorKind::Roce(roce) => {
-                    // Every data arrival at the receiver can answer with an ACK or NACK and a
-                    // CNP, so feedback is live while data can still be sent or is in flight.
-                    if executable || roce.snd_una < generator.bytes_emitted {
-                        maximum[feedback_priority] =
-                            maximum[feedback_priority].max(roce_feedback_max_bytes(image, flow));
-                    }
-                }
-                FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => {}
             }
         }
     }
-    Ok(maximum)
+    Ok(maxima)
 }
 
 fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationError> {
+    // Each controlled link's frame bound, computed for every link at the first monitor.
+    let mut frame_bounds: Option<BTreeMap<LinkId, [u64; 8]>> = None;
     let mut control_lanes = BTreeSet::new();
     let mut controller_monitors = BTreeSet::<(LinkId, NodeId)>::new();
     let mut controlled_priorities = BTreeSet::<(LinkId, u8)>::new();
@@ -1148,20 +1302,30 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                         channel.min_delay_ns
                     )));
                 }
-                let reachable_frame_bytes = derived_pfc_max_frame_bytes(image, controlled.id)?;
+                if frame_bounds.is_none() {
+                    // Every controlled link, bounded in one pass at the first monitor.
+                    let controlled_links = image
+                        .switch_states
+                        .iter()
+                        .flat_map(|state| &state.queues)
+                        .filter_map(|queue| queue.pfc.as_ref())
+                        .flat_map(|pfc| &pfc.ingresses)
+                        .map(|ingress| ingress.controlled_link)
+                        .collect::<BTreeSet<_>>();
+                    frame_bounds = Some(derived_pfc_max_frame_bytes(image, &controlled_links)?);
+                }
+                let reachable_frame_bytes = frame_bounds
+                    .as_ref()
+                    .and_then(|bounds| bounds.get(&controlled.id))
+                    .copied()
+                    .expect("every controlled link has a frame bound");
 
-                let reaction_ns = u128::from(controlled.propagation_ns)
-                    .checked_add(u128::from(reverse_delay))
-                    .ok_or_else(|| ValidationError::new("PFC reaction window overflows u128"))?;
-                let line_numerator = u128::from(controlled.rate_bps)
-                    .checked_mul(reaction_ns)
-                    .ok_or_else(|| {
-                        ValidationError::new("PFC line-rate headroom product overflows u128")
-                    })?;
-                let line_bytes = line_numerator
-                    .checked_add(8_000_000_000_u128 - 1)
-                    .ok_or_else(|| ValidationError::new("PFC headroom rounding overflows u128"))?
-                    / 8_000_000_000_u128;
+                let line_bytes = pfc_line_rate_bytes(
+                    controlled.rate_bps,
+                    controlled.propagation_ns,
+                    reverse_delay,
+                )
+                .map_err(ValidationError::new)?;
                 let mut derived_occupancy = [0_u64; 8];
                 for payload in &queue.queue {
                     let packet = packet(image, *payload)
@@ -1249,16 +1413,8 @@ fn validate_pfc(image: &SimulationImage) -> Result<BTreeSet<usize>, ValidationEr
                         )));
                     }
                     let available = u128::from(capacity - xoff);
-                    let required_headroom = if maximum_frame == 0 {
-                        0
-                    } else {
-                        u128::from(maximum_frame - 1)
-                            .checked_add(line_bytes)
-                            .and_then(|value| value.checked_add(u128::from(maximum_frame)))
-                            .ok_or_else(|| {
-                                ValidationError::new("PFC required headroom overflows u128")
-                            })?
-                    };
+                    let required_headroom = pfc_required_headroom_bytes(maximum_frame, line_bytes)
+                        .map_err(ValidationError::new)?;
                     if available < required_headroom {
                         return Err(ValidationError::new(format!(
                             "switch node {:?} queue {queue_index} PFC priority {priority} has {available} bytes of headroom, below derived requirement {required_headroom}",
@@ -1380,9 +1536,46 @@ fn host_class_paused(image: &SimulationImage, owner: NodeId, priority: u8) -> bo
         .is_some_and(|pfc| pfc.is_paused(usize::from(priority)))
 }
 
+/// The bytes a link can put on the wire during a PFC reaction window: one controlled-link
+/// propagation plus the reverse link's 64-byte pause-frame delay, at the controlled link's rate,
+/// rounded up. The first term of [`pfc_required_headroom_bytes`].
+pub fn pfc_line_rate_bytes(
+    controlled_rate_bps: u64,
+    controlled_propagation_ns: u64,
+    reverse_pause_delay_ns: u64,
+) -> Result<u128, &'static str> {
+    let reaction_ns = u128::from(controlled_propagation_ns)
+        .checked_add(u128::from(reverse_pause_delay_ns))
+        .ok_or("PFC reaction window overflows u128")?;
+    let line_numerator = u128::from(controlled_rate_bps)
+        .checked_mul(reaction_ns)
+        .ok_or("PFC line-rate headroom product overflows u128")?;
+    Ok(line_numerator
+        .checked_add(8_000_000_000_u128 - 1)
+        .ok_or("PFC headroom rounding overflows u128")?
+        / 8_000_000_000_u128)
+}
+
+/// The headroom above XOFF that validation requires of a PFC ingress priority whose largest
+/// reachable frame is `maximum_frame_bytes`: a frame already started when XOFF is crossed, the
+/// line-rate bytes of the reaction window ([`pfc_line_rate_bytes`]), and one more frame.
+pub fn pfc_required_headroom_bytes(
+    maximum_frame_bytes: u64,
+    line_rate_bytes: u128,
+) -> Result<u128, &'static str> {
+    if maximum_frame_bytes == 0 {
+        return Ok(0);
+    }
+    u128::from(maximum_frame_bytes - 1)
+        .checked_add(line_rate_bytes)
+        .and_then(|value| value.checked_add(u128::from(maximum_frame_bytes)))
+        .ok_or("PFC required headroom overflows u128")
+}
+
 /// The queue pairs a host's parked list must hold, by class: each queue pair whose data class is
 /// paused there and whose pacer a paused tick parked with packets left to send (parked, not
-/// stopped, `next_psn < total` and `snd_una < total`; LeanGuard's restartable parked pairs).
+/// window-parked, not stopped, `next_psn < total` and `snd_una < total`; LeanGuard's restartable
+/// parked pairs). A window-parked pair (P16 ruling D7) waits for feedback, not for the RESUME.
 pub(crate) fn expected_pause_parked(
     image: &SimulationImage,
     state: &crate::HostState,
@@ -1403,6 +1596,7 @@ pub(crate) fn expected_pause_parked(
         let class = usize::from(flow.priority);
         if pfc.is_paused(class)
             && !roce.pacer_armed
+            && !roce.window_parked
             && generator.next_emission.status != GeneratorStatus::Stopped
             && roce.next_psn < roce.pacer.total_bytes
             && roce.snd_una < roce.pacer.total_bytes
@@ -1434,21 +1628,15 @@ const fn roce_boundary(psn: u64, mtu_bytes: u64, total_bytes: u64) -> bool {
 
 /// A RoCE collective stage that its prerequisites have not released holds the state its release
 /// starts from (`collectives-design.md` §6.1): nothing sent, acknowledged, credited, timed or
-/// fed back; the pacer parked with its scheduled payload the pacing token; the pacer and the
-/// controller anchored at zero (ruling C5), the controller otherwise as lowering builds it. The
-/// release re-anchors both at its instant, so the control deadline must fit after any release up
-/// to the stop. The caller has already required that no pending event carries either token, at any
-/// time: no pacing tick or retransmission timeout with the pacing token, no control tick.
+/// fed back; the pacer parked with its scheduled payload the pacing token, anchored at zero
+/// (ruling C5); the controller pristine (the Mellanox form starts its timers at the first
+/// feedback, P16). The caller has already required that no pending event carries the pacing
+/// token, at any time.
 fn validate_unreleased_roce_stage(
-    image: &SimulationImage,
     generator: StagedGenerator<'_>,
     roce: crate::RoceGenerator,
 ) -> Result<(), &'static str> {
-    // Lowering builds the controller with its first control deadline one interval after the
-    // anchor (`lowered_dcqcn_controller`), here zero.
-    let config = roce.controller.config;
-    let pristine_controller = crate::DcqcnController::new(config, config.control_interval_ns)
-        .map_err(|_| "has a controller whose first control deadline exceeds u64")?;
+    let pristine_controller = crate::DcqcnController::pristine(roce.controller.config);
     if generator.packets_emitted != 0
         || generator.bytes_emitted != 0
         || generator.feedback.arrivals != 0
@@ -1457,6 +1645,7 @@ fn validate_unreleased_roce_stage(
         || roce.rto_deadline_ns != 0
         || roce.pacer.credit_quanta != 0
         || roce.pacer_armed
+        || roce.window_parked
         || generator.next_emission.status != GeneratorStatus::Blocked
         || generator.next_emission.departure_time_ns != 0
         || roce.pacer.first_pacing_time_ns != 0
@@ -1464,8 +1653,20 @@ fn validate_unreleased_roce_stage(
     {
         return Err("collective stage is dependency-blocked after its sending state changed");
     }
-    if roce.controller.config.control_interval_ns > u64::MAX - image.stop_time_ns {
-        return Err("collective stage's first control deadline after a release exceeds u64");
+    Ok(())
+}
+
+/// Range checks of a Mellanox-form controller held in an image (P16): `DcqcnController::
+/// validate_state`, and both rates within `[dcqcn_rate_floor_bps(minimum), maximum]`, the range
+/// the controller's transitions keep.
+fn validate_dcqcn_controller_state(controller: crate::DcqcnController) -> Result<(), &'static str> {
+    controller.validate_state()?;
+    let floor = crate::dcqcn::dcqcn_rate_floor_bps(controller.config.minimum_rate_bps);
+    let maximum = controller.config.maximum_rate_bps;
+    if !(floor..=maximum).contains(&controller.current_rate_bps)
+        || !(floor..=maximum).contains(&controller.target_rate_bps)
+    {
+        return Err("has a DCQCN rate outside the controller's reachable range");
     }
     Ok(())
 }
@@ -1491,20 +1692,14 @@ fn validate_roce_generator(
         .config
         .validate()
         .map_err(|error| invalid(&format!("has an invalid DCQCN configuration: {error}")))?;
-    if controller.alpha_ppb > crate::DCQCN_FRACTION_SCALE
-        || controller.current_rate_bps < controller.config.minimum_rate_bps
-        || controller.current_rate_bps > controller.config.maximum_rate_bps
-        || controller.target_rate_bps < controller.config.minimum_rate_bps
-        || controller.target_rate_bps > controller.config.maximum_rate_bps
-        || controller.stage_steps >= crate::DCQCN_STAGE_STEPS
-        || controller.stage == crate::DcqcnIncreaseStage::Hyper && controller.stage_steps != 0
-        || controller.cnp_seen && controller.last_cnp_time_ns.is_none()
-    {
-        return Err(invalid("has an out-of-range fixed-point controller state"));
-    }
+    validate_dcqcn_controller_state(controller).map_err(invalid)?;
     let pacer = roce.pacer;
     if pacer.pacing_interval_ns == 0 || pacer.mtu_bytes == 0 || pacer.total_bytes == 0 {
         return Err(invalid("needs a positive pacing interval, MTU and total"));
+    }
+    // An ACK echoes its packet's size in 32 bits (P16 ruling D6).
+    if pacer.mtu_bytes > u64::from(u32::MAX) {
+        return Err(invalid("needs an MTU of at most 4294967295 bytes"));
     }
     // Go-back-N ordering: acknowledged <= next to send <= high-water mark <= total, each a
     // packet boundary, so every packet is a pure function of its PSN.
@@ -1538,28 +1733,36 @@ fn validate_roce_generator(
             roce.snd_una, pacer.total_bytes
         )));
     }
-    // Tokens: a zero-byte control token and pacing token of this flow; the pacing token is the
-    // generator's scheduled payload.
-    for (token, kind) in [
-        (roce.control_timer_payload, PacketKind::DcqcnControlTimer),
-        (roce.pacing_timer_payload, PacketKind::RocePacingTimer),
-    ] {
-        let resident =
-            packet(image, token).ok_or_else(|| invalid("names a missing timer token"))?;
-        if resident.flow != flow.id
-            || resident.kind != kind
-            || resident.size_bytes != 0
-            || resident.ecn_marked
-        {
-            return Err(invalid("timer token is inconsistent"));
-        }
+    // Window (P16 ruling D7): a variable window scales a window; a window park is a Blocked,
+    // parked pacer with packets left and bytes in flight (a tick found `next_psn - snd_una >= w
+    // >= 1`, and only stale feedback has run since: any other restart attempt clears it).
+    if roce.variable_window && roce.window_bytes == 0 {
+        return Err(invalid("has a variable window without a window"));
     }
-    if roce.control_timer_payload == roce.pacing_timer_payload
-        || generator.next_emission.payload != roce.pacing_timer_payload
+    if roce.window_parked
+        && (roce.window_bytes == 0
+            || roce.pacer_armed
+            || status != GeneratorStatus::Blocked
+            || roce.next_psn >= pacer.total_bytes
+            || roce.next_psn <= roce.snd_una)
     {
         return Err(invalid(
-            "timer tokens are not distinct or not its scheduled payload",
+            "is window-parked without a window, a parked Blocked pacer, or bytes in flight",
         ));
+    }
+    // Token: a zero-byte pacing token of this flow, the generator's scheduled payload. The
+    // controller owns no token and no event (P16 ruling D2).
+    let resident = packet(image, roce.pacing_timer_payload)
+        .ok_or_else(|| invalid("names a missing timer token"))?;
+    if resident.flow != flow.id
+        || resident.kind != PacketKind::RocePacingTimer
+        || resident.size_bytes != 0
+        || resident.ecn_marked
+    {
+        return Err(invalid("timer token is inconsistent"));
+    }
+    if generator.next_emission.payload != roce.pacing_timer_payload {
+        return Err(invalid("pacing token is not its scheduled payload"));
     }
     // Pacer: armed iff exactly one pending tick carries the pacing token at the scheduled
     // departure, on the grid; its status predicts that tick.
@@ -1589,7 +1792,7 @@ fn validate_roce_generator(
                 )
                 .ok_or_else(|| invalid("pacing credit exceeds u128"))?;
             let cost = u128::from(size) * 8 * 1_000_000_000;
-            let expected = if credit >= cost {
+            let expected = if credit >= cost && !crate::roce::window_bound(&roce) {
                 GeneratorStatus::Scheduled
             } else {
                 GeneratorStatus::Blocked
@@ -1608,11 +1811,12 @@ fn validate_roce_generator(
             return Err(invalid("parked pacer is Scheduled"));
         }
         // A pacer parks with packets left to send only while its data class is paused at its
-        // host (host-link PFC); `validate_pfc` pins it in the host's parked list. An unreleased
-        // stage is parked before its first tick.
+        // host (host-link PFC; `validate_pfc` pins it in the host's parked list) or its window is
+        // closed (P16 ruling D7). An unreleased stage is parked before its first tick.
         if status == GeneratorStatus::Blocked
             && roce.next_psn < pacer.total_bytes
             && !unreleased
+            && !roce.window_parked
             && !host_class_paused(image, owner, flow.priority)
         {
             return Err(invalid("parked pacer has packets left to send"));
@@ -1653,30 +1857,8 @@ fn validate_roce_generator(
             "retransmission timeout exceeds the deadline headroom",
         ));
     }
-    // Control tick, exactly as DCQCN's; a completed pair keeps at most its last pending tick.
-    let control_events = pacing_counts
-        .get(&(
-            owner,
-            roce.control_timer_payload,
-            controller.next_control_time_ns,
-        ))
-        .copied()
-        .unwrap_or(0);
-    // An unreleased stage arms its control tick at its release, so it owns none at any time.
-    if unreleased
-        && pending_ticks_with_payload(pacing_counts, owner, roce.control_timer_payload) != 0
-    {
-        return Err(invalid("owns a pending control tick before its release"));
-    }
-    let expected_control =
-        usize::from(!unreleased && controller.next_control_time_ns <= image.stop_time_ns);
-    if control_events > expected_control || !complete && control_events != expected_control {
-        return Err(invalid(&format!(
-            "has {control_events} matching control events; expected {expected_control}"
-        )));
-    }
     if unreleased {
-        validate_unreleased_roce_stage(image, generator, roce).map_err(invalid)?;
+        validate_unreleased_roce_stage(generator, roce).map_err(invalid)?;
     }
     if flow.reverse_route.is_empty() {
         return Err(invalid("requires a reverse feedback route"));
@@ -1684,8 +1866,6 @@ fn validate_roce_generator(
     let receiver =
         roce_receiver(image, flow).ok_or_else(|| invalid("has no receiver at its target"))?;
     if receiver.total_bytes != pacer.total_bytes
-        || receiver.np.cnp_interval_ns != controller.config.cnp_interval_ns
-        || receiver.np.cnp_size_bytes == 0
         || receiver.ack_size_bytes == 0
         || receiver.ack_every_packets == 0
         || receiver.packets_since_ack >= receiver.ack_every_packets
@@ -1724,12 +1904,7 @@ fn validate_roce_packets(image: &SimulationImage) -> Result<(), ValidationError>
         let (generator, roce) = image
             .host_states
             .get(source.state_slot as usize)
-            .and_then(|state| {
-                state
-                    .generators
-                    .iter()
-                    .find(|generator| generator.flow == flow.id)
-            })
+            .and_then(|state| ascending_generator(state, flow.id))
             .and_then(|generator| match generator.kind {
                 FlowGeneratorKind::Roce(roce) => Some((generator, roce)),
                 _ => None,
@@ -1954,13 +2129,17 @@ fn validate_generators(
             .entry((event.target, event.payload, event.key.time_ns))
             .or_default() += 1;
     }
-    let mut owners =
-        BTreeMap::<crate::FlowId, (NodeId, GeneratorStatus, PayloadId, u64, bool)>::new();
+    // Each flow's one generator (a second is refused below): its owner, emission status, payload
+    // and time, and transport. The receiver checks read the transport here rather than rescanning
+    // every host's generators per receiver.
+    let mut owners = BTreeMap::<
+        crate::FlowId,
+        (NodeId, GeneratorStatus, PayloadId, u64, GeneratorTransport),
+    >::new();
     let mut receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     let mut dcqcn_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
     let mut roce_receiver_owners = BTreeMap::<crate::FlowId, NodeId>::new();
-    let mut collective_positions =
-        BTreeMap::<(u64, crate::CollectivePhase, u32, u32), crate::FlowId>::new();
+    let mut collective_positions = BTreeMap::<CollectivePosition, crate::FlowId>::new();
     let mut claimed_tcp_timers = BTreeMap::<(NodeId, PayloadId, u64), crate::FlowId>::new();
     let mut compute_positions = BTreeMap::<(u64, u32), crate::FlowId>::new();
     for owner in image
@@ -2039,7 +2218,7 @@ fn validate_generators(
             }
             let mut previous_roce_receiver = None;
             for receiver in receivers.iter() {
-                let receiver_flow = receiver.np.flow;
+                let receiver_flow = receiver.flow;
                 if previous_roce_receiver.is_some_and(|flow| flow >= receiver_flow) {
                     return Err(ValidationError::new(format!(
                         "host node {:?} has duplicate or non-increasing RoCE receiver flow {receiver_flow:?}",
@@ -2090,7 +2269,7 @@ fn validate_generators(
                     generator.next_emission.status,
                     generator.next_emission.payload,
                     generator.next_emission.departure_time_ns,
-                    matches!(generator.kind, FlowGeneratorKind::Tcp(_)),
+                    GeneratorTransport::of(generator.kind),
                 ),
             ) {
                 return Err(ValidationError::new(format!(
@@ -2110,8 +2289,9 @@ fn validate_generators(
                     &mut collective_positions,
                     &mut compute_positions,
                 )?;
-                if is_compute_generator(generator) {
-                    // `validate_compute_stage` owns every invariant of a timer-only stage.
+                if is_compute_generator(generator) || is_notify_generator(generator) {
+                    // `validate_compute_stage` and `validate_notify_timer` own every invariant of
+                    // a timer-only stage.
                     continue;
                 }
             }
@@ -2487,21 +2667,9 @@ fn validate_generators(
                         flow.id
                     )));
                 }
-                if dcqcn.controller.alpha_ppb > crate::DCQCN_FRACTION_SCALE
-                    || dcqcn.controller.current_rate_bps < dcqcn.controller.config.minimum_rate_bps
-                    || dcqcn.controller.current_rate_bps > dcqcn.controller.config.maximum_rate_bps
-                    || dcqcn.controller.target_rate_bps < dcqcn.controller.config.minimum_rate_bps
-                    || dcqcn.controller.target_rate_bps > dcqcn.controller.config.maximum_rate_bps
-                    || dcqcn.controller.stage_steps >= crate::DCQCN_STAGE_STEPS
-                    || dcqcn.controller.stage == crate::DcqcnIncreaseStage::Hyper
-                        && dcqcn.controller.stage_steps != 0
-                    || dcqcn.controller.cnp_seen && dcqcn.controller.last_cnp_time_ns.is_none()
-                {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} DCQCN fixed-point controller state is out of range",
-                        flow.id
-                    )));
-                }
+                validate_dcqcn_controller_state(dcqcn.controller).map_err(|what| {
+                    ValidationError::new(format!("flow {:?} DCQCN {what}", flow.id))
+                })?;
                 if generator.bytes_emitted > rate.total_bytes {
                     return Err(ValidationError::new(format!(
                         "flow {:?} DCQCN emitted bytes {} exceed total bytes {}",
@@ -2631,34 +2799,6 @@ fn validate_generators(
                         flow.id
                     )));
                 }
-                let control = packet(image, dcqcn.control_timer_payload).ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "flow {:?} DCQCN control timer references unknown token {:?}",
-                        flow.id, dcqcn.control_timer_payload
-                    ))
-                })?;
-                if control.flow != flow.id
-                    || control.kind != PacketKind::DcqcnControlTimer
-                    || control.size_bytes != 0
-                    || control.ecn_marked
-                {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} DCQCN control token is inconsistent",
-                        flow.id
-                    )));
-                }
-                let control_matches = pacing_counts
-                    .get(&(owner.id, control.id, dcqcn.controller.next_control_time_ns))
-                    .copied()
-                    .unwrap_or(0);
-                let expected_control =
-                    usize::from(dcqcn.controller.next_control_time_ns <= image.stop_time_ns);
-                if control_matches != expected_control {
-                    return Err(ValidationError::new(format!(
-                        "flow {:?} DCQCN has {control_matches} matching control events; expected {expected_control}",
-                        flow.id
-                    )));
-                }
                 if flow.reverse_route.is_empty() {
                     return Err(ValidationError::new(format!(
                         "flow {:?} DCQCN requires a reverse CNP route",
@@ -2676,11 +2816,9 @@ fn validate_generators(
                             flow.id, flow.target
                         ))
                     })?;
-                if receiver.cnp_interval_ns != dcqcn.controller.config.cnp_interval_ns
-                    || receiver.cnp_size_bytes != dcqcn.cnp_size_bytes
-                {
+                if receiver.cnp_size_bytes != dcqcn.cnp_size_bytes {
                     return Err(ValidationError::new(format!(
-                        "flow {:?} DCQCN receiver and controller CNP parameters disagree",
+                        "flow {:?} DCQCN receiver and sender CNP sizes disagree",
                         flow.id
                     )));
                 }
@@ -2849,6 +2987,7 @@ fn validate_generators(
         }
     }
     validate_collective_partitions(image)?;
+    validate_stage_streams(image)?;
     for (receiver_flow, receiver_owner) in receiver_owners {
         match owners.get(&receiver_flow) {
             None => {
@@ -2856,21 +2995,18 @@ fn validate_generators(
                     "host node {receiver_owner:?} owns TCP receiver state for flow {receiver_flow:?}, but the flow has no generator"
                 )));
             }
-            Some((.., false)) => {
+            Some((.., transport)) if *transport != GeneratorTransport::Tcp => {
                 return Err(ValidationError::new(format!(
                     "host node {receiver_owner:?} owns TCP receiver state for flow {receiver_flow:?}, but the flow generator is not TCP"
                 )));
             }
-            Some((.., true)) => {}
+            Some(_) => {}
         }
     }
     for (receiver_flow, receiver_owner) in dcqcn_receiver_owners {
-        let is_dcqcn = image
-            .host_states
-            .iter()
-            .flat_map(staged_generators)
-            .find(|generator| generator.flow == receiver_flow)
-            .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)));
+        let is_dcqcn = owners
+            .get(&receiver_flow)
+            .is_some_and(|(.., transport)| *transport == GeneratorTransport::Dcqcn);
         if !is_dcqcn {
             return Err(ValidationError::new(format!(
                 "host node {receiver_owner:?} owns DCQCN receiver state for flow {receiver_flow:?}, but the flow generator is not DCQCN"
@@ -2878,12 +3014,9 @@ fn validate_generators(
         }
     }
     for (receiver_flow, receiver_owner) in roce_receiver_owners {
-        let is_roce = image
-            .host_states
-            .iter()
-            .flat_map(staged_generators)
-            .find(|generator| generator.flow == receiver_flow)
-            .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)));
+        let is_roce = owners
+            .get(&receiver_flow)
+            .is_some_and(|(.., transport)| *transport == GeneratorTransport::Roce);
         if !is_roce {
             return Err(ValidationError::new(format!(
                 "host node {receiver_owner:?} owns RoCE receiver state for flow {receiver_flow:?}, but the flow generator is not a RoCE queue pair"
@@ -2896,7 +3029,10 @@ fn validate_generators(
         .iter()
         .filter(|packet| matches!(packet.kind, PacketKind::TcpData(_) | PacketKind::TcpAck(_)))
     {
-        if !owners.get(&packet.flow).is_some_and(|(.., is_tcp)| *is_tcp) {
+        if !owners
+            .get(&packet.flow)
+            .is_some_and(|(.., transport)| *transport == GeneratorTransport::Tcp)
+        {
             return Err(ValidationError::new(format!(
                 "TCP packet {:?} for flow {:?} requires a TCP generator",
                 packet.id, packet.flow
@@ -2930,15 +3066,67 @@ fn validate_generators(
 #[derive(Clone)]
 struct CollectivePartitionState {
     algorithm: crate::CollectiveAlgorithm,
-    topology_level: u32,
-    topology_group: u32,
     group_size: u32,
     declared_total_bytes: u64,
+    chunk_policy: crate::CollectiveChunkPolicy,
+    channel_policy: crate::CollectiveChannelPolicy,
+    /// Stages per channel.
+    stages_by_channel: BTreeMap<u32, u64>,
+    /// One ring under `EqualRemainderLast`: each owner's chunk and its propagation count.
     bounds_by_owner: BTreeMap<u32, (u64, u64)>,
     copies_by_owner: BTreeMap<u32, u64>,
+    /// Every other policy: the chunk bytes of each stage.
+    chunk_sizes: BTreeSet<u64>,
 }
 
+/// The stage streams name existing stage groups, strictly ascending, each on a stream other than
+/// 0 (stream 0 is the default and is never listed). Nothing to check, and nothing built, when the
+/// list is empty.
+fn validate_stage_streams(image: &SimulationImage) -> Result<(), ValidationError> {
+    let streams = &image.stage_streams;
+    if streams.is_empty() {
+        return Ok(());
+    }
+    let mut operations = BTreeSet::new();
+    for state in &image.host_states {
+        for stage in state.stages.iter().flatten() {
+            operations.insert(match stage.role {
+                crate::StageRole::Collective(identity) => {
+                    crate::StageOperation::Collective(identity.collective_id)
+                }
+                crate::StageRole::Compute(compute) => {
+                    crate::StageOperation::Compute(compute.compute_id)
+                }
+            });
+        }
+    }
+    if streams
+        .windows(2)
+        .any(|pair| pair[0].operation >= pair[1].operation)
+        || streams
+            .iter()
+            .any(|entry| entry.stream == 0 || !operations.contains(&entry.operation))
+    {
+        return Err(ValidationError::new(
+            "stage streams must name existing stage groups, ascending, on streams other than 0"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Every collective's stages partition its declared total as its algorithm and policies say.
+///
+/// One ring under `EqualRemainderLast` (the P14 form): each owner's chunk is `EqualRemainderLast`
+/// of the declared total and is propagated by `n - 1` stages per phase. Rings under `UniformFloor`
+/// (one or several channels): every message is `floor(floor(S / n) / c)` bytes and each of the
+/// `c` channels has `n (n - 1)` stages per phase. A uniform all-to-all has `n (n - 1)` messages of
+/// `floor(S / n)`; a seeded one at most that many; a send/recv one message of `S`.
 fn validate_collective_partitions(image: &SimulationImage) -> Result<(), ValidationError> {
+    use crate::{
+        CollectiveAlgorithm as Algorithm, CollectiveChannelPolicy as Channels,
+        CollectiveChunkPolicy as Chunk,
+    };
     let mut collectives = BTreeMap::<u64, CollectivePartitionState>::new();
     for generator in image.host_states.iter().flat_map(staged_generators) {
         let Some(crate::CollectiveStage {
@@ -2948,47 +3136,49 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
         else {
             continue;
         };
-        let group_size = u64::from(stage.group_size);
-        let owner_offset = match (stage.algorithm, stage.phase) {
-            (crate::CollectiveAlgorithm::AllGather, crate::CollectivePhase::AllGather)
-            | (crate::CollectiveAlgorithm::RingAllReduce, crate::CollectivePhase::ReduceScatter) => {
-                1
-            }
-            (crate::CollectiveAlgorithm::RingAllReduce, crate::CollectivePhase::AllGather) => 2,
-            (crate::CollectiveAlgorithm::AllGather, crate::CollectivePhase::ReduceScatter) => {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} collective partition has an invalid AllGather phase",
-                    generator.flow
-                )));
-            }
-        };
-        let owner = (u64::from(stage.rank) + group_size - u64::from(stage.step) + owner_offset)
-            % group_size;
-        let owner = u32::try_from(owner).expect("collective owner is bounded by u32 group size");
-        let bounds = (stage.chunk_offset_bytes, stage.chunk_bytes);
         let state =
             collectives
                 .entry(stage.collective_id)
                 .or_insert_with(|| CollectivePartitionState {
                     algorithm: stage.algorithm,
-                    topology_level: stage.topology_level,
-                    topology_group: stage.topology_group,
                     group_size: stage.group_size,
                     declared_total_bytes: stage.declared_total_bytes,
+                    chunk_policy: stage.chunk_policy,
+                    channel_policy: stage.channel_policy,
+                    stages_by_channel: BTreeMap::new(),
                     bounds_by_owner: BTreeMap::new(),
                     copies_by_owner: BTreeMap::new(),
+                    chunk_sizes: BTreeSet::new(),
                 });
         if state.algorithm != stage.algorithm
-            || state.topology_level != stage.topology_level
-            || state.topology_group != stage.topology_group
             || state.group_size != stage.group_size
             || state.declared_total_bytes != stage.declared_total_bytes
+            || state.chunk_policy != stage.chunk_policy
+            || state.channel_policy != stage.channel_policy
         {
             return Err(ValidationError::new(format!(
                 "collective partition {} metadata is inconsistent across propagation stages",
                 stage.collective_id
             )));
         }
+        // One ring under `EqualRemainderLast` (every P14 and P15 collective) is checked by owner
+        // below and allocates nothing more; the other forms are counted by channel and size.
+        let one_ring = state.chunk_policy == Chunk::EqualRemainderLast
+            && state.channel_policy == Channels::RingNext;
+        if !one_ring {
+            *state.stages_by_channel.entry(stage.channel).or_default() += 1;
+            state.chunk_sizes.insert(stage.chunk_bytes);
+            continue;
+        }
+        let group_size = u64::from(stage.group_size);
+        let owner_offset = match (stage.algorithm, stage.phase) {
+            (Algorithm::RingAllReduce, crate::CollectivePhase::AllGather) => 2,
+            _ => 1,
+        };
+        let owner = (u64::from(stage.rank) + group_size - u64::from(stage.step) + owner_offset)
+            % group_size;
+        let owner = u32::try_from(owner).expect("collective owner is bounded by u32 group size");
+        let bounds = (stage.chunk_offset_bytes, stage.chunk_bytes);
         if state
             .bounds_by_owner
             .get(&owner)
@@ -3009,43 +3199,118 @@ fn validate_collective_partitions(image: &SimulationImage) -> Result<(), Validat
         })?;
     }
 
+    // The image names the matrix of exactly its seeded collectives, ascending by id (ruling R7).
+    // Their pair sizes are the lowering's and LeanGuard re-derives them from the certificate; the
+    // validator does not, as a matrix costs a draw per routed token copy.
+    let table = &image.seeded_all_to_alls;
+    if table
+        .windows(2)
+        .any(|pair| pair[0].collective_id >= pair[1].collective_id)
+        || table.iter().any(|entry| {
+            collectives
+                .get(&entry.collective_id)
+                .is_none_or(|state| state.chunk_policy != Chunk::Seeded)
+        })
+        || collectives.iter().any(|(collective_id, state)| {
+            state.chunk_policy == Chunk::Seeded
+                && table
+                    .binary_search_by_key(collective_id, |entry| entry.collective_id)
+                    .is_err()
+        })
+    {
+        return Err(ValidationError::new(
+            "seeded all-to-all matrices must name exactly the image's seeded collectives, ascending"
+                .to_owned(),
+        ));
+    }
     for (collective_id, state) in collectives {
-        let expected_copies = match state.algorithm {
-            crate::CollectiveAlgorithm::AllGather => u64::from(state.group_size - 1),
-            crate::CollectiveAlgorithm::RingAllReduce => 2 * u64::from(state.group_size - 1),
+        let n = u64::from(state.group_size);
+        let phases = match state.algorithm {
+            Algorithm::RingAllReduce => 2,
+            _ => 1,
         };
-        if state.bounds_by_owner.len() != state.group_size as usize
-            || state.copies_by_owner.len() != state.group_size as usize
-            || state
-                .copies_by_owner
-                .values()
-                .any(|copies| *copies != expected_copies)
-        {
-            return Err(ValidationError::new(format!(
-                "collective partition {collective_id} does not propagate every owner exactly {expected_copies} times"
-            )));
-        }
-        let base = state.declared_total_bytes / u64::from(state.group_size);
-        for (index, (owner, (offset, bytes))) in state.bounds_by_owner.into_iter().enumerate() {
-            let owner_u64 = u64::from(owner);
-            let expected_offset = owner_u64.checked_mul(base).ok_or_else(|| {
-                ValidationError::new(format!(
-                    "collective partition {collective_id} declared-total offset exceeds u64"
-                ))
-            })?;
-            let expected_bytes = if owner + 1 == state.group_size {
-                state.declared_total_bytes - expected_offset
-            } else {
-                base
-            };
-            if usize::try_from(owner).ok() != Some(index)
-                || offset != expected_offset
-                || bytes != expected_bytes
-            {
-                return Err(ValidationError::new(format!(
-                    "collective partition {collective_id} does not match declared total {} under EqualRemainderLast at owner {owner}",
-                    state.declared_total_bytes
-                )));
+        let channels = state.stages_by_channel.len() as u64;
+        let contiguous = state
+            .stages_by_channel
+            .keys()
+            .copied()
+            .eq(0..u32::try_from(channels).unwrap_or(u32::MAX));
+        let total = state.declared_total_bytes;
+        let mismatch = |what: &str| {
+            Err(ValidationError::new(format!(
+                "collective partition {collective_id} {what}"
+            )))
+        };
+        match (state.algorithm, state.chunk_policy, state.channel_policy) {
+            (Algorithm::AllToAll, chunk, _) => {
+                let stages = state.stages_by_channel.values().sum::<u64>();
+                let uniform = chunk == Chunk::UniformFloor;
+                if channels != 1
+                    || stages > n * (n - 1)
+                    || uniform
+                        && (stages != n * (n - 1)
+                            || state.chunk_sizes.iter().any(|&bytes| bytes != total / n))
+                {
+                    return mismatch("does not send each ordered pair its floor share");
+                }
+            }
+            (Algorithm::SendRecv, ..) => {
+                if state.stages_by_channel.values().sum::<u64>() != 1
+                    || state.chunk_sizes.iter().any(|&bytes| bytes != total)
+                {
+                    return mismatch("is not one message of its declared size");
+                }
+            }
+            (_, Chunk::UniformFloor, _) => {
+                let bytes = total / n / channels.max(1);
+                if !contiguous
+                    || state.channel_policy == Channels::RingNext && channels != 1
+                    || state
+                        .stages_by_channel
+                        .values()
+                        .any(|&count| count != phases * n * (n - 1))
+                    || state.chunk_sizes.iter().any(|&chunk| chunk != bytes)
+                {
+                    return mismatch("does not send every channel its uniform-floor messages");
+                }
+            }
+            _ => {
+                let expected_copies = phases * (n - 1);
+                if state.bounds_by_owner.len() != state.group_size as usize
+                    || state.copies_by_owner.len() != state.group_size as usize
+                    || state
+                        .copies_by_owner
+                        .values()
+                        .any(|copies| *copies != expected_copies)
+                {
+                    return Err(ValidationError::new(format!(
+                        "collective partition {collective_id} does not propagate every owner exactly {expected_copies} times"
+                    )));
+                }
+                let base = total / n;
+                for (index, (owner, (offset, bytes))) in
+                    state.bounds_by_owner.into_iter().enumerate()
+                {
+                    let owner_u64 = u64::from(owner);
+                    let expected_offset = owner_u64.checked_mul(base).ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "collective partition {collective_id} declared-total offset exceeds u64"
+                        ))
+                    })?;
+                    let expected_bytes = if owner + 1 == state.group_size {
+                        total - expected_offset
+                    } else {
+                        base
+                    };
+                    if usize::try_from(owner).ok() != Some(index)
+                        || offset != expected_offset
+                        || bytes != expected_bytes
+                    {
+                        return Err(ValidationError::new(format!(
+                            "collective partition {collective_id} does not match declared total {total} under EqualRemainderLast at owner {owner}"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -3207,12 +3472,86 @@ fn staged_generator(state: &crate::HostState, position: usize) -> StagedGenerato
     }
 }
 
+#[cfg(feature = "planner-test-hooks")]
+std::thread_local! {
+    /// Test-only (P16 H4): passes over a host's generator table ([`staged_generators`] calls) on
+    /// this thread, so a test can pin validation's generator passes per host.
+    static GENERATOR_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test-only (P16 H4): this thread's passes over a host's generator table since the last call;
+/// resets them to zero.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn take_generator_passes_for_testing() -> usize {
+    GENERATOR_PASSES.take()
+}
+
+/// `state`'s generators, scanned for one flow's generator: a pass over the host's generator
+/// table, counted with [`staged_generators`]'s passes. Only `validate_flows` scans, and only on
+/// a table that is not strictly ascending by flow, which `validate_generators` then rejects.
+fn scan_generators(state: &crate::HostState) -> std::slice::Iter<'_, crate::FlowGeneratorState> {
+    #[cfg(feature = "planner-test-hooks")]
+    GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
+    state.generators.iter()
+}
+
+/// Whether `state`'s generator table is strictly ascending by flow: a pass over the table, counted
+/// with [`staged_generators`]'s passes.
+fn generators_ascend(state: &crate::HostState) -> bool {
+    #[cfg(feature = "planner-test-hooks")]
+    GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
+    state
+        .generators
+        .windows(2)
+        .all(|pair| pair[0].flow < pair[1].flow)
+}
+
+/// The generator of `flow` in `state`'s table, by binary search, for a table strictly ascending
+/// by flow: there a scan for the flow finds this generator or none (P16 H3 part 2B: a scan per
+/// lookup cost queue pairs squared per host). Every check after `validate_generators`, which
+/// requires the order, looks up this way.
+fn ascending_generator(
+    state: &crate::HostState,
+    flow: crate::FlowId,
+) -> Option<&crate::FlowGeneratorState> {
+    let index = state
+        .generators
+        .partition_point(|generator| generator.flow < flow);
+    state
+        .generators
+        .get(index)
+        .filter(|generator| generator.flow == flow)
+}
+
+/// The transport of a flow's generator, as `validate_generators` records it per flow.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GeneratorTransport {
+    Tcp,
+    Dcqcn,
+    Roce,
+    Other,
+}
+
+impl GeneratorTransport {
+    const fn of(kind: FlowGeneratorKind) -> Self {
+        match kind {
+            FlowGeneratorKind::Tcp(_) => Self::Tcp,
+            FlowGeneratorKind::Dcqcn(_) => Self::Dcqcn,
+            FlowGeneratorKind::Roce(_) => Self::Roce,
+            FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => Self::Other,
+        }
+    }
+}
+
 /// `state`'s generators in table order, each with its stage record.
 ///
 /// Each generator pairs with the stage table's entry at its position, or with `None` past the
 /// table's end, exactly as [`staged_generator`] reads it, whatever the table's length. On a host
 /// without stages the table is empty, every generator pairs with `None`, and no entry is read.
 fn staged_generators(state: &crate::HostState) -> impl Iterator<Item = StagedGenerator<'_>> {
+    #[cfg(feature = "planner-test-hooks")]
+    GENERATOR_PASSES.set(GENERATOR_PASSES.get() + 1);
     let stages = state
         .stages
         .iter()
@@ -3229,6 +3568,16 @@ fn is_compute_generator(generator: StagedGenerator<'_>) -> bool {
     generator
         .stage
         .is_some_and(|stage| matches!(stage.role, crate::StageRole::Compute(_)))
+}
+
+/// A stage notify (P16 H2): a collective stage whose transport is a constant timer generator.
+/// Its timer names a `StageNotify` packet of the whole chunk, which then crosses out of band to
+/// the target host on the pair's lane. TCP and RoCE stages carry their own generators.
+fn is_notify_generator(generator: StagedGenerator<'_>) -> bool {
+    matches!(generator.kind, FlowGeneratorKind::Constant(_))
+        && generator
+            .stage
+            .is_some_and(|stage| matches!(stage.role, crate::StageRole::Collective(_)))
 }
 
 /// Collective identity of a stage, when the generator carries one.
@@ -3253,7 +3602,7 @@ fn validate_collective_stage(
     flow: &crate::FlowDescriptor,
     generator: StagedGenerator<'_>,
     stage: crate::CollectiveStage,
-    positions: &mut BTreeMap<(u64, crate::CollectivePhase, u32, u32), crate::FlowId>,
+    positions: &mut BTreeMap<CollectivePosition, crate::FlowId>,
     compute_positions: &mut BTreeMap<(u64, u32), crate::FlowId>,
 ) -> Result<(), ValidationError> {
     let dependencies = stage.dependencies;
@@ -3275,9 +3624,13 @@ fn validate_collective_stage(
     let transport_bytes = match generator.kind {
         FlowGeneratorKind::Tcp(tcp) => tcp.total_bytes,
         FlowGeneratorKind::Roce(roce) => roce.pacer.total_bytes,
+        FlowGeneratorKind::Constant(constant) => {
+            validate_notify_timer(image, flow_index, flow, generator, constant, stage)?;
+            constant.packet_size_bytes
+        }
         _ => {
             return Err(ValidationError::new(format!(
-                "flow {:?} collective stage record requires a TCP or RoCE generator",
+                "flow {:?} collective stage record requires a TCP, RoCE or stage-notify generator",
                 flow.id
             )));
         }
@@ -3285,25 +3638,60 @@ fn validate_collective_stage(
     let position = (
         collective.collective_id,
         collective.phase,
+        collective.channel,
         collective.rank,
         collective.step,
     );
     if let Some(previous_flow) = positions.insert(position, flow.id) {
         return Err(ValidationError::new(format!(
-            "flow {:?} has duplicate collective stage position ({}, {:?}, {}, {}), already owned by flow {:?}",
+            "flow {:?} has duplicate collective stage position ({}, {:?}, {}, {}, {}), already owned by flow {:?}",
             flow.id,
             collective.collective_id,
             collective.phase,
+            collective.channel,
             collective.rank,
             collective.step,
             previous_flow
         )));
     }
-    if collective.chunk_policy != crate::CollectiveChunkPolicy::EqualRemainderLast
-        || collective.channel_policy != crate::CollectiveChannelPolicy::RingNext
-        || collective.algorithm == crate::CollectiveAlgorithm::AllGather
-            && collective.phase != crate::CollectivePhase::AllGather
-    {
+    use crate::{
+        CollectiveAlgorithm as Algorithm, CollectiveChannelPolicy as Channels,
+        CollectiveChunkPolicy as Chunk, CollectivePhase as Phase,
+    };
+    let ring = is_ring_algorithm(collective.algorithm);
+    let consistent = match collective.algorithm {
+        Algorithm::RingAllReduce => {
+            matches!(collective.phase, Phase::ReduceScatter | Phase::AllGather)
+        }
+        Algorithm::AllGather => collective.phase == Phase::AllGather,
+        Algorithm::ReduceScatter => collective.phase == Phase::ReduceScatter,
+        Algorithm::AllToAll => {
+            collective.phase == Phase::AllToAll
+                && collective.channel_policy == Channels::AllPairs
+                && matches!(collective.chunk_policy, Chunk::UniformFloor | Chunk::Seeded)
+        }
+        Algorithm::SendRecv => {
+            collective.phase == Phase::SendRecv
+                && collective.channel_policy == Channels::Pair
+                && collective.chunk_policy == Chunk::EqualRemainderLast
+                && collective.group_size == 2
+                && collective.rank == 0
+                && collective.step == 1
+        }
+    } && (!ring
+        || match collective.channel_policy {
+            Channels::RingNext => {
+                collective.channel == 0
+                    && matches!(
+                        collective.chunk_policy,
+                        Chunk::EqualRemainderLast | Chunk::UniformFloor
+                    )
+            }
+            Channels::Channels => collective.chunk_policy == Chunk::UniformFloor,
+            Channels::AllPairs | Channels::Pair => false,
+        })
+        && (ring || collective.channel == 0);
+    if !consistent {
         return Err(ValidationError::new(format!(
             "flow {:?} collective policy or phase is inconsistent with its algorithm",
             flow.id
@@ -3336,142 +3724,236 @@ fn validate_collective_stage(
             flow.id, transport_bytes, collective.chunk_bytes
         )));
     }
-    if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
-        return Err(ValidationError::new(format!(
-            "flow {:?} collective inbound bytes {} exceed required bytes {}",
-            flow.id, dependencies.inbound_bytes_received, dependencies.inbound_predecessor_bytes
-        )));
-    }
+    let inline = validate_stage_dependencies(image, flow_index, state, flow, stage)?;
 
+    // A root is step one of a ring's first phase, every all-to-all pair, or the send: it follows
+    // the groups the collective follows.
+    let first_phase = collective.algorithm != Algorithm::RingAllReduce
+        || collective.phase == Phase::ReduceScatter;
+    if !ring || collective.step == 1 && first_phase {
+        return validate_entry_predecessors(image, flow_index, flow, dependencies, inline);
+    }
     let final_step = collective.group_size - 1;
-    let root = collective.step == 1
-        && (collective.algorithm == crate::CollectiveAlgorithm::AllGather
-            || collective.phase == crate::CollectivePhase::ReduceScatter);
-    let find_stage = |rank: u32| {
-        let (phase, step) = if collective.step > 1 {
-            (collective.phase, collective.step - 1)
-        } else {
-            (crate::CollectivePhase::ReduceScatter, final_step)
-        };
-        flow_index
-            .collective_stage(image, (collective.collective_id, phase, rank, step))
-            .map(|candidate| candidate.flow)
-    };
-    let previous_rank = if collective.rank == 0 {
-        collective.group_size - 1
+    let (phase, step) = if collective.step > 1 {
+        (collective.phase, collective.step - 1)
     } else {
-        collective.rank - 1
+        (Phase::ReduceScatter, final_step)
     };
-    // A root may follow the same-rank stage of a compute group on its own host.
-    let entry = dependencies
-        .local_predecessor
-        .filter(|_| root)
-        .and_then(|id| flow_index.generator_for_flow(image, id))
-        .filter(|candidate| {
-            matches!(candidate.stage.map(|stage| stage.role),
-                Some(crate::StageRole::Compute(compute))
-                    if compute.rank == collective.rank && compute.group_size == collective.group_size)
-                && flow_source(image, candidate.flow) == Some(flow.source)
-        });
-    let (expected_local, expected_inbound) = if root {
-        (entry.map(|candidate| candidate.flow), None)
-    } else {
-        (find_stage(collective.rank), find_stage(previous_rank))
+    let expected_local = flow_index
+        .collective_stage(
+            image,
+            (
+                collective.collective_id,
+                phase,
+                collective.channel,
+                collective.rank,
+                step,
+            ),
+        )
+        .map(|candidate| candidate.flow);
+    let recurrence_error = || {
+        ValidationError::new(format!(
+            "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
+            flow.id
+        ))
     };
-    if dependencies.local_predecessor != expected_local
-        || dependencies.inbound_predecessor != expected_inbound
+    if expected_local.is_none() || dependencies.local.one() != expected_local {
+        return Err(recurrence_error());
+    }
+    let local = inline
+        .local
+        .expect("an inline local predecessor was validated");
+    let inbound = inline
+        .inbound
+        .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
+        .ok_or_else(recurrence_error)?;
+    // The inbound predecessor is the same channel's step before, on the rank before this one: on
+    // one ring (`RingNext`) exactly `rank - 1`; on a channel, whichever rank the channel orders
+    // there, whose flow delivers to this host (checked with the dependencies).
+    let previous_rank = previous_rank(collective.rank, collective.group_size);
+    if inbound.1.collective_id != collective.collective_id
+        || inbound.1.phase != phase
+        || inbound.1.channel != collective.channel
+        || inbound.1.step != step
+        || inbound.1.rank == collective.rank
+        || collective.channel_policy == Channels::RingNext && inbound.1.rank != previous_rank
+    {
+        return Err(recurrence_error());
+    }
+    if inbound.1.chunk_bytes != collective.chunk_bytes
+        || inbound.1.chunk_offset_bytes != collective.chunk_offset_bytes
     {
         return Err(ValidationError::new(format!(
-            "flow {:?} collective predecessor identities do not match the declared algorithm recurrence",
+            "flow {:?} collective inbound predecessor does not deliver the declared chunk to its source",
             flow.id
         )));
     }
-    if root {
-        let local_complete =
-            entry.is_none_or(|entry| entry.next_emission.status == GeneratorStatus::Finished);
-        if dependencies.local_predecessor_complete != local_complete
-            || !dependencies.inbound_predecessor_complete
-            || dependencies.inbound_predecessor_bytes != collective.chunk_bytes
-            || dependencies.inbound_bytes_received != 0
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective root prerequisite state is inconsistent",
-                flow.id
-            )));
-        }
-    } else {
-        let local = expected_local
-            .and_then(|id| flow_index.generator_for_flow(image, id))
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} collective local predecessor is missing",
-                    flow.id
-                ))
-            })?;
-        if dependencies.local_predecessor_complete
-            != (local.next_emission.status == GeneratorStatus::Finished)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective local completion flag disagrees with predecessor state",
-                flow.id
-            )));
-        }
-        let inbound = expected_inbound
-            .and_then(|id| flow_index.generator_for_flow(image, id))
-            .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} collective inbound predecessor is missing",
-                    flow.id
-                ))
-            })?;
-        if inbound.1.chunk_bytes != dependencies.inbound_predecessor_bytes
-            || inbound.1.chunk_offset_bytes != collective.chunk_offset_bytes
-            || self::flow(image, inbound.0.flow)
-                .is_none_or(|predecessor_flow| predecessor_flow.target != flow.source)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective inbound predecessor does not deliver the declared chunk to its source",
-                flow.id
-            )));
-        }
-        if dependencies.inbound_predecessor_complete
-            != (dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective inbound completion flag disagrees with received bytes",
-                flow.id
-            )));
-        }
-        // One collective, one transport: its stages share one traffic key.
-        if std::mem::discriminant(&inbound.0.kind) != std::mem::discriminant(&generator.kind)
-            || std::mem::discriminant(&local.kind) != std::mem::discriminant(&generator.kind)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective predecessors use another transport",
-                flow.id
-            )));
-        }
-        let frontier = host_inbound_frontier(state, &inbound.0);
-        if frontier != Some(dependencies.inbound_bytes_received) {
-            return Err(ValidationError::new(format!(
-                "flow {:?} collective inbound bytes {} disagree with the in-order {} frontier {:?} of flow {:?}",
-                flow.id,
-                dependencies.inbound_bytes_received,
-                transport_label(&inbound.0),
-                frontier,
-                inbound.0.flow
-            )));
-        }
-    }
-    let prerequisites_complete = dependencies.prerequisites_complete();
-    if stage.activated != prerequisites_complete {
+    // One collective, one fabric transport: its fabric stages share one traffic key. A stage
+    // notify (a same-server message, P16 H2) may sit next to any of them.
+    let fabric_mismatch = |other: StagedGenerator<'_>| {
+        !is_notify_generator(other)
+            && !is_notify_generator(generator)
+            && std::mem::discriminant(&other.kind) != std::mem::discriminant(&generator.kind)
+    };
+    if fabric_mismatch(inbound.0) || fabric_mismatch(local) {
         return Err(ValidationError::new(format!(
-            "flow {:?} collective release flag disagrees with its prerequisites",
+            "flow {:?} collective predecessors use another transport",
             flow.id
         )));
     }
     Ok(())
+}
+
+/// Whether `algorithm` runs on rings.
+const fn is_ring_algorithm(algorithm: crate::CollectiveAlgorithm) -> bool {
+    matches!(
+        algorithm,
+        crate::CollectiveAlgorithm::RingAllReduce
+            | crate::CollectiveAlgorithm::AllGather
+            | crate::CollectiveAlgorithm::ReduceScatter
+    )
+}
+
+/// The bytes a delivering stage carries: its TCP or RoCE total, or a stage notify's chunk (P16
+/// H2); `None` for any other generator.
+fn delivered_total_bytes(generator: StagedGenerator<'_>) -> Option<u64> {
+    match generator.kind {
+        FlowGeneratorKind::Tcp(tcp) => Some(tcp.total_bytes),
+        FlowGeneratorKind::Roce(roce) => Some(roce.pacer.total_bytes),
+        FlowGeneratorKind::Constant(constant) if is_notify_generator(generator) => {
+            Some(constant.packet_size_bytes)
+        }
+        _ => None,
+    }
+}
+
+/// Dependency invariants every dependency-gated stage shares, whatever its role.
+///
+/// The predecessor lists are canonical: a join names at least two flows, in a run of
+/// `stage_joins`, strictly ascending. Every local predecessor is a stage sourced at this host, and
+/// the stage counts exactly those that have finished. Every inbound predecessor is a transport
+/// stage whose flow targets this host; the stage requires their summed totals and has received
+/// exactly the sum of this host's in-order frontiers of them. The release flag is the
+/// prerequisites' conjunction.
+fn validate_stage_dependencies<'a>(
+    image: &'a SimulationImage,
+    flow_index: &FlowIndex,
+    state: &crate::HostState,
+    flow: &crate::FlowDescriptor,
+    stage: crate::CollectiveStage,
+) -> Result<InlinePredecessors<'a>, ValidationError> {
+    let dependencies = stage.dependencies;
+    for predecessors in [dependencies.local, dependencies.inbound] {
+        if let crate::StagePredecessors::Join { count, .. } = predecessors {
+            let run = predecessors.join_run(&image.stage_joins);
+            if count < 2
+                || run.len() != count as usize
+                || run.windows(2).any(|pair| pair[0] >= pair[1])
+            {
+                return Err(ValidationError::new(format!(
+                    "flow {:?} stage join is not a strictly ascending run of at least two stage_joins entries",
+                    flow.id
+                )));
+            }
+        }
+    }
+    let mut inline = InlinePredecessors::default();
+    let mut local_finished = 0_u32;
+    for id in dependencies.local.iter(&image.stage_joins) {
+        let local = flow_index
+            .generator_for_flow(image, id)
+            .filter(|candidate| {
+                candidate.stage.is_some()
+                    && candidate.flow != flow.id
+                    && flow_source(image, candidate.flow) == Some(flow.source)
+            })
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} local predecessor {id:?} is not a stage on its host",
+                    flow.id
+                ))
+            })?;
+        if local.next_emission.status == GeneratorStatus::Finished {
+            local_finished += 1;
+        }
+        if dependencies.local.one().is_some() {
+            inline.local = Some(local);
+        }
+    }
+    if dependencies.local_completed != local_finished {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage local completion count {} disagrees with predecessor state ({} finished)",
+            flow.id, dependencies.local_completed, local_finished
+        )));
+    }
+    let mut required = 0_u64;
+    let mut frontiers = 0_u64;
+    for id in dependencies.inbound.iter(&image.stage_joins) {
+        let inbound = flow_index
+            .generator_for_flow(image, id)
+            .filter(|candidate| {
+                collective_identity(*candidate).is_some()
+                    && self::flow(image, candidate.flow)
+                        .is_some_and(|predecessor| predecessor.target == flow.source)
+            })
+            .ok_or_else(|| {
+                ValidationError::new(format!(
+                    "flow {:?} inbound predecessor {id:?} is not a collective stage delivering to its host",
+                    flow.id
+                ))
+            })?;
+        let total = delivered_total_bytes(inbound).ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} inbound predecessor {id:?} is not a TCP, RoCE or stage-notify stage",
+                flow.id
+            ))
+        })?;
+        let frontier = inbound_frontier(image, state, inbound).ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} inbound predecessor {id:?} has no receiver on its host",
+                flow.id
+            ))
+        })?;
+        required = required.checked_add(total).ok_or_else(|| {
+            ValidationError::new(format!(
+                "flow {:?} inbound byte requirement exceeds u64",
+                flow.id
+            ))
+        })?;
+        frontiers = frontiers.checked_add(frontier).ok_or_else(|| {
+            ValidationError::new(format!("flow {:?} inbound byte count exceeds u64", flow.id))
+        })?;
+        if dependencies.inbound.one().is_some() {
+            inline.inbound = Some(inbound);
+        }
+    }
+    if dependencies.inbound_predecessor_bytes != required {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage inbound requirement {} is not its predecessors' {required} bytes",
+            flow.id, dependencies.inbound_predecessor_bytes
+        )));
+    }
+    if dependencies.inbound_bytes_received != frontiers {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage inbound bytes {} disagree with the in-order frontiers {frontiers} of its inbound predecessors",
+            flow.id, dependencies.inbound_bytes_received
+        )));
+    }
+    if stage.activated != dependencies.prerequisites_complete() {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage release flag disagrees with its prerequisites",
+            flow.id
+        )));
+    }
+    Ok(inline)
+}
+
+/// The generators of a stage's inline (single) local and inbound predecessors, as
+/// [`validate_stage_dependencies`] found them.
+#[derive(Clone, Copy, Default)]
+struct InlinePredecessors<'a> {
+    local: Option<StagedGenerator<'a>>,
+    inbound: Option<StagedGenerator<'a>>,
 }
 
 /// The source of flow `id`. `validate_flow_ids` has established `flows[i].id == i` with unique
@@ -3491,7 +3973,7 @@ fn host_inbound_frontier(
         FlowGeneratorKind::Roce(_) => state
             .roce_receivers
             .as_deref()?
-            .binary_search_by_key(&predecessor.flow, |receiver| receiver.np.flow)
+            .binary_search_by_key(&predecessor.flow, |receiver| receiver.flow)
             .ok()
             .map(|index| state.roce_receivers.as_deref().expect("searched")[index].expected_psn),
         _ => host_tcp_receiver(state, predecessor.flow)
@@ -3499,23 +3981,135 @@ fn host_inbound_frontier(
     }
 }
 
-/// The transport of a stage generator, as validation errors name it.
-/// A RoCE queue pair's MTU and pacing interval, which a compute stage after it writes on its
-/// progress rows (schema Amendment 5); `None` for any other generator.
-const fn roce_transport(kind: &FlowGeneratorKind) -> Option<(u64, u64)> {
-    match kind {
-        FlowGeneratorKind::Roce(roce) => {
-            Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
-        }
-        _ => None,
+/// The bytes this host holds of the inbound predecessor `predecessor`: its receiver's in-order
+/// frontier, or, for a stage notify (P16 H2), the whole chunk once the notify has arrived (its
+/// timer fired and its packet is no longer resident) and zero before.
+fn inbound_frontier(
+    image: &SimulationImage,
+    state: &crate::HostState,
+    predecessor: StagedGenerator<'_>,
+) -> Option<u64> {
+    if let (true, FlowGeneratorKind::Constant(constant)) =
+        (is_notify_generator(predecessor), predecessor.kind)
+    {
+        let emission = predecessor.next_emission;
+        let delivered = emission.status == GeneratorStatus::Finished
+            && packet(image, emission.payload)
+                .is_none_or(|resident| resident.flow != predecessor.flow);
+        return Some(if delivered {
+            constant.packet_size_bytes
+        } else {
+            0
+        });
     }
+    host_inbound_frontier(state, predecessor.generator)
 }
 
-const fn transport_label(generator: &crate::FlowGeneratorState) -> &'static str {
-    match generator.kind {
-        FlowGeneratorKind::Roce(_) => "RoCE",
-        _ => "TCP",
+/// Generator and timer invariants of a stage notify (P16 H2).
+///
+/// The generator is a constant timer of the stage's chunk: `interval_ns` is the sender's lead (at
+/// least one nanosecond), `first_departure_ns` the latency of its host pair's lane (which the
+/// notify crosses after the lead), `packet_size_bytes` and the byte termination the chunk.
+/// Unreleased, it is `Blocked`; released at instant `t` (its collective's start for a root, its
+/// prerequisites' completion otherwise), its timer is due at `t + lead`, so a released notify's
+/// due time is never below its lead (review F1: the image does not record `t`, so lowering pins the
+/// sum and this pins its lower bound). Released, its notify names one `PacingTimer` at the source
+/// (`Scheduled`), or its due time passes the stop (`Stopped`); fired, it is
+/// `Finished` with one packet of the chunk emitted, and the notify is either in flight (resident,
+/// with one `RemoteArrival` at the target) or delivered (no longer resident).
+fn validate_notify_timer(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+    flow: &crate::FlowDescriptor,
+    generator: StagedGenerator<'_>,
+    constant: crate::ConstantGenerator,
+    stage: crate::CollectiveStage,
+) -> Result<(), ValidationError> {
+    let crate::StageRole::Collective(collective) = stage.role else {
+        unreachable!("a stage notify carries a collective stage");
+    };
+    let chunk = collective.chunk_bytes;
+    let emission = generator.next_emission;
+    let fired = emission.status == GeneratorStatus::Finished;
+    if flow_index.notify_lane(flow.source, flow.target) != Some(constant.first_departure_ns)
+        || constant.interval_ns == 0
+        || constant.packet_size_bytes != chunk
+        || constant.termination != GeneratorTermination::Bytes(chunk)
+        || (generator.packets_emitted, generator.bytes_emitted)
+            != if fired { (1, chunk) } else { (0, 0) }
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage notify requires a constant timer of its chunk",
+            flow.id
+        )));
     }
+    if emission.status != GeneratorStatus::Blocked
+        && emission.departure_time_ns < constant.interval_ns
+    {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage notify timer at {} ns is earlier than its {} ns lead after any release",
+            flow.id, emission.departure_time_ns, constant.interval_ns
+        )));
+    }
+    let notify = |payload: PayloadId| {
+        packet(image, payload).filter(|resident| {
+            resident.flow == flow.id
+                && resident.size_bytes == chunk
+                && resident.kind == PacketKind::StageNotify
+                && !resident.ecn_marked
+        })
+    };
+    let events = |kind: crate::EventKind, target: NodeId, payload: PayloadId, time: Option<u64>| {
+        flow_index.notify_event_count(payload, kind, target, time)
+    };
+    let consistent = match emission.status {
+        GeneratorStatus::Blocked => {
+            !stage.activated && emission.departure_time_ns == 0 && emission.payload == PayloadId(0)
+        }
+        GeneratorStatus::Stopped => {
+            stage.activated && emission.departure_time_ns > image.stop_time_ns
+        }
+        GeneratorStatus::Scheduled => {
+            stage.activated
+                && emission.departure_time_ns <= image.stop_time_ns
+                && notify(emission.payload).is_some()
+                && events(
+                    crate::EventKind::PacingTimer,
+                    flow.source,
+                    emission.payload,
+                    Some(emission.departure_time_ns),
+                ) == 1
+                && events(
+                    crate::EventKind::RemoteArrival,
+                    flow.target,
+                    emission.payload,
+                    None,
+                ) == 0
+        }
+        GeneratorStatus::Finished => {
+            stage.activated
+                && match packet(image, emission.payload).filter(|resident| resident.flow == flow.id)
+                {
+                    None => true,
+                    Some(_) => {
+                        notify(emission.payload).is_some()
+                            && events(
+                                crate::EventKind::RemoteArrival,
+                                flow.target,
+                                emission.payload,
+                                None,
+                            ) == 1
+                    }
+                }
+        }
+    };
+    if !consistent {
+        return Err(ValidationError::new(format!(
+            "flow {:?} stage notify state {:?} is inconsistent with its release",
+            flow.id, emission.status
+        )));
+    }
+    Ok(())
 }
 
 /// The host's TCP receiver for `id`.
@@ -3536,9 +4130,9 @@ fn host_tcp_receiver(
 
 /// Invariants of one compute (delay-only) stage.
 ///
-/// The generator is a zero-byte constant timer whose interval is the compute duration. Its local
-/// predecessor is the same-rank stage of a compute group, or the same-rank final stage of a
-/// collective together with the previous rank's final stage as the inbound predecessor. A released
+/// The generator is a zero-byte constant timer whose interval is the compute duration. Its
+/// predecessors are the stages at its host of the groups it follows
+/// (`validate_entry_predecessors`). A released
 /// stage is timed (`Scheduled` with its token and one `PacingTimer`), beyond the stop (`Stopped`),
 /// or complete (`Finished`).
 #[allow(clippy::too_many_arguments)]
@@ -3585,109 +4179,8 @@ fn validate_compute_stage(
         )));
     }
 
-    let local = dependencies
-        .local_predecessor
-        .map(|id| {
-            flow_index
-                .generator_for_flow(image, id)
-                .filter(|candidate| flow_source(image, candidate.flow) == Some(flow.source))
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "flow {:?} compute local predecessor {id:?} is not a stage on its host",
-                        flow.id
-                    ))
-                })
-        })
-        .transpose()?;
-    let local_role = local
-        .and_then(|candidate| candidate.stage)
-        .map(|stage| stage.role);
-    match (local_role, dependencies.inbound_predecessor) {
-        (None, None) => {}
-        (Some(crate::StageRole::Compute(previous)), None)
-            if previous.rank == compute.rank && previous.group_size == compute.group_size => {}
-        (Some(crate::StageRole::Collective(final_stage)), Some(inbound_id))
-            if final_stage.rank == compute.rank
-                && final_stage.group_size == compute.group_size
-                && final_stage.phase == crate::CollectivePhase::AllGather
-                && final_stage.step + 1 == final_stage.group_size =>
-        {
-            let previous_rank = (compute.rank + compute.group_size - 1) % compute.group_size;
-            let inbound = flow_index
-                .generator_for_flow(image, inbound_id)
-                .and_then(|candidate| collective_identity(candidate).map(|stage| (candidate, stage)))
-                .filter(|(candidate, stage)| {
-                    stage.collective_id == final_stage.collective_id
-                        && stage.phase == final_stage.phase
-                        && stage.step == final_stage.step
-                        && stage.rank == previous_rank
-                        && self::flow(image, candidate.flow)
-                            .is_some_and(|flow_descriptor| flow_descriptor.target == flow.source)
-                })
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "flow {:?} compute inbound predecessor is not the previous rank's final stage",
-                        flow.id
-                    ))
-                })?;
-            if inbound.1.chunk_bytes != dependencies.inbound_predecessor_bytes {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} compute inbound predecessor does not deliver the declared chunk",
-                    flow.id
-                )));
-            }
-            // Schema Amendment 5: the stage's progress rows name its inbound transport from its
-            // local predecessor, the same rank's final stage of the same collective.
-            if local.map(|candidate| roce_transport(&candidate.kind))
-                != Some(roce_transport(&inbound.0.kind))
-            {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} compute local and inbound predecessors disagree on the RoCE MTU or pacing interval",
-                    flow.id
-                )));
-            }
-            let frontier = host_inbound_frontier(state, &inbound.0);
-            if frontier != Some(dependencies.inbound_bytes_received) {
-                return Err(ValidationError::new(format!(
-                    "flow {:?} compute inbound bytes {} disagree with the in-order {} frontier {:?} of flow {inbound_id:?}",
-                    flow.id,
-                    dependencies.inbound_bytes_received,
-                    transport_label(&inbound.0),
-                    frontier
-                )));
-            }
-        }
-        _ => {
-            return Err(ValidationError::new(format!(
-                "flow {:?} compute predecessors are neither a same-rank compute stage nor a collective's final stages",
-                flow.id
-            )));
-        }
-    }
-    if dependencies.local_predecessor_complete
-        != local.is_none_or(|candidate| candidate.next_emission.status == GeneratorStatus::Finished)
-    {
-        return Err(ValidationError::new(format!(
-            "flow {:?} compute local completion flag disagrees with predecessor state",
-            flow.id
-        )));
-    }
-    if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes
-        || dependencies.inbound_predecessor_complete
-            != (dependencies.inbound_predecessor.is_none()
-                || dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes)
-    {
-        return Err(ValidationError::new(format!(
-            "flow {:?} compute inbound completion flag disagrees with received bytes",
-            flow.id
-        )));
-    }
-    if stage.activated != dependencies.prerequisites_complete() {
-        return Err(ValidationError::new(format!(
-            "flow {:?} compute release flag disagrees with its prerequisites",
-            flow.id
-        )));
-    }
+    let inline = validate_stage_dependencies(image, flow_index, state, flow, stage)?;
+    validate_entry_predecessors(image, flow_index, flow, dependencies, inline)?;
     let emission = generator.next_emission;
     let consistent = match emission.status {
         GeneratorStatus::Blocked => {
@@ -3724,6 +4217,107 @@ fn validate_compute_stage(
             "flow {:?} compute timer state {:?} is inconsistent with its release",
             flow.id, emission.status
         )));
+    }
+    Ok(())
+}
+
+/// Whether `stage` completes its collective at a rank (`collective_completion` in the lowering):
+/// a ring's final step of its last phase, any all-to-all pair, the send of a send/recv.
+const fn is_completion_stage(stage: crate::CollectiveStageIdentity) -> bool {
+    match stage.algorithm {
+        crate::CollectiveAlgorithm::AllToAll | crate::CollectiveAlgorithm::SendRecv => true,
+        crate::CollectiveAlgorithm::ReduceScatter => {
+            matches!(stage.phase, crate::CollectivePhase::ReduceScatter)
+                && matches!(stage.step.checked_add(1), Some(next) if next == stage.group_size)
+        }
+        _ => {
+            matches!(stage.phase, crate::CollectivePhase::AllGather)
+                && matches!(stage.step.checked_add(1), Some(next) if next == stage.group_size)
+        }
+    }
+}
+
+/// The rank before `rank` on a ring of `group_size` ranks in rank order, without overflow on any
+/// metadata (an out-of-range rank is refused elsewhere).
+const fn previous_rank(rank: u32, group_size: u32) -> u32 {
+    if rank == 0 {
+        group_size.saturating_sub(1)
+    } else {
+        rank - 1
+    }
+}
+
+/// The shape of the predecessors of a stage that follows stage groups (a compute stage, or a
+/// collective's root): it waits, at its host, for the groups it follows there (host-matched
+/// `after`, the ruling on H3's C1). Each local predecessor is a compute stage on its host, or a
+/// completion stage of a collective there (`validate_stage_dependencies` pins the host); each
+/// inbound predecessor is a completion stage of a collective delivering here that also has a
+/// local completion stage here when it is a ring, at the collective's rank `r` here, and on one
+/// ring (`RingNext`) it is rank `r - 1`'s. A send/recv's receiver waits for the send alone, and an
+/// all-to-all rank that sends nothing for the messages delivered to it and its release (the
+/// all-to-all's gate stages here, all local).
+fn validate_entry_predecessors(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+    flow: &crate::FlowDescriptor,
+    dependencies: crate::StageDependencies,
+    inline: InlinePredecessors<'_>,
+) -> Result<(), ValidationError> {
+    let shape_error = || {
+        ValidationError::new(format!(
+            "flow {:?} entry predecessors are neither compute stages nor a collective's completion stages at its host",
+            flow.id
+        ))
+    };
+    let role_of = |candidate: Option<StagedGenerator<'_>>, id| {
+        candidate
+            .or_else(|| flow_index.generator_for_flow(image, id))
+            .and_then(|candidate| candidate.stage)
+            .map(|stage| stage.role)
+    };
+    // The collective this local predecessor completes here, with its rank here, if it is a
+    // collective stage.
+    let local_collective = |id| -> Result<Option<(u64, u32)>, ValidationError> {
+        match role_of(inline.local, id).ok_or_else(shape_error)? {
+            crate::StageRole::Compute(_) => Ok(None),
+            crate::StageRole::Collective(stage) if is_completion_stage(stage) => {
+                Ok(Some((stage.collective_id, stage.rank)))
+            }
+            crate::StageRole::Collective(_) => Err(shape_error()),
+        }
+    };
+    for id in dependencies.local.iter(&image.stage_joins) {
+        local_collective(id)?;
+    }
+    for id in dependencies.inbound.iter(&image.stage_joins) {
+        let Some(crate::StageRole::Collective(inbound)) = role_of(inline.inbound, id) else {
+            return Err(shape_error());
+        };
+        if !is_completion_stage(inbound) {
+            return Err(shape_error());
+        }
+        // A send/recv's receiver waits for the send alone, and an all-to-all rank that sends
+        // nothing for the messages delivered to it (and its release); a ring it follows also
+        // completes here locally, at its rank here.
+        if is_ring_algorithm(inbound.algorithm) {
+            let mut rank_here = None;
+            for local in dependencies.local.iter(&image.stage_joins) {
+                if let Some((collective, rank)) = local_collective(local)? {
+                    if collective == inbound.collective_id {
+                        rank_here = Some(rank);
+                        break;
+                    }
+                }
+            }
+            let Some(rank_here) = rank_here else {
+                return Err(shape_error());
+            };
+            if inbound.channel_policy == crate::CollectiveChannelPolicy::RingNext
+                && inbound.rank != previous_rank(rank_here, inbound.group_size)
+            {
+                return Err(shape_error());
+            }
+        }
     }
     Ok(())
 }
@@ -3917,27 +4511,17 @@ fn validate_packets_and_derive_delays(
         if packet.kind.is_timer_token() {
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
-            let owns_token = image.host_states[source.state_slot as usize]
-                .generators
-                .iter()
-                .any(|generator| {
-                    generator.flow == flow.id
-                        && match (packet.kind, generator.kind) {
-                            (PacketKind::DcqcnControlTimer, FlowGeneratorKind::Dcqcn(dcqcn)) => {
-                                dcqcn.control_timer_payload == packet.id
-                            }
-                            (PacketKind::DcqcnControlTimer, FlowGeneratorKind::Roce(roce)) => {
-                                roce.control_timer_payload == packet.id
-                            }
-                            (PacketKind::RocePacingTimer, FlowGeneratorKind::Roce(roce)) => {
-                                roce.pacing_timer_payload == packet.id
-                            }
-                            _ => false,
+            let owns_token =
+                ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+                    .is_some_and(|generator| match (packet.kind, generator.kind) {
+                        (PacketKind::RocePacingTimer, FlowGeneratorKind::Roce(roce)) => {
+                            roce.pacing_timer_payload == packet.id
                         }
-                });
+                        _ => false,
+                    });
             if packet.size_bytes != 0 || !owns_token {
                 return Err(ValidationError::new(format!(
-                    "DCQCN control token {:?} must be zero-byte NotECT state owned by its DCQCN generator",
+                    "timer token {:?} must be zero-byte NotECT state owned by its queue pair",
                     packet.id
                 )));
             }
@@ -3946,19 +4530,13 @@ fn validate_packets_and_derive_delays(
         if matches!(packet.kind, PacketKind::DcqcnCnp(_)) {
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
-            let is_dcqcn = image.host_states[source.state_slot as usize]
-                .generators
-                .iter()
-                .any(|generator| {
-                    generator.flow == flow.id
-                        && matches!(
-                            generator.kind,
-                            FlowGeneratorKind::Dcqcn(_) | FlowGeneratorKind::Roce(_)
-                        )
-                });
+            let is_dcqcn =
+                ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+                    .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)));
+            // A queue pair echoes ECN on its ACKs and never sends a CNP (P16 ruling D4).
             if packet.size_bytes != 64 || !is_dcqcn {
                 return Err(ValidationError::new(format!(
-                    "DCQCN CNP packet {:?} must be an exact 64-byte NotECT frame bound to a DCQCN generator",
+                    "DCQCN CNP packet {:?} must be an exact 64-byte NotECT frame bound to an unreliable DCQCN generator",
                     packet.id
                 )));
             }
@@ -3982,11 +4560,7 @@ fn validate_packets_and_derive_delays(
             let source =
                 node(image, flow.source).expect("flow validation established the source node");
             let state = &image.host_states[source.state_slot as usize];
-            if !state
-                .generators
-                .iter()
-                .any(|generator| generator.flow == flow.id)
-            {
+            if ascending_generator(state, flow.id).is_none() {
                 return Err(ValidationError::new(format!(
                     "feedback packet {:?} for flow {:?} has no generator at source node {:?}",
                     packet.id, flow.id, flow.source
@@ -4113,9 +4687,9 @@ fn validate_packets_and_derive_delays(
                 FlowGeneratorKind::Roce(roce) => {
                     let feedback_can_be_emitted =
                         generator_can_emit || roce.snd_una < generator.bytes_emitted;
-                    let feedback_sizes = roce_receiver(image, flow).map_or([0, 0], |receiver| {
-                        [receiver.ack_size_bytes, receiver.np.cnp_size_bytes]
-                    });
+                    // A queue pair's feedback is its ACKs and NACKs (P16: no CNP).
+                    let feedback_sizes = roce_receiver(image, flow)
+                        .map_or([0], |receiver| [receiver.ack_size_bytes]);
                     for (index, link_id) in flow.reverse_route.iter().enumerate() {
                         let link = link(image, *link_id)
                             .expect("validated reverse route names an existing link");
@@ -4594,12 +5168,8 @@ fn dcqcn_data_can_still_emit_cnp(
     let Some(source) = node(image, flow.source) else {
         return false;
     };
-    if !image.host_states[source.state_slot as usize]
-        .generators
-        .iter()
-        .any(|generator| {
-            generator.flow == flow.id && matches!(generator.kind, FlowGeneratorKind::Dcqcn(_))
-        })
+    if !ascending_generator(&image.host_states[source.state_slot as usize], flow.id)
+        .is_some_and(|generator| matches!(generator.kind, FlowGeneratorKind::Dcqcn(_)))
     {
         return false;
     }
@@ -5036,11 +5606,6 @@ fn validate_drop_mark_policy(
     queue_index: usize,
     queue: &crate::SwitchQueueState,
 ) -> Result<(), ValidationError> {
-    let queued_packets = u64::try_from(queue.queue.len()).map_err(|_| {
-        ValidationError::new(format!(
-            "switch node {owner:?} queue {queue_index} packet depth exceeds u64"
-        ))
-    })?;
     let queued_bytes = queue.queue.iter().try_fold(0_u64, |total, payload| {
         let size = packet(image, *payload)
             .expect("packet validation precedes drop/mark validation")
@@ -5053,74 +5618,16 @@ fn validate_drop_mark_policy(
     })?;
     match queue.drop_mark {
         crate::DropMarkPolicy::TailDrop => Ok(()),
-        crate::DropMarkPolicy::EcnThreshold(config) => {
-            if config.capacity == 0 || config.threshold == 0 || config.threshold > config.capacity {
+        crate::DropMarkPolicy::EcnRamp(policy) => {
+            crate::ecn_ramp::ecn_ramp_policy_check(&policy).map_err(|reason| {
+                ValidationError::new(format!(
+                    "switch node {owner:?} queue {queue_index} ECN ramp {reason}"
+                ))
+            })?;
+            if queued_bytes > policy.capacity_bytes {
                 return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} ECN threshold must satisfy 0 < threshold <= capacity"
-                )));
-            }
-            let depth = match config.unit {
-                crate::QueueDepthUnit::Packets => queued_packets,
-                crate::QueueDepthUnit::Bytes => queued_bytes,
-            };
-            if depth > config.capacity {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} ECN depth {depth} exceeds policy capacity {}",
-                    config.capacity
-                )));
-            }
-            Ok(())
-        }
-        crate::DropMarkPolicy::Red(state) => {
-            if state.capacity == 0
-                || state.min_threshold >= state.max_threshold
-                || state.max_threshold > state.capacity
-                || state.max_probability_numerator == 0
-                || state.max_probability_denominator == 0
-                || state.max_probability_numerator > state.max_probability_denominator
-            {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED requires 0 <= min < max <= capacity and 0 < max probability <= 1"
-                )));
-            }
-            let depth = match state.unit {
-                crate::QueueDepthUnit::Packets => queued_packets,
-                crate::QueueDepthUnit::Bytes => queued_bytes,
-            };
-            if depth > state.capacity {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED depth {depth} exceeds policy capacity {}",
-                    state.capacity
-                )));
-            }
-            let maximum_average = u128::from(state.capacity)
-                .checked_mul(1_u128 << 32)
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "switch node {owner:?} queue {queue_index} RED average bound exceeds u128"
-                    ))
-                })?;
-            if state.average_scaled > maximum_average {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED average {} exceeds scaled capacity {maximum_average}",
-                    state.average_scaled
-                )));
-            }
-            let probability_numerator = BigUint::from(state.max_probability_numerator);
-            let worst_spacing_numerator = BigUint::from(state.max_probability_denominator)
-                * BigUint::from(state.max_threshold - state.min_threshold)
-                * BigUint::from(1_u128 << 32);
-            let worst_spacing =
-                (&worst_spacing_numerator + &probability_numerator - 1_u8) / probability_numerator;
-            if worst_spacing > BigUint::from(u64::MAX) {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED worst-case signal spacing exceeds u64 counter state"
-                )));
-            }
-            if BigUint::from(state.counter) >= worst_spacing {
-                return Err(ValidationError::new(format!(
-                    "switch node {owner:?} queue {queue_index} RED counter {} is not below its worst-case signal spacing",
-                    state.counter
+                    "switch node {owner:?} queue {queue_index} ECN ramp depth {queued_bytes} exceeds its byte capacity {}",
+                    policy.capacity_bytes
                 )));
             }
             Ok(())
@@ -5252,9 +5759,68 @@ fn validate_channels(
     Ok(())
 }
 
+/// The host-to-host lanes of stage notifies (P16 H2), as channel indices.
+///
+/// A stage notify's lane is the channel from its source host to its target host on a link that
+/// joins exactly those hosts: one per host pair, with event kind `RemoteArrival`, a positive
+/// latency, and a link no routed packet crosses (so out-of-band delivery is all it carries). An
+/// image without stage notifies has no lanes, whatever host-to-host links it declares.
+fn validate_notify_lanes(
+    image: &SimulationImage,
+    flow_index: &FlowIndex,
+    derived_delays: &DerivedChannelDelays,
+) -> Result<BTreeSet<usize>, ValidationError> {
+    let mut lanes = BTreeSet::new();
+    if !flow_index.has_stage_generators() {
+        return Ok(lanes);
+    }
+    let mut candidates = BTreeMap::<(NodeId, NodeId), Vec<usize>>::new();
+    for flow in &image.flows {
+        if flow_index.is_notify_flow(image, flow.id) {
+            candidates.entry((flow.source, flow.target)).or_default();
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(lanes);
+    }
+    for (index, channel) in image.channels.iter().enumerate() {
+        let Some(link) = link(image, channel.link) else {
+            continue;
+        };
+        if let Some(found) = candidates.get_mut(&(link.source, link.target)) {
+            if channel.source == link.source && channel.target == link.target {
+                found.push(index);
+            }
+        }
+    }
+    for ((source, target), found) in candidates {
+        let [index] = found[..] else {
+            return Err(ValidationError::new(format!(
+                "stage notifies from {source:?} to {target:?} need exactly one lane, found {}",
+                found.len()
+            )));
+        };
+        let channel = image.channels[index];
+        if channel.event_kind != EventKind::RemoteArrival
+            || channel.min_delay_ns == 0
+            || derived_delays
+                .possible
+                .contains_key(&(channel.link, channel.target))
+        {
+            return Err(ValidationError::new(format!(
+                "channel {index} is not a stage-notify lane: it must deliver RemoteArrival after a \
+                 positive latency on a link no routed packet crosses"
+            )));
+        }
+        lanes.insert(index);
+    }
+    Ok(lanes)
+}
+
 fn validate_events(
     image: &SimulationImage,
     pfc_channels: &BTreeSet<usize>,
+    lane_channels: &BTreeSet<usize>,
 ) -> Result<(), ValidationError> {
     let declared_route_channels = image
         .channels
@@ -5386,7 +5952,19 @@ fn validate_events(
                 }
             }
             EventKind::RemoteArrival => {
-                if let PacketKind::Pfc(header) = packet.kind {
+                if packet.kind == PacketKind::StageNotify {
+                    // P16 H2: a stage notify crosses its host pair's lane, source to target.
+                    let on_lane = lane_channels.iter().any(|channel_index| {
+                        let channel = &image.channels[*channel_index];
+                        channel.source == origin.id && channel.target == event.target
+                    });
+                    if !on_lane || origin.id != flow.source || event.target != flow.target {
+                        return Err(ValidationError::new(format!(
+                            "stage notify RemoteArrival event {index} from {:?} to {:?} is not on its flow's lane",
+                            origin.id, event.target
+                        )));
+                    }
+                } else if let PacketKind::Pfc(header) = packet.kind {
                     let matching_lane = pfc_channels.iter().copied().find(|channel_index| {
                         let channel = &image.channels[*channel_index];
                         channel.source == origin.id
@@ -5444,7 +6022,10 @@ fn validate_events(
                         event.payload, flow.source
                     )));
                 }
-                if !packet.kind.is_data() && !packet.kind.is_timer_token() {
+                if !packet.kind.is_data()
+                    && !packet.kind.is_timer_token()
+                    && packet.kind != PacketKind::StageNotify
+                {
                     return Err(ValidationError::new(format!(
                         "PacingTimer event {index} references non-data payload {:?}",
                         event.payload
@@ -5678,27 +6259,6 @@ fn dcqcn_payload_allocations(
     rate_payload_allocations(image, generator.with_generator(&fastest))
 }
 
-fn executable_dcqcn_control_ticks(
-    image: &SimulationImage,
-    dcqcn: crate::DcqcnGenerator,
-) -> BigUint {
-    executable_control_ticks(image, dcqcn.controller)
-}
-
-/// Control ticks a DCQCN controller can still run until the stop time, its pending one included.
-fn executable_control_ticks(
-    image: &SimulationImage,
-    controller: crate::DcqcnController,
-) -> BigUint {
-    if controller.next_control_time_ns > image.stop_time_ns {
-        return BigUint::from(0_u8);
-    }
-    BigUint::from(
-        (image.stop_time_ns - controller.next_control_time_ns)
-            / controller.config.control_interval_ns,
-    ) + 1_u8
-}
-
 /// Pacing ticks a RoCE queue pair can still run until the stop time, its pending one included.
 ///
 /// Every tick lies on the grid anchored at `first_pacing_time_ns` and emits at most one data
@@ -5761,16 +6321,14 @@ fn roce_receiver<'a>(
         .roce_receivers
         .as_deref()?;
     receivers
-        .binary_search_by_key(&flow.id, |receiver| receiver.np.flow)
+        .binary_search_by_key(&flow.id, |receiver| receiver.flow)
         .ok()
         .map(|index| &receivers[index])
 }
 
-/// The largest feedback packet of a RoCE flow: an ACK or NACK, or a CNP.
+/// The largest feedback packet of a RoCE flow: an ACK or NACK (P16: no CNP).
 fn roce_feedback_max_bytes(image: &SimulationImage, flow: &FlowDescriptor) -> u64 {
-    roce_receiver(image, flow).map_or(0, |receiver| {
-        receiver.ack_size_bytes.max(receiver.np.cnp_size_bytes)
-    })
+    roce_receiver(image, flow).map_or(0, |receiver| receiver.ack_size_bytes)
 }
 
 /// The largest data packet a RoCE queue pair can still send: a retransmission may resend any
@@ -5789,35 +6347,6 @@ fn roce_future_data_min_bytes(roce: crate::RoceGenerator) -> u64 {
     } else {
         tail
     }
-}
-
-fn latest_dcqcn_control_time(
-    image: &SimulationImage,
-    generator: StagedGenerator<'_>,
-) -> Result<u64, ValidationError> {
-    let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
-        unreachable!("DCQCN control deadline requires DCQCN state")
-    };
-    let ticks = executable_dcqcn_control_ticks(image, dcqcn);
-    if ticks == BigUint::from(0_u8) {
-        return Ok(0);
-    }
-    let computed_successor = BigUint::from(dcqcn.controller.next_control_time_ns)
-        + BigUint::from(dcqcn.controller.config.control_interval_ns) * &ticks;
-    if computed_successor > BigUint::from(u64::MAX) {
-        return Err(ValidationError::new(format!(
-            "flow {:?} DCQCN control timer successor exceeds u64",
-            generator.flow
-        )));
-    }
-    let latest_event =
-        computed_successor - BigUint::from(dcqcn.controller.config.control_interval_ns);
-    u64::try_from(latest_event).map_err(|_| {
-        ValidationError::new(format!(
-            "flow {:?} latest DCQCN control time exceeds u64",
-            generator.flow
-        ))
-    })
 }
 
 fn latest_dcqcn_pacing_time(
@@ -6070,11 +6599,6 @@ fn validate_global_time_capacity(
                         generator.kind,
                         FlowGeneratorKind::Rate(_) | FlowGeneratorKind::Dcqcn(_)
                     )
-                || matches!(
-                    generator.kind,
-                    FlowGeneratorKind::Dcqcn(dcqcn)
-                        if dcqcn.controller.next_control_time_ns <= image.stop_time_ns
-                )
                 || matches!(generator.kind, FlowGeneratorKind::Roce(_))
         })
         .map(|generator| match generator.kind {
@@ -6108,9 +6632,9 @@ fn validate_global_time_capacity(
                 } else {
                     0
                 };
-                Ok(pacing.max(latest_dcqcn_control_time(image, generator)?))
+                Ok(pacing)
             }
-            // Pacing and control ticks run at most to the stop time; a retransmission timeout
+            // Pacing ticks run at most to the stop time; a retransmission timeout
             // armed before it ends within `rto_ns`, which generator validation bounds.
             FlowGeneratorKind::Roce(_) => Ok(image.stop_time_ns),
         })
@@ -6449,66 +6973,41 @@ struct FutureWork {
     pfc_by_channel: Vec<u64>,
 }
 
-fn validate_dcqcn_arithmetic_capacity(
+/// The flows whose route (data) or reverse route (feedback) enters each PFC controller through
+/// its controlled link, by monitor `(controlled link, controller)`, each list in flow order: one
+/// pass over the routes instead of one pass over every flow per monitor (P16 H3 part 2B).
+fn pfc_entering_flows(
     image: &SimulationImage,
-    work: &FutureWork,
-) -> Result<(), ValidationError> {
-    let resident_cnp_flows = executable_resident_packets(image)
-        .into_iter()
-        .filter_map(|packet| matches!(packet.kind, PacketKind::DcqcnCnp(_)).then_some(packet.flow))
-        .collect::<BTreeSet<_>>();
-    for generator in image.host_states.iter().flat_map(staged_generators) {
-        let FlowGeneratorKind::Dcqcn(dcqcn) = generator.kind else {
-            continue;
-        };
-        let index = generator.flow.0 as usize;
-        let cnp_can_arrive =
-            work.dcqcn_cnp_by_flow[index] != 0 || resident_cnp_flows.contains(&generator.flow);
-        if cnp_can_arrive
-            && dcqcn.controller.last_cnp_time_ns.is_some_and(|last| {
-                last.checked_add(dcqcn.controller.config.cnp_interval_ns)
-                    .is_none()
-            })
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} DCQCN CNP interval deadline can exceed u64 while feedback remains executable",
-                generator.flow
-            )));
-        }
-
-        let executable_packets = executable_dcqcn_packets(image, generator)?;
-        let remaining_bytes = dcqcn.rate.total_bytes - generator.bytes_emitted;
-        let executable_bytes = u128::from(executable_packets)
-            .checked_mul(u128::from(dcqcn.rate.packet_size_bytes))
-            .map(|bytes| bytes.min(u128::from(remaining_bytes)))
-            .ok_or_else(|| {
-                ValidationError::new(format!(
-                    "flow {:?} DCQCN executable byte bound exceeds u128",
-                    generator.flow
-                ))
-            })?;
-        if u128::from(dcqcn.controller.bytes_since_increase) + executable_bytes
-            > u128::from(u64::MAX)
-        {
-            return Err(ValidationError::new(format!(
-                "flow {:?} DCQCN byte counter can exceed u64 across {executable_packets} executable packets",
-                generator.flow
-            )));
+) -> BTreeMap<(LinkId, NodeId), (Vec<usize>, Vec<usize>)> {
+    let mut entering = image
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::Switch)
+        .flat_map(|owner| {
+            image.switch_states[owner.state_slot as usize]
+                .queues
+                .iter()
+                .filter_map(|queue| queue.pfc.as_ref())
+                .flat_map(|pfc| &pfc.ingresses)
+                .map(move |ingress| ((ingress.controlled_link, owner.id), Default::default()))
+        })
+        .collect::<BTreeMap<_, (Vec<usize>, Vec<usize>)>>();
+    for (index, flow) in image.flows.iter().enumerate() {
+        for (route, data) in [(&flow.route, true), (&flow.reverse_route, false)] {
+            for pair in route.windows(2) {
+                let Some(lists) =
+                    link(image, pair[1]).and_then(|next| entering.get_mut(&(pair[0], next.source)))
+                else {
+                    continue;
+                };
+                let list = if data { &mut lists.0 } else { &mut lists.1 };
+                if list.last() != Some(&index) {
+                    list.push(index);
+                }
+            }
         }
     }
-    Ok(())
-}
-
-fn route_enters_pfc_controller(
-    image: &SimulationImage,
-    route: &[LinkId],
-    controlled_link: LinkId,
-    controller: NodeId,
-) -> bool {
-    route.windows(2).any(|pair| {
-        pair[0] == controlled_link
-            && link(image, pair[1]).is_some_and(|next| next.source == controller)
-    })
+    entering
 }
 
 fn future_work(
@@ -6574,6 +7073,8 @@ fn future_work(
     // Grouped after the counting loop above so that a resident whose flow is outside the dense
     // table still reaches that loop's direct index first, exactly as before.
     let resident_groups = ResidentFlowGroups::build(image, &resident_packets);
+    // Built at the first PFC monitor, so an image without one never builds it.
+    let mut entering = None;
     let mut pfc_by_node = vec![0_u64; image.nodes.len()];
     let mut pfc_by_channel = vec![0_u64; image.channels.len()];
     for owner in image
@@ -6593,60 +7094,61 @@ fn future_work(
             })
         {
             let mut controller_frames = 0_u64;
-            for flow in &image.flows {
-                // Data is monitored in the flow's class, receiver feedback in its feedback class.
-                let data_monitored = ingress.xoff_threshold_bytes[usize::from(flow.priority)] != 0;
-                let feedback_monitored =
-                    ingress.xoff_threshold_bytes[usize::from(flow.feedback_priority)] != 0;
-                if !data_monitored && !feedback_monitored {
-                    continue;
-                }
+            let (data_flows, feedback_flows) = entering
+                .get_or_insert_with(|| pfc_entering_flows(image))
+                .get(&(ingress.controlled_link, owner.id))
+                .map_or((&[][..], &[][..]), |(data, feedback)| {
+                    (data.as_slice(), feedback.as_slice())
+                });
+            // The packets of one flow and kind that can still enter the controller.
+            let reachable = |flow: &FlowDescriptor, data: bool| -> Result<u64, ValidationError> {
+                let past_resident = u64::try_from(
+                    resident_groups
+                        .group(image, &resident_packets, flow.id)
+                        .filter(|packet| {
+                            if data {
+                                packet.kind.is_data()
+                            } else {
+                                packet.kind.is_feedback()
+                            }
+                        })
+                        .filter(|packet| {
+                            !packet_can_still_cross_link(image, packet, ingress.controlled_link)
+                        })
+                        .count(),
+                )
+                .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
+                let total = if data {
+                    data_by_flow[flow.id.0 as usize]
+                } else {
+                    feedback_by_flow[flow.id.0 as usize]
+                };
+                Ok(total.checked_sub(past_resident).expect(
+                    "resident data and feedback counts are included in the per-flow totals",
+                ))
+            };
+            // Flow by flow, as the union of the two lists (both in flow order), so the counters
+            // see the same additions in the same order as a pass over every flow would.
+            let mut data_flows = data_flows.iter().copied().peekable();
+            let mut feedback_flows = feedback_flows.iter().copied().peekable();
+            while let Some(index) = match (data_flows.peek(), feedback_flows.peek()) {
+                (Some(&data), Some(&feedback)) => Some(data.min(feedback)),
+                (Some(&data), None) => Some(data),
+                (None, Some(&feedback)) => Some(feedback),
+                (None, None) => None,
+            } {
+                let flow = &image.flows[index];
                 let mut monitored_packets = 0_u64;
-                if data_monitored
-                    && route_enters_pfc_controller(
-                        image,
-                        &flow.route,
-                        ingress.controlled_link,
-                        owner.id,
-                    )
+                // Data is monitored in the flow's class, receiver feedback in its feedback class.
+                if data_flows.next_if_eq(&index).is_some()
+                    && ingress.xoff_threshold_bytes[usize::from(flow.priority)] != 0
                 {
-                    let past_resident = u64::try_from(
-                        resident_groups
-                            .group(image, &resident_packets, flow.id)
-                            .filter(|packet| packet.kind.is_data())
-                            .filter(|packet| {
-                                !packet_can_still_cross_link(image, packet, ingress.controlled_link)
-                            })
-                            .count(),
-                    )
-                    .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
-                    let reachable = data_by_flow[flow.id.0 as usize]
-                        .checked_sub(past_resident)
-                        .expect("resident data count is included in the per-flow total");
-                    add_packet_count(&mut monitored_packets, reachable)?;
+                    add_packet_count(&mut monitored_packets, reachable(flow, true)?)?;
                 }
-                if feedback_monitored
-                    && route_enters_pfc_controller(
-                        image,
-                        &flow.reverse_route,
-                        ingress.controlled_link,
-                        owner.id,
-                    )
+                if feedback_flows.next_if_eq(&index).is_some()
+                    && ingress.xoff_threshold_bytes[usize::from(flow.feedback_priority)] != 0
                 {
-                    let past_resident = u64::try_from(
-                        resident_groups
-                            .group(image, &resident_packets, flow.id)
-                            .filter(|packet| packet.kind.is_feedback())
-                            .filter(|packet| {
-                                !packet_can_still_cross_link(image, packet, ingress.controlled_link)
-                            })
-                            .count(),
-                    )
-                    .map_err(|_| ValidationError::new("PFC resident packet count exceeds u64"))?;
-                    let reachable = feedback_by_flow[flow.id.0 as usize]
-                        .checked_sub(past_resident)
-                        .expect("resident feedback count is included in the per-flow total");
-                    add_packet_count(&mut monitored_packets, reachable)?;
+                    add_packet_count(&mut monitored_packets, reachable(flow, false)?)?;
                 }
                 let frames = monitored_packets
                     .checked_mul(2)
@@ -7163,7 +7665,7 @@ fn validate_origin_sequences(
                         })?
                     }
                 }
-                FlowGeneratorKind::Dcqcn(dcqcn) => {
+                FlowGeneratorKind::Dcqcn(_) => {
                     let pacing_ticks = executable_dcqcn_pacing_ticks(image, generator)?;
                     let pacing_successors = if pacing_ticks == BigUint::from(0_u8) {
                         0
@@ -7175,51 +7677,20 @@ fn validate_origin_sequences(
                             ))
                         })?
                     };
-                    let control_ticks = executable_dcqcn_control_ticks(image, dcqcn);
-                    let control_successors = if control_ticks == BigUint::from(0_u8) {
-                        0
-                    } else {
-                        u64::try_from(control_ticks - 1_u8).map_err(|_| {
-                            ValidationError::new(format!(
-                                "flow {:?} DCQCN successor control-timer count exceeds u64",
-                                generator.flow
-                            ))
-                        })?
-                    };
                     pacing_successors
-                        .checked_add(control_successors)
-                        .ok_or_else(|| {
-                            ValidationError::new(format!(
-                                "flow {:?} DCQCN successor timer count exceeds u64",
-                                generator.flow
-                            ))
-                        })?
                 }
                 FlowGeneratorKind::Roce(roce) => {
-                    // Every pacing tick, restarts included, every control tick and every timeout
-                    // installation is one emitted event (a conservative count: the pending tick
-                    // and control tick already exist).
+                    // Every pacing tick, restarts included, and every timeout installation is one
+                    // emitted event (a conservative count: the pending tick already exists).
                     let pacing_ticks = roce_grid_ticks(image, &generator, roce);
                     let data_packets = executable_generator_packets(image, generator)?;
-                    // The DCQCN count in u64 arithmetic, with no heap allocation per queue pair.
-                    let controller = roce.controller;
-                    let control_ticks = if controller.next_control_time_ns > image.stop_time_ns {
-                        0
-                    } else {
-                        (image.stop_time_ns - controller.next_control_time_ns)
-                            / controller.config.control_interval_ns
-                            + 1
-                    };
                     let timers = roce_timer_installations(image, roce, pacing_ticks, data_packets)?;
-                    pacing_ticks
-                        .checked_add(control_ticks)
-                        .and_then(|total| total.checked_add(timers))
-                        .ok_or_else(|| {
-                            ValidationError::new(format!(
-                                "flow {:?} RoCE timer event count exceeds u64",
-                                generator.flow
-                            ))
-                        })?
+                    pacing_ticks.checked_add(timers).ok_or_else(|| {
+                        ValidationError::new(format!(
+                            "flow {:?} RoCE timer event count exceeds u64",
+                            generator.flow
+                        ))
+                    })?
                 }
             };
             emissions_by_node[owner.id.0 as usize] += u128::from(emissions);
@@ -7370,11 +7841,11 @@ fn validate_payload_sequences(
                 FlowGeneratorKind::Rate(_) => rate_payload_allocations(image, generator)?,
                 FlowGeneratorKind::Dcqcn(_) => dcqcn_payload_allocations(image, generator)?,
                 FlowGeneratorKind::Roce(_) => {
-                    // Its two timer tokens were allocated at lowering; every data packet,
+                    // Its pacing token was allocated at lowering; every data packet,
                     // retransmissions included, takes a fresh payload when it is sent.
                     consumed_sequences = consumed_sequences
                         .checked_add(generator.packets_emitted)
-                        .and_then(|total| total.checked_add(2))
+                        .and_then(|total| total.checked_add(1))
                         .ok_or_else(|| {
                             ValidationError::new(format!(
                                 "node {:?} consumed payload sequence count exceeds u64",
@@ -7402,12 +7873,6 @@ fn validate_payload_sequences(
             consumed_sequences = consumed_sequences
                 .checked_add(generator.packets_emitted)
                 .and_then(|total| total.checked_add(already_scheduled))
-                .and_then(|total| {
-                    total.checked_add(u64::from(matches!(
-                        generator.kind,
-                        FlowGeneratorKind::Dcqcn(_)
-                    )))
-                })
                 .ok_or_else(|| {
                     ValidationError::new(format!(
                         "node {:?} consumed payload sequence count exceeds u64",
@@ -7455,17 +7920,14 @@ fn validate_payload_sequences(
                 })?;
         }
         for receiver in state.roce_receivers.iter().flatten() {
-            // One ACK or NACK and one CNP per data arrival.
-            let arrivals = work.data_by_flow[receiver.np.flow.0 as usize];
-            allocations = arrivals
-                .checked_mul(2)
-                .and_then(|feedback| allocations.checked_add(feedback))
-                .ok_or_else(|| {
-                    ValidationError::new(format!(
-                        "node {:?} generated RoCE feedback count exceeds u64",
-                        owner.id
-                    ))
-                })?;
+            // At most one ACK or NACK per data arrival (P16: no CNP).
+            let arrivals = work.data_by_flow[receiver.flow.0 as usize];
+            allocations = allocations.checked_add(arrivals).ok_or_else(|| {
+                ValidationError::new(format!(
+                    "node {:?} generated RoCE feedback count exceeds u64",
+                    owner.id
+                ))
+            })?;
         }
         if state.next_payload_seq < consumed_sequences {
             return Err(ValidationError::new(format!(
@@ -7615,20 +8077,22 @@ fn packet_route(flow: &FlowDescriptor, packet_kind: PacketKind) -> &[LinkId] {
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => &flow.reverse_route,
-        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => &[],
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => &[],
     }
 }
 
 fn packet_terminal(flow: &FlowDescriptor, packet_kind: PacketKind) -> NodeId {
     match packet_kind {
-        PacketKind::Data | PacketKind::TcpData(_) | PacketKind::RoceData(_) => flow.target,
+        PacketKind::Data
+        | PacketKind::TcpData(_)
+        | PacketKind::RoceData(_)
+        | PacketKind::StageNotify => flow.target,
         PacketKind::Feedback
         | PacketKind::TcpAck(_)
         | PacketKind::Pfc(_)
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_)
-        | PacketKind::DcqcnControlTimer
         | PacketKind::RocePacingTimer => flow.source,
     }
 }
@@ -7800,7 +8264,7 @@ mod legacy_scans {
         image: &SimulationImage,
         position: super::CollectivePosition,
     ) -> Option<StagedGenerator<'_>> {
-        let (collective_id, phase, rank, step) = position;
+        let (collective_id, phase, channel, rank, step) = position;
         image
             .host_states
             .iter()
@@ -7809,6 +8273,7 @@ mod legacy_scans {
                 super::collective_identity(*candidate).is_some_and(|stage| {
                     stage.collective_id == collective_id
                         && stage.phase == phase
+                        && stage.channel == channel
                         && stage.rank == rank
                         && stage.step == step
                 })
@@ -7937,8 +8402,8 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
     for generator in image.host_states.iter().flat_map(staged_generators) {
         generator_queries.push(generator.flow);
         if let Some(stage) = generator.stage {
-            generator_queries.extend(stage.dependencies.local_predecessor);
-            generator_queries.extend(stage.dependencies.inbound_predecessor);
+            generator_queries.extend(stage.dependencies.local.iter(&image.stage_joins));
+            generator_queries.extend(stage.dependencies.inbound.iter(&image.stage_joins));
         }
     }
     for packet in &image.initial_packets {
@@ -7982,29 +8447,22 @@ pub fn assert_validate_generator_index_equivalent_for_testing(
         };
         let other_phase = match stage.phase {
             crate::CollectivePhase::ReduceScatter => crate::CollectivePhase::AllGather,
-            crate::CollectivePhase::AllGather => crate::CollectivePhase::ReduceScatter,
+            _ => crate::CollectivePhase::ReduceScatter,
         };
+        let (id, phase, channel, rank, step) = (
+            stage.collective_id,
+            stage.phase,
+            stage.channel,
+            stage.rank,
+            stage.step,
+        );
         positions.extend([
-            (stage.collective_id, stage.phase, stage.rank, stage.step),
-            (
-                stage.collective_id.wrapping_add(1),
-                stage.phase,
-                stage.rank,
-                stage.step,
-            ),
-            (stage.collective_id, other_phase, stage.rank, stage.step),
-            (
-                stage.collective_id,
-                stage.phase,
-                stage.rank.wrapping_add(1),
-                stage.step,
-            ),
-            (
-                stage.collective_id,
-                stage.phase,
-                stage.rank,
-                stage.step.wrapping_sub(1),
-            ),
+            (id, phase, channel, rank, step),
+            (id.wrapping_add(1), phase, channel, rank, step),
+            (id, other_phase, channel, rank, step),
+            (id, phase, channel.wrapping_add(1), rank, step),
+            (id, phase, channel, rank.wrapping_add(1), step),
+            (id, phase, channel, rank, step.wrapping_sub(1)),
         ]);
     }
     positions.sort_unstable();

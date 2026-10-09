@@ -16,14 +16,14 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
     let stdout = String::from_utf8(output.stdout).expect("sizing report must be UTF-8");
     assert!(stdout.contains(
         "record=device_sizing_protocol \
-         mode=host_arithmetic_only allocates_device=false executes_simulation=false plane_count=28"
+         mode=host_arithmetic_only allocates_device=false executes_simulation=false plane_count=29"
     ));
     assert_eq!(
         stdout
             .lines()
             .filter(|line| line.starts_with("record=device_sizing_plane "))
             .count(),
-        28
+        29
     );
     let plane_names = stdout
         .lines()
@@ -65,8 +65,19 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
             "stream_state",
             "stream_records",
             "scheduler_state",
+            "tcp_state",
         ]
     );
+    // P16 G2: both planners allocate `tcp_state` for every image, so the projection reports it for
+    // this open-loop image too: a 7-word receiver row, a 6-word ledger row and one 5-word ledger
+    // record per flow, and no stage or RoCE region. The image has 5,530 flows (one generator stream
+    // of 2 slots each, below).
+    const FLOWS: usize = 11_060 / 2;
+    assert!(stdout.contains(&format!(
+        "record=device_sizing_plane index=28 name=tcp_state words={} bytes={} ",
+        18 * FLOWS,
+        18 * FLOWS * 8
+    )));
     // T21 fix 2 appended the per-round FEL root cache to `stream_state`: two words per LP. O2.12
     // additionally sizes stream records at their exact 11/5/10-word physical widths. The literals
     // below exclude the root-cache region so that its size remains image-derived.
@@ -84,5 +95,5 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
         490_621_544_usize + round_scratch_bytes,
         512_474_568_usize + round_scratch_bytes,
     )));
-    assert!(stdout.contains("record=device_sizing_total plane_count=28 total_device_bytes="));
+    assert!(stdout.contains("record=device_sizing_total plane_count=29 total_device_bytes="));
 }

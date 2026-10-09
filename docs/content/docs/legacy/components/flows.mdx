@@ -17,6 +17,29 @@ The source and sink implementations depend on `flow_type`:
 
 `starts_before` and `starts_after` become `FlowFinishMsg` connections. Distribution sinks signal completion; TCP and DCQCN sources signal completion after their feedback-driven work finishes.
 
+## DCQCN configuration
+
+Legacy DCQCN requires `-p days-legacy --features dcqcn` and this table (`StrictDcqcn` in `legacy/src/config.rs`):
+
+```toml
+[flow.traffic.dcqcn]
+rate_gbps = 10.0
+min_rate_gbps = 1.0
+max_rate_gbps = 10.0
+g = 0.5
+ai_rate_gbps = 0.5
+hai_rate_gbps = 1.0
+mi_factor = 0.5
+rtt_ns = 100000.0
+cnp_interval_ns = 50000.0
+pacing_interval_ns = 1000.0
+cnp_priority = 0
+```
+
+Rates must satisfy `min_rate_gbps <= rate_gbps <= max_rate_gbps`. `g` and `mi_factor` must lie in `0..=1`; priorities must lie in `0..=7`. The strict loader rejects any other key in this table.
+
+This is the paper-form controller. Days AGO replaced it in P16 with the Mellanox form, whose `[flow.traffic.dcqcn]` keys are on the [Days AGO flows](/docs/configuration/flows#dcqcn) page. The two tables differ: Days AGO rejects `mi_factor`, `rtt_ns` and `increase_byte_threshold` by name, and the strict legacy loader rejects the keys only Days AGO has (`alpha_resume_interval_ns`, `rate_decrease_interval_ns`, `rp_timer_ns`, `fast_recovery_times`, `clamp_target_rate`). The committed `configs/dcqcn_*.toml` and `configs/ci/leanguard_dcqcn.toml` scenarios set `mi_factor` and are legacy inputs; the Days AGO DCQCN fixtures are under `configs/p14/`, `configs/p15/` and `configs/p16/`.
+
 ## Routing
 
 `Flow::compute_path` produces a path containing the source actor, switch IDs, and sink actor. `Topology::route_flows` installs two per-flow tables in each switch:

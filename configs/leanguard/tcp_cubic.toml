@@ -1,0 +1,80 @@
+# LeanGuard CI fixture (Days AGO TCP CUBIC): five TCP CUBIC flows from hosts 0-4 share switch 6's
+# egress to host 5. An 8-packet TailDrop queue forces losses, so the trace covers every tcp_check
+# CUBIC coverpoint: exact new ACK and congestion avoidance, K, duplicate ACK, fast-recovery
+# entry, inflation, partial and full ACK, and timeout. tests/leanguard_certificates.rs lowers it
+# and writes the Scalar certificate lean/fixtures/tcp/cubic-compiled-tcp-events.csv.
+seed = 16
+edges = [[0, 6],[1, 6],[2, 6],[3, 6],[4, 6],[5, 6]]
+hosts = [0, 1, 2, 3, 4, 5]
+duration = 2.0
+
+[switch]
+port_rate = 1000000000
+capacity = 8
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[0, 5]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "CUBIC"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[1, 5]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "CUBIC"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[2, 5]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "CUBIC"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[3, 5]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "CUBIC"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[4, 5]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "CUBIC"

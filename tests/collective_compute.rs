@@ -153,11 +153,11 @@ fn compute_stages_lower_to_timer_only_generators() {
             StageRole::Collective(identity) => {
                 let root = identity.step == 1
                     && identity.phase == days_executor::CollectivePhase::ReduceScatter;
-                assert!(stage.dependencies.local_predecessor.is_some());
+                assert!(stage.dependencies.local.one().is_some());
                 if root {
-                    assert!(stage.dependencies.inbound_predecessor.is_none());
+                    assert!(stage.dependencies.inbound.one().is_none());
                     assert!(!stage.activated);
-                    let predecessor = stage.dependencies.local_predecessor.unwrap();
+                    let predecessor = stage.dependencies.local.one().unwrap();
                     assert_eq!(
                         stages[&(FORWARD_NS, identity.rank)].0,
                         predecessor,
@@ -227,7 +227,7 @@ fn compute_ring_compute_chain_has_exact_completion_times() {
             .expect("backward compute activates");
         assert_eq!(activation.stage_kind, CollectiveStageKind::Compute);
         assert_eq!(activation.duration_ns, BACKWARD_NS);
-        let local = acknowledged[&activation.local_predecessor.unwrap()];
+        let local = acknowledged[&tcp::stage_predecessors(&image)[&activation.flow].0.unwrap()];
         let inbound_rows = rows
             .iter()
             .filter(|row| {
@@ -250,9 +250,11 @@ fn compute_ring_compute_chain_has_exact_completion_times() {
         );
     }
 
-    let csv =
-        collective_transitions_csv(&result.diagnostics.as_ref().unwrap().mechanism_transitions)
-            .unwrap();
+    let csv = collective_transitions_csv(
+        &result.diagnostics.as_ref().unwrap().mechanism_transitions,
+        &image,
+    )
+    .unwrap();
     assert!(
         csv.lines()
             .next()
@@ -329,12 +331,22 @@ fn compute_dependency_errors_are_precise() {
         "invalid scenario: stage group dependencies form a cycle through `a`"
     );
     let named = base.replace("[[collective]]\n", "[[collective]]\nname = \"ring\"\n");
-    assert_eq!(
-        lowering_error(&format!(
-            "{named}\n[[compute]]\nname = \"a\"\nhosts = [0, 1]\nduration_ns = 1\nafter = \"ring\"\n"
-        )),
-        "invalid scenario: compute `a` hosts must equal the ranks of `ring` in order"
-    );
+    // Host-matched `after` (the ruling on H3's C1): a compute on some of the ring's hosts waits
+    // for the ring at each of them, so it lowers.
+    let subset = std::env::temp_dir().join(format!(
+        "days-p14-compute-subset-{}.toml",
+        std::process::id()
+    ));
+    fs::write(
+        &subset,
+        format!(
+            "{named}\n[[compute]]\nname = \"a\"\nhosts = [1, 0]\nduration_ns = 1\nafter = \"ring\"\n"
+        ),
+    )
+    .unwrap();
+    let lowered = compile_config(&subset);
+    fs::remove_file(subset).unwrap();
+    lowered.expect("a compute on some of the ring's hosts lowers");
     assert_eq!(
         lowering_error(&format!(
             "{named}\n[[compute]]\nname = \"ring\"\nhosts = [0, 1, 2]\nduration_ns = 1\n"
@@ -380,17 +392,17 @@ fn compute_validator_rejects_inconsistent_stage_state() {
                 .unwrap()
                 .activated = true;
         },
-        format!("flow {backward:?} compute release flag disagrees with its prerequisites"),
+        format!("flow {backward:?} stage release flag disagrees with its prerequisites"),
     );
     reject(
         &|image| {
             let host = &mut image.host_states[slot];
             let mut dependencies = host.stage_dependencies(index).unwrap();
-            dependencies.local_predecessor = Some(forward);
+            dependencies.local = days_executor::StagePredecessors::One(forward);
             host.set_stage_dependencies(index, dependencies);
         },
         format!(
-            "flow {backward:?} compute predecessors are neither a same-rank compute stage nor a collective's final stages"
+            "flow {backward:?} entry predecessors are neither compute stages nor a collective's completion stages at its host"
         ),
     );
     reject(
@@ -401,12 +413,7 @@ fn compute_validator_rejects_inconsistent_stage_state() {
             host.set_stage_dependencies(index, dependencies);
         },
         format!(
-            "flow {backward:?} compute inbound bytes 1 disagree with the in-order TCP frontier Some(0) of flow {:?}",
-            image.host_states[slot]
-                .stage_dependencies(index)
-                .unwrap()
-                .inbound_predecessor
-                .unwrap()
+            "flow {backward:?} stage inbound bytes 1 disagree with the in-order frontiers 0 of its inbound predecessors"
         ),
     );
     let (slot, index) = locate(&image, forward);
@@ -432,7 +439,7 @@ fn compute_validator_rejects_inconsistent_stage_state() {
 }
 
 #[test]
-fn compute_only_scenarios_run_on_scalar_and_cpu_and_are_refused_on_devices() {
+fn compute_only_scenarios_run_on_scalar_and_cpu_and_validate_on_devices() {
     let config = r#"
 seed = 26
 edges = [[0, 2], [1, 2]]
@@ -457,11 +464,10 @@ duration_ns = 7000
 after = "a"
 "#;
     let image = tcp::compile_text("compute-only", config);
+    // P16 G1: the device backends accept compute stages (identity in
+    // `tests/p16_device_collectives.rs`).
     for backend in [Backend::Metal, Backend::Cuda] {
-        assert_eq!(
-            validate(&image, backend).unwrap_err().to_string(),
-            format!("backend {backend} does not support collective generators; use Scalar or Cpu")
-        );
+        validate(&image, backend).expect("devices accept compute stages");
     }
     let result = run_everywhere(&image, "compute-only");
     assert!(result.pending_events.is_empty());

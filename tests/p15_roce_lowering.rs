@@ -57,7 +57,7 @@ fn receiver(image: &SimulationImage, flow: days_executor::FlowId) -> RoceReceive
         .expect("a QP's target host holds RoCE receivers");
     *receivers
         .iter()
-        .find(|receiver| receiver.np.flow == flow)
+        .find(|receiver| receiver.flow == flow)
         .expect("the QP has a receiver on its target host")
 }
 
@@ -107,14 +107,14 @@ fn every_p15_fixture_lowers_to_queue_pairs_with_receivers_and_two_tokens() {
                 packet(&image, roce.pacing_timer_payload).kind,
                 PacketKind::RocePacingTimer
             );
+            // The Mellanox-form controller owns no token and no event (P16 ruling D2).
+            let token = packet(&image, roce.pacing_timer_payload);
+            assert_eq!((token.flow, token.size_bytes), (flow, 0), "{name}");
             assert_eq!(
-                packet(&image, roce.control_timer_payload).kind,
-                PacketKind::DcqcnControlTimer
+                roce.controller,
+                days_executor::DcqcnController::pristine(roce.controller.config),
+                "{name}: the controller starts pristine"
             );
-            for token in [roce.pacing_timer_payload, roce.control_timer_payload] {
-                let token = packet(&image, token);
-                assert_eq!((token.flow, token.size_bytes), (flow, 0), "{name}");
-            }
             let pacing_events = image
                 .initial_events
                 .iter()
@@ -128,13 +128,13 @@ fn every_p15_fixture_lowers_to_queue_pairs_with_receivers_and_two_tokens() {
             assert_eq!(receiver.total_bytes, roce.pacer.total_bytes);
             assert_eq!((receiver.expected_psn, receiver.packets_since_ack), (0, 0));
             assert_eq!(receiver.last_nack, None);
-            assert_eq!(receiver.np.last_cnp_time_ns, None);
             assert_eq!(
                 descriptor.feedback_priority,
                 if name == "roce_feedback_priority.toml" {
                     1
                 } else if name == "hpcc_incast64_dragonfly.toml" {
-                    0
+                    // P16 ruling D16: HPCC's switch queues ACKs in the data class.
+                    3
                 } else {
                     descriptor.priority
                 },
@@ -152,14 +152,14 @@ fn queue_pair_keys_lower_with_their_defaults_and_the_hpcc_profile() {
     assert_eq!(roce.pacer.mtu_bytes, 1_000);
     assert_eq!(roce.pacer.total_bytes, 200_000);
     assert_eq!(roce.pacer.pacing_interval_ns, 1_000);
-    assert_eq!(roce.controller.config.control_interval_ns, 50_000);
+    assert_eq!(roce.controller.config.increase_interval_ns, 50_000);
+    assert_eq!(roce.controller.config.alpha_interval_ns, 1_000);
+    assert_eq!(roce.controller.config.decrease_interval_ns, 4_000);
     let defaults = receiver(&lossless, flow);
     assert_eq!(defaults.ack_every_packets, 1);
     assert_eq!(defaults.nack_interval_ns, 500_000);
     assert_eq!(defaults.ack_size_bytes, 64);
     assert!(defaults.duplicate_ack);
-    assert_eq!(defaults.np.cnp_size_bytes, 64);
-    assert_eq!(defaults.np.cnp_interval_ns, 10_000);
 
     let hpcc = lower_fixture("hpcc_incast64_dragonfly.toml");
     let pairs = queue_pairs(&hpcc);
@@ -171,7 +171,8 @@ fn queue_pair_keys_lower_with_their_defaults_and_the_hpcc_profile() {
         assert_eq!(receiver.ack_size_bytes, 60);
         let descriptor = &hpcc.flows[flow.0 as usize];
         assert_eq!(descriptor.target.0 % 6, 0);
-        assert_eq!((descriptor.priority, descriptor.feedback_priority), (3, 0));
+        // P16 ruling D16: ACKs ride the data class, as at HPCC's switch.
+        assert_eq!((descriptor.priority, descriptor.feedback_priority), (3, 3));
     }
     // HPCC host n maps to Days host 6 (n - 1): the receiver is host 0 and the senders are
     // hosts 6, 12, ..., 384, all under router 0.
@@ -257,12 +258,33 @@ fn queue_pair_options_are_refused_where_they_do_not_apply() {
     );
     refused(
         base.replacen(
-            "increase_byte_threshold = 100000\n",
-            "increase_byte_threshold = 100000\ncnp_priority = 0\n",
+            "pacing_interval_ns = 1000\n",
+            "pacing_interval_ns = 1000\ncnp_priority = 0\n",
             1,
         ),
         "cnp_priority",
     );
+    // P16: a queue pair echoes ECN on its ACKs and sends no CNP (ruling D4), and the paper-form
+    // keys are rejected by name (ruling D9).
+    for (line, expected) in [
+        ("cnp_interval_ns = 0\n", "cnp_interval_ns"),
+        ("mi_factor = 0.5\n", "mi_factor"),
+        ("rtt_ns = 50000\n", "rp_timer_ns"),
+        (
+            "increase_byte_threshold = 100000\n",
+            "increase_byte_threshold",
+        ),
+        ("control_interval_ns = 1\n", "unknown field"),
+    ] {
+        refused(
+            base.replacen(
+                "pacing_interval_ns = 1000\n",
+                &format!("pacing_interval_ns = 1000\n{line}"),
+                1,
+            ),
+            expected,
+        );
+    }
     refused(
         base.replacen("flow_type = \"RoCE\"", "flow_type = \"DCQCN\"", 1),
         "RoCE options",

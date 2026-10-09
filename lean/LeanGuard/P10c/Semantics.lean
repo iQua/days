@@ -1,6 +1,7 @@
 import Std
 
 import LeanGuard.Shared.Check
+import LeanGuard.P10c.SplitMix
 
 namespace LeanGuard.P10c.Semantics
 
@@ -8,14 +9,9 @@ open LeanGuard.Shared
 
 namespace Aqm
 
-def averageScale : Nat := 2 ^ 32
+open LeanGuard.P10c.SplitMix
 
 def maxQueueBytes : Nat := 2 ^ 64 - 1
-
-inductive DepthUnit
-  | packets
-  | bytes
-  deriving DecidableEq, Repr
 
 inductive Action
   | enqueue
@@ -23,79 +19,61 @@ inductive Action
   | drop
   deriving DecidableEq, Repr
 
-structure ThresholdConfig where
-  unit : DepthUnit
-  capacity : Nat
-  threshold : Nat
+/-- The ECN ramp of one queue (`EcnRampPolicy`): tail drop past `capacityBytes`; for ECN-capable
+data, no mark below `kminBytes`, a mark at or above `kmaxBytes`, and in between a mark with
+probability `Pmax * (d - kmin) / (kmax - kmin)`, `Pmax = pmaxNumerator / pmaxDenominator`. -/
+structure RampConfig where
+  capacityBytes : Nat
+  kminBytes : Nat
+  kmaxBytes : Nat
+  pmaxNumerator : Nat
+  pmaxDenominator : Nat
   deriving DecidableEq, Repr
 
-structure RedState where
-  unit : DepthUnit
-  capacity : Nat
-  minThreshold : Nat
-  maxThreshold : Nat
-  maxProbabilityNumerator : Nat
-  maxProbabilityDenominator : Nat
-  averageScaled : Nat
-  counter : Nat
-  markEcn : Bool
-  deriving DecidableEq, Repr
+/-- `ecn_ramp_policy_check`: a positive capacity, `1 ≤ kmin ≤ kmax ≤ capacity`, `0 < Pmax ≤ 1` in
+lowest terms, `Pmax = 1` on a step, and a span `pmaxDenominator * (kmax - kmin)` within a `u64`. -/
+def RampConfig.wellFormed (config : RampConfig) : Bool :=
+  config.capacityBytes > 0 &&
+    1 ≤ config.kminBytes && config.kminBytes ≤ config.kmaxBytes &&
+    config.kmaxBytes ≤ config.capacityBytes &&
+    0 < config.pmaxNumerator && config.pmaxNumerator ≤ config.pmaxDenominator &&
+    Nat.gcd config.pmaxNumerator config.pmaxDenominator = 1 &&
+    (config.kminBytes ≠ config.kmaxBytes || config.pmaxNumerator = config.pmaxDenominator) &&
+    config.pmaxDenominator * (config.kmaxBytes - config.kminBytes) ≤ maxU64
 
-def postDepth
-    (unit : DepthUnit)
-    (queuedPackets queuedBytes packetSizeBytes : Nat) : Nat :=
-  match unit with
-  | .packets => queuedPackets + 1
-  | .bytes => queuedBytes + packetSizeBytes
+/-- `ECN_RAMP_DOMAIN`, `"ECN_RAMP"` in ASCII. -/
+def rampDomain : Nat := 0x45434e5f52414d50
+
+/-- `ecn_queue_key`: the draw's per-queue key. -/
+def queueKey (seed node queue : Nat) : Nat :=
+  mix (mix (mix (seed ^^^ rampDomain) ^^^ node) ^^^ queue)
+
+/-- `ecn_draw`: the draw of one arrival (its payload id) at the queue with key `key`. -/
+def draw (key payload : Nat) : Nat := mix (key ^^^ payload)
 
 def queueByteSumRepresentable (queuedBytes packetSizeBytes : Nat) : Bool :=
   queuedBytes + packetSizeBytes ≤ maxQueueBytes
 
-def thresholdDecision
-    (config : ThresholdConfig)
-    (queuedPackets queuedBytes packetSizeBytes : Nat) : Action :=
-  let depth := postDepth config.unit queuedPackets queuedBytes packetSizeBytes
+/-- `ecn_ramp_decision`, line for line: the post-admission byte depth `d` drops past the capacity;
+a packet that is not ECN-capable data is admitted unmarked; below `kmin` no mark, at or above
+`kmax` a mark; in between a mark iff `⌊u · span / 2^64⌋ < pmaxNumerator · (d − kmin)`. -/
+def rampDecision
+    (config : RampConfig) (isData : Bool) (queuedBytes packetSizeBytes u : Nat) : Action :=
+  let depth := queuedBytes + packetSizeBytes
   if !queueByteSumRepresentable queuedBytes packetSizeBytes then
     .drop
-  else if config.capacity ≠ 0 && config.capacity < depth then
+  else if config.capacityBytes < depth then
     .drop
-  else if config.threshold ≤ depth then
+  else if !isData || depth < config.kminBytes then
+    .enqueue
+  else if config.kmaxBytes ≤ depth then
     .mark
   else
-    .enqueue
-
-def redDecision
-    (state : RedState)
-    (queuedPackets queuedBytes packetSizeBytes : Nat) : RedState × Action :=
-  let sample :=
-    match state.unit with
-    | .packets => queuedPackets
-    | .bytes => queuedBytes
-  let depth := postDepth state.unit queuedPackets queuedBytes packetSizeBytes
-  let average := (state.averageScaled * 511 + sample * averageScale) / 512
-  let state := { state with averageScaled := average }
-  if !queueByteSumRepresentable queuedBytes packetSizeBytes then
-    (state, .drop)
-  else if state.capacity ≠ 0 && state.capacity < depth then
-    (state, .drop)
-  else
-    let minimum := state.minThreshold * averageScale
-    let maximum := state.maxThreshold * averageScale
-    if average ≤ minimum then
-      ({ state with counter := 0 }, .enqueue)
-    else if maximum ≤ average then
-      ({ state with counter := 0 }, if state.markEcn then .mark else .drop)
+    let span := config.pmaxDenominator * (config.kmaxBytes - config.kminBytes)
+    if (u * span) / modulus < config.pmaxNumerator * (depth - config.kminBytes) then
+      .mark
     else
-      let counter := state.counter + 1
-      let left :=
-        counter * state.maxProbabilityNumerator * (average - minimum)
-      let right :=
-        state.maxProbabilityDenominator *
-          (state.maxThreshold - state.minThreshold) * averageScale
-      if right ≤ left then
-        ({ state with counter := 0 }, if state.markEcn then .mark else .drop)
-      else
-        ({ state with counter }, .enqueue)
+      .enqueue
 
 end Aqm
 
@@ -345,5 +323,107 @@ def schedule (lineNo : Nat) (state : State) : Except String (State × Packet) :=
   scheduleLoop lineNo (2 * state.classCount) state
 
 end Wrr
+
+/-!
+Days AGO's exact Weighted Fair Queueing (P16 L2), after Demers, Keshav and Shenker. Virtual time
+and finish tags are rationals normalized by the egress link's rate (bits rather than seconds), as
+in the executor's `WfqSchedulerState`: a packet's service is `size_bytes * 8 / weight`, and virtual
+time advances by `elapsed_ns * rate_bps / (10^9 * W)` over the active classes' weight sum `W`.
+A packet's class is `flow % class_count`.
+-/
+namespace Wfq
+
+/-- The scheduler state one transition reads and writes. -/
+structure State where
+  virtualTime : Rat
+  lastUpdatedNs : Nat
+  /-- Each class's last finish tag. -/
+  finishTimes : List Rat
+  /-- Each class's queued plus in-service packets. -/
+  activePackets : List Nat
+  deriving DecidableEq, Repr
+
+def initial (classCount : Nat) : State :=
+  { virtualTime := 0
+    lastUpdatedNs := 0
+    finishTimes := List.replicate classCount 0
+    activePackets := List.replicate classCount 0 }
+
+def activeWeightSum (weights activePackets : List Nat) : Nat :=
+  (weights.zip activePackets).foldl
+    (fun sum (weight, active) => if active = 0 then sum else sum + weight) 0
+
+/-- Virtual time at `timeNs`, advanced over the active weight sum (which must be positive). -/
+def advance (rateBps : Nat) (weights : List Nat) (state : State) (timeNs : Nat) : Rat :=
+  let weightSum := activeWeightSum weights state.activePackets
+  state.virtualTime +
+    (((timeNs - state.lastUpdatedNs) * rateBps : Nat) : Rat) / ((1_000_000_000 * weightSum : Nat) : Rat)
+
+/--
+Admit a packet of `classId` at `timeNs`: an idle scheduler resets virtual time and every class's
+finish tag to zero; otherwise virtual time advances. The packet starts at the later of virtual time
+and its class's last finish tag. Returns the state after, the virtual start and the finish tag.
+-/
+def enqueue (lineNo rateBps : Nat) (weights : List Nat) (state : State)
+    (classId sizeBytes timeNs : Nat) : Except String (State × Rat × Rat) := do
+  require lineNo (state.lastUpdatedNs ≤ timeNs) "WFQ time went backwards"
+  let weight := weights.getD classId 0
+  require lineNo (weight > 0) s!"WFQ weight of class {classId} must be positive"
+  let idle := state.activePackets.all (· = 0)
+  let virtualTime := if idle then 0 else advance rateBps weights state timeNs
+  let finishTimes := if idle then List.replicate weights.length 0 else state.finishTimes
+  let previous := finishTimes.getD classId 0
+  let start := if virtualTime < previous then previous else virtualTime
+  let finish := start + ((sizeBytes * 8 : Nat) : Rat) / (weight : Rat)
+  pure
+    ({ virtualTime
+       lastUpdatedNs := timeNs
+       finishTimes := finishTimes.set classId finish
+       activePackets :=
+         state.activePackets.set classId (state.activePackets.getD classId 0 + 1) },
+      start, finish)
+
+/--
+Complete the service of a packet of `classId` at `timeNs`: virtual time advances over the active
+set that still holds the packet, then the class loses it; a scheduler left idle resets its virtual
+time and that class's finish tag to zero.
+-/
+def complete (lineNo rateBps : Nat) (weights : List Nat) (state : State)
+    (classId timeNs : Nat) : Except String State := do
+  require lineNo (state.lastUpdatedNs ≤ timeNs) "WFQ time went backwards"
+  let active := state.activePackets.getD classId 0
+  require lineNo (active > 0) s!"WFQ class {classId} completes a packet it does not hold"
+  let virtualTime := advance rateBps weights state timeNs
+  let activePackets := state.activePackets.set classId (active - 1)
+  if activePackets.all (· = 0) then
+    pure
+      { virtualTime := 0
+        lastUpdatedNs := timeNs
+        finishTimes := state.finishTimes.set classId 0
+        activePackets }
+  else
+    pure { state with virtualTime, lastUpdatedNs := timeNs, activePackets }
+
+/-- A waiting packet: its finish tag and its enqueue ordinal at the queue. -/
+structure Waiting where
+  payload : Nat
+  finish : Rat
+  order : Nat
+  deriving Repr
+
+/-- The served packet: the least finish tag, the earliest enqueue among equal tags. -/
+def least : List Waiting → Option Waiting
+  | [] => none
+  | first :: rest =>
+      some <| rest.foldl
+        (fun best packet =>
+          if packet.finish < best.finish ||
+              (packet.finish = best.finish && packet.order < best.order) then
+            packet
+          else
+            best)
+        first
+
+end Wfq
 
 end LeanGuard.P10c.Semantics

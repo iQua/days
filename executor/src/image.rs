@@ -413,6 +413,13 @@ pub enum GeneratorTermination {
 }
 
 /// Fixed-width parameters for the v1 constant generator.
+///
+/// Two stage kinds reuse it as a timer that sends nothing over the fabric. A compute stage (P14):
+/// zero bytes, no departure, `interval_ns` the compute duration. A stage notify (P16 H2), a
+/// collective stage whose ranks share a server: `packet_size_bytes` and the byte termination are
+/// its chunk, `interval_ns` is the sender's lead, and `first_departure_ns` is the latency of its
+/// host pair's lane, which the notify crosses after the lead. The message's NVLink delay is their
+/// sum.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConstantGenerator {
@@ -429,6 +436,12 @@ pub struct ConstantGenerator {
 pub enum CollectiveAlgorithm {
     RingAllReduce = 0,
     AllGather = 1,
+    /// One ring phase: rank r ends holding the reduced chunk it owns.
+    ReduceScatter = 2,
+    /// One message per ordered pair of ranks, all independent.
+    AllToAll = 3,
+    /// One message from the group's rank 0 to its rank 1.
+    SendRecv = 4,
 }
 
 /// Resolved phase tag for one collective stage.
@@ -437,6 +450,10 @@ pub enum CollectiveAlgorithm {
 pub enum CollectivePhase {
     ReduceScatter = 0,
     AllGather = 1,
+    /// An all-to-all's one phase: `step` is the offset `k` of the destination `rank + k`.
+    AllToAll = 2,
+    /// A send/recv's one phase.
+    SendRecv = 3,
 }
 
 /// Chunk partition policy retained explicitly in every stage image.
@@ -444,6 +461,11 @@ pub enum CollectivePhase {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectiveChunkPolicy {
     EqualRemainderLast = 0,
+    /// Every message carries `floor(floor(S / n) / c)` bytes (`c` channels), the remainder
+    /// unsent: SimAI's NCCL flow model. An all-to-all's pairs carry `floor(S / n)`.
+    UniformFloor = 1,
+    /// An all-to-all's per-pair bytes from a seeded routing matrix (`scenario::alltoall`).
+    Seeded = 2,
 }
 
 /// Logical communication-channel policy retained explicitly in every stage image.
@@ -451,31 +473,111 @@ pub enum CollectiveChunkPolicy {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum CollectiveChannelPolicy {
     RingNext = 0,
+    /// Several rings over the same ranks, each its own order; `channel` names the ring.
+    Channels = 1,
+    /// Every ordered pair of ranks (an all-to-all).
+    AllPairs = 2,
+    /// The one pair rank 0 to rank 1 (a send/recv).
+    Pair = 3,
+}
+
+/// The predecessors of one kind (local or inbound) of a dependency-gated stage.
+///
+/// Most stages wait for at most one stage of each kind, held inline. A join (the stage after an
+/// all-to-all or a multi-channel ring, or after several stage groups) waits for several; their
+/// flows are the run `[first, first + count)` of [`SimulationImage::stage_joins`], ascending and
+/// distinct. The predecessor graph is fixed at lowering, so the run is immutable image data that
+/// no host state carries.
+#[repr(C, u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StagePredecessors {
+    #[default]
+    None,
+    One(FlowId),
+    Join {
+        first: u32,
+        count: u32,
+    },
+}
+
+impl StagePredecessors {
+    /// How many predecessors of this kind the stage waits for.
+    pub const fn count(self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::One(_) => 1,
+            Self::Join { count, .. } => count,
+        }
+    }
+
+    /// The single predecessor held inline; `None` for no predecessor and for a join.
+    pub const fn one(self) -> Option<FlowId> {
+        match self {
+            Self::One(flow) => Some(flow),
+            _ => None,
+        }
+    }
+
+    /// A join's run of [`SimulationImage::stage_joins`] (`joins`); empty for `None` and `One`.
+    ///
+    /// A run outside `joins` yields nothing; validation rejects it before any run.
+    pub fn join_run(self, joins: &[FlowId]) -> &[FlowId] {
+        match self {
+            Self::None => &[],
+            Self::One(_) => &[],
+            Self::Join { first, count } => usize::try_from(first)
+                .ok()
+                .and_then(|first| {
+                    joins.get(first..first.checked_add(usize::try_from(count).ok()?)?)
+                })
+                .unwrap_or(&[]),
+        }
+    }
+
+    /// Each predecessor flow, in ascending order.
+    pub fn iter(self, joins: &[FlowId]) -> impl Iterator<Item = FlowId> + '_ {
+        let one = match self {
+            Self::One(flow) => Some(flow),
+            _ => None,
+        };
+        one.into_iter().chain(self.join_run(joins).iter().copied())
+    }
 }
 
 /// Prerequisite state of one dependency-gated stage, owned by the stage's source host LP.
 ///
-/// The local predecessor runs on the same host. The inbound predecessor is a stage on another host
-/// whose flow targets this host; its completion is observed through ordinary delivery at this host,
-/// so no cross-LP state is shared.
+/// Local predecessors run on the same host; the stage counts those that completed. Inbound
+/// predecessors are stages on other hosts whose flows target this host; their completion is
+/// observed through ordinary delivery at this host, so no cross-LP state is shared, and the stage
+/// counts the bytes they delivered in order. A stage is released once every local predecessor
+/// completed and every inbound byte arrived.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StageDependencies {
-    pub local_predecessor: Option<FlowId>,
-    pub inbound_predecessor: Option<FlowId>,
-    /// Bytes the inbound predecessor must deliver to this host before it counts as complete.
+    pub local: StagePredecessors,
+    pub inbound: StagePredecessors,
+    /// Bytes the inbound predecessors must deliver to this host: their totals, summed.
     pub inbound_predecessor_bytes: u64,
-    pub local_predecessor_complete: bool,
-    pub inbound_predecessor_complete: bool,
-    /// Inbound bytes delivered so far: the receiver's in-order frontier of the inbound
-    /// predecessor, TCP's next expected sequence or a RoCE queue pair's expected PSN.
+    /// Inbound bytes delivered so far: the sum of the receivers' in-order frontiers of the
+    /// inbound predecessors (TCP's next expected sequence, a RoCE queue pair's expected PSN).
     pub inbound_bytes_received: u64,
+    /// Local predecessors complete so far.
+    pub local_completed: u32,
 }
 
 impl StageDependencies {
+    /// Whether every local predecessor completed.
+    pub const fn local_complete(self) -> bool {
+        self.local_completed == self.local.count()
+    }
+
+    /// Whether every inbound predecessor delivered its bytes.
+    pub const fn inbound_complete(self) -> bool {
+        self.inbound_bytes_received == self.inbound_predecessor_bytes
+    }
+
     pub const fn prerequisites_complete(self) -> bool {
-        (self.local_predecessor.is_none() || self.local_predecessor_complete)
-            && (self.inbound_predecessor.is_none() || self.inbound_predecessor_complete)
+        self.local_complete() && self.inbound_complete()
     }
 }
 
@@ -489,8 +591,8 @@ impl StageDependencies {
 pub struct CollectiveStageIdentity {
     pub collective_id: u64,
     pub algorithm: CollectiveAlgorithm,
-    pub topology_level: u32,
-    pub topology_group: u32,
+    /// The channel (ring) this stage runs on; 0 for a single-ring collective.
+    pub channel: u32,
     pub group_size: u32,
     pub declared_total_bytes: u64,
     pub rank: u32,
@@ -569,14 +671,14 @@ pub struct RateGenerator {
     pub credit_quanta: u128,
 }
 
-/// Exact DCQCN reaction-point state over the T25 rate generator.
+/// Exact Mellanox-form DCQCN reaction point over the T25 rate generator: an unreliable DCQCN
+/// flow, whose receiver answers CE-marked data with CNP packets. The controller has no timer
+/// event (P16 ruling D2); its one live event is the pacing tick.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DcqcnGenerator {
     pub rate: RateGenerator,
     pub controller: DcqcnController,
-    /// Stable zero-byte token referenced by the second live `PacingTimer` event.
-    pub control_timer_payload: PayloadId,
     pub cnp_size_bytes: u64,
 }
 
@@ -599,7 +701,7 @@ pub struct RocePacer {
 
 /// A RoCE queue pair: a reliable DCQCN flow with Go-back-N.
 ///
-/// The exact DCQCN reaction point (`controller`, its control tick and the separate CNP packet)
+/// The exact Mellanox-form DCQCN reaction point (`controller`, with lazy timers and no timer event)
 /// paces a Go-back-N sender. A PSN is the byte offset of a packet's first byte, and packet `psn`
 /// is `min(mtu_bytes, total_bytes - psn)` bytes, so a retransmission is a pure function of its
 /// PSN and no segment ledger exists. The high-water mark is `FlowGeneratorState::bytes_emitted`,
@@ -609,8 +711,6 @@ pub struct RocePacer {
 pub struct RoceGenerator {
     pub pacer: RocePacer,
     pub controller: DcqcnController,
-    /// Stable zero-byte token of the control tick (`PacketKind::DcqcnControlTimer`).
-    pub control_timer_payload: PayloadId,
     /// Stable zero-byte token of the pacing tick and the retransmission timeout
     /// (`PacketKind::RocePacingTimer`).
     pub pacing_timer_payload: PayloadId,
@@ -624,8 +724,16 @@ pub struct RoceGenerator {
     /// Fixed retransmission timeout (no backoff); zero turns the timeout off, so only a NACK
     /// recovers a loss and a lost last packet stalls the queue pair for the rest of the run.
     pub rto_ns: u64,
+    /// P16 ruling D7: the window in bytes (SimAI `m_win`); zero turns it off.
+    pub window_bytes: u64,
     /// Whether exactly one pacing tick is pending. A parked pacer has none.
     pub pacer_armed: bool,
+    /// P16 ruling D7: the window scales with the controller's rate (SimAI `m_var_win`).
+    pub variable_window: bool,
+    /// The pacer is parked because a tick found the window closed, and no restart has run since.
+    /// Only an ACK or NACK that moves `snd_una`, or a timeout, restarts such a pacer; a host
+    /// RESUME does not (it restarts pause-parked pacers), so the bit keeps the two apart.
+    pub window_parked: bool,
 }
 
 /// Fixed-width result of routing an ordinary feedback packet into a source generator.
@@ -768,13 +876,13 @@ pub struct RoceNackMark {
     pub time_ns: u64,
 }
 
-/// Target-owned state of one RoCE queue pair: the DCQCN notification point and the Go-back-N
-/// receiver.
+/// Target-owned state of one RoCE queue pair: the Go-back-N receiver. Its ACKs and NACKs echo the
+/// ECN mark of the data packet that triggered them, so it holds no notification point (P16 ruling
+/// D4).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoceReceiverState {
-    /// The DCQCN notification point, exactly as a DCQCN flow's receiver holds it.
-    pub np: DcqcnReceiverState,
+    pub flow: FlowId,
     pub total_bytes: u64,
     /// The in-order frontier: every byte below it has arrived in order.
     pub expected_psn: u64,
@@ -874,14 +982,18 @@ pub struct RoceDataHeader {
     pub retransmission: bool,
 }
 
-/// RoCE cumulative ACK or NACK metadata: the receiver's in-order frontier, and the send time and
-/// size of the data packet that triggered it.
+/// RoCE cumulative ACK or NACK metadata: the receiver's in-order frontier, the send time and size
+/// of the data packet that triggered it, and that packet's ECN echo (P16 ruling D4: the queue
+/// pair's congestion feedback, as HPCC's and SimAI's ACK `FLAG_CNP`). The size is a packet size,
+/// at most the queue pair's MTU, which lowering bounds by `u32::MAX`, so the header keeps the 24 B
+/// every packet descriptor reserves.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RoceAckHeader {
     pub acknowledgment: u64,
     pub echoed_sent_time_ns: u64,
-    pub acknowledged_bytes: u64,
+    pub acknowledged_bytes: u32,
+    pub ce_echo: bool,
 }
 
 /// Closed packet direction used to route ordinary data and feedback packets.
@@ -894,14 +1006,19 @@ pub enum PacketKind {
     TcpAck(TcpAckHeader) = 3,
     Pfc(PfcHeader) = 4,
     DcqcnCnp(DcqcnCnpHeader) = 5,
-    /// A source-local zero-byte token. It is never enqueued or transmitted.
-    DcqcnControlTimer = 6,
+    // Code 6 was the paper-form DCQCN control tick, removed in P16 (the Mellanox-form controller
+    // has no timer events); the remaining codes keep their values.
     RoceData(RoceDataHeader) = 7,
     RoceAck(RoceAckHeader) = 8,
     /// A cumulative NACK: `acknowledgment` is the expected PSN the sender rewinds to.
     RoceNack(RoceAckHeader) = 9,
     /// A source-local zero-byte token of a RoCE pacer. It is never enqueued or transmitted.
     RocePacingTimer = 10,
+    /// A stage notify (P16 H2): one same-server collective message, which Days models delay-only.
+    /// It names the sender's timer and then crosses out of band, as a PFC frame does, on its host
+    /// pair's lane to the target host, where its `size_bytes` (the whole chunk) arrive at once. It
+    /// is never enqueued, transmitted on a link or acknowledged.
+    StageNotify = 11,
 }
 
 impl PacketKind {
@@ -921,10 +1038,10 @@ impl PacketKind {
         )
     }
 
-    /// A zero-byte source-local timer token (a DCQCN or RoCE control tick, a RoCE pacing tick):
-    /// never enqueued, transmitted or delivered.
+    /// A zero-byte source-local timer token (a RoCE pacing tick): never enqueued, transmitted or
+    /// delivered.
     pub const fn is_timer_token(self) -> bool {
-        matches!(self, Self::DcqcnControlTimer | Self::RocePacingTimer)
+        matches!(self, Self::RocePacingTimer)
     }
 
     pub const fn code(self) -> u8 {
@@ -935,11 +1052,11 @@ impl PacketKind {
             Self::TcpAck(_) => 3,
             Self::Pfc(_) => 4,
             Self::DcqcnCnp(_) => 5,
-            Self::DcqcnControlTimer => 6,
             Self::RoceData(_) => 7,
             Self::RoceAck(_) => 8,
             Self::RoceNack(_) => 9,
             Self::RocePacingTimer => 10,
+            Self::StageNotify => 11,
         }
     }
 }
@@ -1031,7 +1148,7 @@ impl RemoteChannel {
 }
 
 /// One immutable semantic image containing every host and switch logical process.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct SimulationImage {
     /// Inclusive configured simulation endpoint in integer nanoseconds.
     pub stop_time_ns: u64,
@@ -1045,6 +1162,66 @@ pub struct SimulationImage {
     pub channels: Vec<RemoteChannel>,
     pub initial_events: Vec<Event>,
     pub seed: u64,
+    /// The predecessor runs of join stages ([`StagePredecessors::Join`]), fixed at lowering and
+    /// read-only; empty, with no allocation, in an image without a join.
+    pub stage_joins: Vec<FlowId>,
+    /// The parameters of every seeded all-to-all, ascending by collective id (P16 H1, ruling R7):
+    /// its pairs' stages carry the matrix's bytes, and the progress certificate names the
+    /// parameters so LeanGuard can re-derive them. Empty, with no allocation, without one.
+    pub seeded_all_to_alls: Vec<SeededCollective>,
+    /// The issue stream of every stage group not on stream 0, ascending by operation (P16 H1,
+    /// ruling R11 (a)): the stage-aware sizing counts each stream's widest operation once at a
+    /// host. Empty, with no allocation, when every group is on stream 0.
+    pub stage_streams: Vec<StageStream>,
+}
+
+/// A stage group: a collective by its id, or a compute group by its id.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum StageOperation {
+    Collective(u64),
+    Compute(u64),
+}
+
+/// A stage group's issue stream (nonzero).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StageStream {
+    pub operation: StageOperation,
+    pub stream: u32,
+}
+
+/// One seeded all-to-all's routing-matrix parameters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SeededCollective {
+    pub collective_id: u64,
+    pub matrix: crate::SeededAllToAll,
+}
+
+impl fmt::Debug for SimulationImage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("SimulationImage");
+        debug
+            .field("stop_time_ns", &self.stop_time_ns)
+            .field("nodes", &self.nodes)
+            .field("host_states", &self.host_states)
+            .field("switch_states", &self.switch_states)
+            .field("flows", &self.flows)
+            .field("initial_packets", &self.initial_packets)
+            .field("links", &self.links)
+            .field("channels", &self.channels)
+            .field("initial_events", &self.initial_events)
+            .field("seed", &self.seed);
+        // Omitting the empty additive field preserves every image byte without a join.
+        if !self.stage_joins.is_empty() {
+            debug.field("stage_joins", &self.stage_joins);
+        }
+        if !self.seeded_all_to_alls.is_empty() {
+            debug.field("seeded_all_to_alls", &self.seeded_all_to_alls);
+        }
+        if !self.stage_streams.is_empty() {
+            debug.field("stage_streams", &self.stage_streams);
+        }
+        debug.finish()
+    }
 }
 
 #[cfg(test)]
@@ -1080,13 +1257,56 @@ mod tests {
     #[test]
     fn roce_queue_pairs_grow_no_per_flow_record() {
         let checks = [
-            ("RoceGenerator", std::mem::size_of::<RoceGenerator>(), 256),
+            ("RoceGenerator", std::mem::size_of::<RoceGenerator>(), 240),
             ("FlowDescriptor", std::mem::size_of::<FlowDescriptor>(), 80),
             ("HostState", std::mem::size_of::<HostState>(), 224),
             (
                 "RoceReceiverState",
                 std::mem::size_of::<RoceReceiverState>(),
-                120,
+                88,
+            ),
+            ("PacketKind", std::mem::size_of::<PacketKind>(), 32),
+        ];
+        for (name, size, bound) in checks {
+            assert!(
+                size <= bound,
+                "{name} grew to {size} B, above its {bound} B budget"
+            );
+        }
+    }
+
+    /// P16 D1 layout budgets (`days-gpu/evidence/P16/dcqcn-design.md` §5.4). The Mellanox-form
+    /// controller is 136 B (152 B for the paper form at `main` 9ff20ea): 80 B of configuration and
+    /// 56 B of state, four `bool`s packed after the `u32` stage (a stored freeze flag would pad it to
+    /// 144 B, so the freeze is derived from the generator). With no control token, an unreliable
+    /// DCQCN generator is 208 B (240 B at `main`) and a queue pair 240 B (256 B, the union's full
+    /// budget, at `main`), which leaves the window its 16 B. A queue pair's receiver loses its
+    /// 40 B notification point (88 B; 120 B at `main`), and the ACK header keeps the 24 B every
+    /// packet descriptor reserves although it now carries the ECN echo.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn mellanox_dcqcn_state_fits_its_budgets() {
+        let checks = [
+            (
+                "DcqcnController",
+                std::mem::size_of::<super::DcqcnController>(),
+                136,
+            ),
+            (
+                "DcqcnGenerator",
+                std::mem::size_of::<super::DcqcnGenerator>(),
+                208,
+            ),
+            ("RoceGenerator", std::mem::size_of::<RoceGenerator>(), 240),
+            (
+                "RoceReceiverState",
+                std::mem::size_of::<RoceReceiverState>(),
+                88,
+            ),
+            (
+                "RoceAckHeader",
+                std::mem::size_of::<super::RoceAckHeader>(),
+                24,
             ),
             ("PacketKind", std::mem::size_of::<PacketKind>(), 32),
         ];
@@ -1134,8 +1354,9 @@ mod tests {
     /// at zero, its pacer parked) and its release flag is `CollectiveStage::activated`, so neither
     /// the stage record (136 B at `ade83b4`, one per generator on a stage host) nor its
     /// dependencies (56 B) nor the progress record (280 B; RoCE rows add a `stage_kind` value, not
-    /// a field) grows. Layout is the compiler's choice, so these are upper bounds on 64-bit
-    /// targets.
+    /// a field) grows. P16 H1's join counts took the progress record's two single-predecessor
+    /// fields (the certificate writer lists predecessors from the image), so it shrank to 256 B.
+    /// Layout is the compiler's choice, so these are upper bounds on 64-bit targets.
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn roce_collective_stages_grow_no_stage_record() {
@@ -1158,7 +1379,7 @@ mod tests {
             (
                 "CollectiveProgressRecord",
                 std::mem::size_of::<crate::CollectiveProgressRecord>(),
-                280,
+                256,
             ),
         ];
         for (name, size, bound) in checks {

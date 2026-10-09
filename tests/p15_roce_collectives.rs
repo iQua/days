@@ -14,10 +14,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use days::scenario::compile_config;
 use days_executor::{
     Backend, CollectiveActivationCause, CollectivePhase, CollectiveProgressRecord, CpuConfig,
-    DcqcnTransitionKind, FlowGeneratorKind, FlowId, GeneratorStatus, MechanismTransitionRecord,
-    ObservationMode, PacketKind, PfcControlAction, RoceSenderKind, RoceSenderRecord,
-    RoceTransitionRecord, RunResult, SimulationImage, StageRole, run_cpu_with_observations,
-    run_scalar_with_observations, validate,
+    FlowGeneratorKind, FlowId, GeneratorStatus, MechanismTransitionRecord, ObservationMode,
+    PacketKind, PfcControlAction, RoceSenderKind, RoceSenderRecord, RoceTransitionRecord,
+    RunResult, SimulationImage, StageRole, run_cpu_with_observations, run_scalar_with_observations,
+    validate,
 };
 
 fn fixture_path(name: &str) -> std::path::PathBuf {
@@ -265,8 +265,19 @@ fn compute_dag_releases_each_root_at_the_compute_deadline() {
     let rows = progress(&result);
     let roots = rows
         .iter()
-        .filter(|row| is_roce_row(row) && row.activated && row.local_predecessor.is_some())
-        .filter(|row| row.inbound_predecessor.is_none())
+        .filter(|row| {
+            let stage = image
+                .host_states
+                .iter()
+                .flat_map(|state| state.generators_with_stages())
+                .find(|(generator, _)| generator.flow == row.flow)
+                .and_then(|(_, stage)| stage)
+                .expect("a progress row belongs to a stage");
+            is_roce_row(row)
+                && row.activated
+                && stage.dependencies.local.one().is_some()
+                && stage.dependencies.inbound == days_executor::StagePredecessors::None
+        })
         .collect::<Vec<_>>();
     assert_eq!(roots.len(), 4, "every rank's root is gated by `forward`");
     for root in roots {
@@ -313,16 +324,16 @@ fn stage_rules_hold_on_every_fixture() {
 fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
     let stages = roce_stages(image);
     let senders = sender_rows(result);
-    let control_ticks = records(result)
+    // The Mellanox-form controller starts at the pair's first feedback (P16): a stage's first
+    // DCQCN row, if any, comes no earlier than its first tick and starts from the pristine state.
+    let first_dcqcn_rows = records(result)
         .iter()
         .filter_map(|record| match record {
-            MechanismTransitionRecord::Dcqcn(row) if row.kind == DcqcnTransitionKind::Control => {
-                Some((row.flow, row.key))
-            }
+            MechanismTransitionRecord::Dcqcn(row) => Some(*row),
             _ => None,
         })
-        .fold(BTreeMap::<FlowId, Vec<_>>::new(), |mut map, (flow, key)| {
-            map.entry(flow).or_default().push(key);
+        .fold(BTreeMap::<FlowId, _>::new(), |mut map, row| {
+            map.entry(row.flow).or_insert(row);
             map
         });
     let rows = progress(result);
@@ -402,16 +413,16 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
         if let Some(&released) = activations.get(flow) {
             assert_eq!(first.key.time_ns, released, "{name}");
         }
-        let control = control_ticks.get(flow).and_then(|ticks| ticks.first());
-        let expected = first.key.time_ns + 50_000;
-        if expected <= image.stop_time_ns {
-            let control = control.unwrap_or_else(|| panic!("{name}: a first control tick"));
-            assert_eq!(control.time_ns, expected, "{name}: first control tick");
-            // A release emits the pacing tick, then the control tick, as lowering orders a
-            // plain pair's (design note S-R6).
-            if activations.contains_key(flow) {
-                assert_eq!(control.origin_seq, first.key.origin_seq + 1, "{name}");
-            }
+        if let Some(row) = first_dcqcn_rows.get(flow) {
+            assert!(
+                row.key > first.key,
+                "{name}: a DCQCN row before the first tick"
+            );
+            assert_eq!(
+                row.before,
+                days_executor::DcqcnController::pristine(row.before.config),
+                "{name}: the controller starts pristine"
+            );
         }
     }
 }
@@ -453,7 +464,7 @@ fn with_the_timeout_off_a_lost_tail_stalls_its_stage_and_successors_visibly() {
                 let Some(successor_stage) = successor_stage else {
                     continue;
                 };
-                if successor_stage.dependencies.local_predecessor == Some(generator.flow) {
+                if successor_stage.dependencies.local.one() == Some(generator.flow) {
                     assert!(!successor_stage.activated, "{:?} waits", successor.flow);
                 }
             }
@@ -605,8 +616,9 @@ duration = 0.01
 port_rate = 1000000000
 capacity = 300
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 1.0
+drop = "TailDrop"
+ecn_capacity_bytes = 300_000
+ecn = { kmin_bytes = 300_000, kmax_bytes = 300_000, pmax = 1 }
 "#;
     let dcqcn = |table: &str| {
         format!(
@@ -618,11 +630,8 @@ max_rate_gbps = 1.0
 g = 0.00390625
 ai_rate_gbps = 0.005
 hai_rate_gbps = 0.05
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 1000
-increase_byte_threshold = 100000
 
 [{table}.traffic.roce]
 retransmit_timeout_ns = 1000000
@@ -723,6 +732,9 @@ fn checkpoint(image: &SimulationImage, horizon_ns: u64) -> SimulationImage {
         channels: image.channels.clone(),
         initial_events: result.pending_events,
         seed: image.seed,
+        stage_joins: image.stage_joins.clone(),
+        seeded_all_to_alls: image.seeded_all_to_alls.clone(),
+        stage_streams: image.stage_streams.clone(),
     }
 }
 
@@ -800,29 +812,35 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
 
 /// Frozen at authoring (`5752c51`, 2026-10-01, Mac): the Scalar summary-mode results, which the
 /// `days` CLI reproduced on Scalar and CPU at 2 workers
-/// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`).
+/// (`days-gpu/evidence/P15/collectives-impl/raw/anchors-mac-5752c51.txt`); re-frozen at P16 D1
+/// (2026-10-03, Mac) for the Mellanox-form controller and the ECN echo
+/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`); re-frozen at P16 H1 (2026-10-06, Mac) for the
+/// counted stage dependencies, which change only the stage records' rendering
+/// (`days-gpu/evidence/P16/collops-impl/semantic-identity-r1.txt`); re-frozen at P16 ecnramp
+/// (2026-10-08, Mac) for the byte ECN step, which changes only the queues' `drop_mark` rendering
+/// here (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`).
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        199_110,
-        0x8b3d_8615_76b7_d646,
+        190_023,
+        0x7991_1130_0edc_753d,
     ),
     (
         "roce_allgather_lossless.toml",
-        126_202,
-        0x84c0_e6d2_a574_9c80,
+        122_162,
+        0xa7d6_51e8_b84f_7b01,
     ),
-    ("roce_ring_lossy.toml", 190_244, 0xa065_c89e_82b4_e3b9),
-    ("roce_compute_dag.toml", 218_236, 0xb3e9_c56f_a727_6c1c),
+    ("roce_ring_lossy.toml", 179_008, 0x62fd_2636_40b6_c9c1),
+    ("roce_compute_dag.toml", 208_285, 0xb946_2a2b_3cbe_0b26),
     (
         "roce_tcp_mixed_collectives.toml",
-        141_856,
-        0xee09_f67f_aca4_91d5,
+        136_572,
+        0xbd42_30ab_406e_c194,
     ),
     (
         "roce_ring_release_paused.toml",
-        203_330,
-        0x273c_f356_1189_2368,
+        193_977,
+        0xcee3_a626_84e9_2076,
     ),
 ];
 
@@ -859,51 +877,69 @@ fn roce_transport(image: &SimulationImage, flow: FlowId) -> Option<(u64, u64)> {
 }
 
 /// Schema Amendment 5 (LeanGuard part 3, review M1): a compute stage whose inbound predecessor is
-/// a RoCE stage writes that queue pair's MTU and pacing interval on every progress row, so the
+/// a RoCE stage carries that queue pair's MTU and pacing interval on every certificate row, so the
 /// certificate can be replayed with the Go-back-N frontier even when the predecessor is an
 /// unlogged root (`roce_allgather_compute_lossy`, an ungated two-rank AllGather); every other
-/// compute row writes zero. Every compute inbound row of a RoCE predecessor is a packet of that
-/// pair at its PSN and advances the frontier exactly when the PSN is the frontier.
+/// compute row writes zero. The certificate writer reads them from the image (P16 H1). Every
+/// compute inbound row of a RoCE predecessor is a packet of that pair at its PSN and advances the
+/// frontier exactly when the PSN is the frontier.
 #[test]
 fn compute_rows_name_their_roce_inbound_transport() {
     for name in ["roce_compute_dag.toml", "roce_allgather_compute_lossy.toml"] {
         let image = lower(name);
         let result = run_identical(&image, name);
-        let rows: Vec<_> = progress(&result)
-            .into_iter()
-            .filter(|row| row.stage_kind == days_executor::CollectiveStageKind::Compute)
-            .collect();
+        let csv = days_executor::collective_transitions_csv(
+            &result.diagnostics.as_ref().unwrap().mechanism_transitions,
+            &image,
+        )
+        .unwrap();
+        let mut lines = csv.lines();
+        let header: Vec<&str> = lines.next().unwrap().split(',').collect();
+        let column = |name: &str| header.iter().position(|field| *field == name).unwrap();
+        let number = |fields: &[&str], name: &str| fields[column(name)].parse::<u64>().unwrap();
         let (mut transported, mut out_of_order) = (0, 0);
-        for row in &rows {
-            let expected = row
-                .inbound_predecessor
-                .and_then(|flow| roce_transport(&image, flow))
-                .unwrap_or((0, 0));
+        for line in lines {
+            let fields: Vec<&str> = line.split(',').collect();
+            if fields[column("stage_kind")] != "compute" {
+                continue;
+            }
+            let inbound = fields[column("inbound_predecessors")];
+            let expected = if inbound.is_empty() {
+                (0, 0)
+            } else {
+                roce_transport(&image, FlowId(inbound.parse().unwrap())).unwrap_or((0, 0))
+            };
             assert_eq!(
-                (row.packet_size_bytes, row.interval_ns),
+                (
+                    number(&fields, "packet_size_bytes"),
+                    number(&fields, "interval_ns")
+                ),
                 expected,
-                "{name}: compute row of flow {:?} at {:?}",
-                row.flow,
-                row.key
+                "{name}: compute row {line}"
             );
             if expected.0 == 0 {
                 continue;
             }
             transported += 1;
-            if row.cause == CollectiveActivationCause::InboundArrival {
-                let (mtu, total) = (expected.0, row.inbound_predecessor_bytes);
-                let psn = row.segment_sequence;
+            if fields[column("cause")] == "inbound_arrival" {
+                let (mtu, total) = (expected.0, number(&fields, "inbound_predecessor_bytes"));
+                let psn = number(&fields, "segment_sequence");
+                let segment = number(&fields, "segment_bytes");
                 assert!(
-                    psn % mtu == 0 && psn < total && row.segment_bytes == mtu.min(total - psn),
+                    psn % mtu == 0 && psn < total && segment == mtu.min(total - psn),
                     "{name}: compute inbound row is not its pair's packet at PSN {psn}"
                 );
-                let advance = if psn == row.before_inbound_bytes {
-                    row.segment_bytes
+                let advance = if psn == number(&fields, "before_inbound_bytes") {
+                    segment
                 } else {
                     out_of_order += 1;
                     0
                 };
-                assert_eq!(row.arrival_bytes, advance, "{name}: Go-back-N advance");
+                assert_eq!(
+                    number(&fields, "arrival_bytes"),
+                    advance,
+                    "{name}: Go-back-N advance"
+                );
             }
         }
         assert!(

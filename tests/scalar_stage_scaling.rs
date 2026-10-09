@@ -71,11 +71,8 @@ max_rate_gbps = 8.0
 g = 0.00390625
 ai_rate_gbps = 0.04
 hai_rate_gbps = 0.4
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 500
-increase_byte_threshold = 100000
 
 [collective.traffic.roce]
 retransmit_timeout_ns = 1000000

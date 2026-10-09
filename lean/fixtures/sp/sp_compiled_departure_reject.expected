@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 7: departure_time_ns mismatch (scheduled at line 3)

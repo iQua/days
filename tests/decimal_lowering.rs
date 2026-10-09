@@ -83,18 +83,26 @@ fn reviewer_numeric_fields_lower_exactly_above_binary64_integer_precision() {
         "9007199.254740993",
         "9007199254740993.0",
         EXACT,
-        "ECN_THRESHOLD",
-        "ecn_threshold = 0.5",
+        "TailDrop",
+        "ecn_capacity_bytes = 9007199254740993\n\
+         ecn = { kmin_bytes = 4503599627370497, kmax_bytes = 4503599627371497, \
+         pmax = 0.9007199254740993 }",
     ))
     .expect("exact duration/rate/ECN scenario");
     assert_eq!(image.stop_time_ns, EXACT);
     assert!(image.links.iter().all(|link| link.rate_bps == EXACT));
     for queue in image.switch_states.iter().flat_map(|state| &state.queues) {
-        let DropMarkPolicy::EcnThreshold(policy) = queue.drop_mark else {
-            panic!("ECN threshold queue")
+        let DropMarkPolicy::EcnRamp(policy) = queue.drop_mark else {
+            panic!("ECN ramp queue")
         };
-        assert_eq!(policy.capacity, EXACT);
-        assert_eq!(policy.threshold, 4_503_599_627_370_497);
+        assert_eq!(policy.capacity_bytes, EXACT);
+        assert_eq!(policy.kmin_bytes, 4_503_599_627_370_497);
+        assert_eq!(policy.kmax_bytes, 4_503_599_627_371_497);
+        assert_eq!(
+            (policy.pmax_numerator, policy.pmax_denominator),
+            (EXACT, 10_000_000_000_000_000),
+            "pmax lowers from its decimal text, above binary64 precision"
+        );
     }
 
     let initial = compile_text(&packet_distribution_config(
@@ -321,18 +329,6 @@ propagation_ns = {EXACT}
         assert_eq!(queue.drop_mark, DropMarkPolicy::TailDrop);
     }
 
-    let red_capacity = 1_000_003_u64;
-    let red = compile_text(&empty_config("1", "8000000000", red_capacity, "RED", ""))
-        .expect("exact fixed RED thresholds");
-    for queue in red.switch_states.iter().flat_map(|state| &state.queues) {
-        let DropMarkPolicy::Red(red) = queue.drop_mark else {
-            panic!("RED queue")
-        };
-        assert_eq!(red.capacity, red_capacity);
-        assert_eq!(red.min_threshold, red_capacity * 7 / 10);
-        assert_eq!(red.max_threshold, red_capacity * 9 / 10);
-    }
-
     const TOML_INTEGER_MAX: u64 = i64::MAX as u64;
     let maximums = compile_text(&format!(
         r#"
@@ -345,12 +341,18 @@ port_rate = 8000000000
 capacity = {}
 discipline = "WFQ"
 weights = [{}]
-drop = "ECN_THRESHOLD"
-ecn_threshold = 1
+drop = "TailDrop"
+ecn_capacity_bytes = {}
+ecn = {{ kmin_bytes = {}, kmax_bytes = {}, pmax = 1 }}
 [link]
 propagation_ns = {}
 "#,
-        TOML_INTEGER_MAX, TOML_INTEGER_MAX, TOML_INTEGER_MAX,
+        TOML_INTEGER_MAX,
+        TOML_INTEGER_MAX,
+        TOML_INTEGER_MAX,
+        TOML_INTEGER_MAX,
+        TOML_INTEGER_MAX,
+        TOML_INTEGER_MAX,
     ))
     .expect("maximum TOML integer queue, ECN, WFQ, and link fields");
     assert!(
@@ -369,10 +371,11 @@ propagation_ns = {}
             panic!("WFQ queue")
         };
         assert_eq!(wfq.weights, vec![TOML_INTEGER_MAX]);
-        let DropMarkPolicy::EcnThreshold(ecn) = queue.drop_mark else {
-            panic!("ECN threshold queue")
+        let DropMarkPolicy::EcnRamp(ecn) = queue.drop_mark else {
+            panic!("ECN ramp queue")
         };
-        assert_eq!(ecn.capacity, TOML_INTEGER_MAX);
-        assert_eq!(ecn.threshold, TOML_INTEGER_MAX);
+        assert_eq!(ecn.capacity_bytes, TOML_INTEGER_MAX);
+        assert_eq!(ecn.kmin_bytes, TOML_INTEGER_MAX);
+        assert_eq!(ecn.kmax_bytes, TOML_INTEGER_MAX);
     }
 }

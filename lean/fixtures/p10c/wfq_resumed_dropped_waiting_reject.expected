@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 5: WFQ initial row of queue (node_id=11, queue_id=0): its packets by class [0, 1] are not its active counts

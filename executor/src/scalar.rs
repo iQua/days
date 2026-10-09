@@ -79,7 +79,9 @@ pub enum AqmTransitionAction {
     Drop,
 }
 
-/// One non-TailDrop enqueue decision, keyed by the event that caused it.
+/// One ECN-ramp enqueue decision, keyed by the event that caused it. The policy is immutable, so
+/// one copy names it; LeanGuard recomputes the decision and its draw from the row and the image
+/// seed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AqmTransitionRecord {
     pub key: EventKey,
@@ -87,13 +89,11 @@ pub struct AqmTransitionRecord {
     /// Stable index of the queue within the node-owned switch state.
     pub queue_id: u64,
     pub payload: PayloadId,
-    pub queued_packets_before: u64,
     pub queued_bytes_before: u64,
     pub packet_size_bytes: u64,
     pub ecn_before: bool,
     pub ecn_after: bool,
-    pub before: crate::DropMarkPolicy,
-    pub after: crate::DropMarkPolicy,
+    pub policy: crate::EcnRampPolicy,
     pub action: AqmTransitionAction,
 }
 
@@ -295,7 +295,8 @@ struct PendingCollectiveProgress {
     cause: crate::CollectiveActivationCause,
     cause_flow: FlowId,
     arrival_bytes: u64,
-    before_local_complete: bool,
+    /// Local predecessors complete before this transition.
+    before_local_completed: u32,
     before_inbound_complete: bool,
     before_inbound_bytes: u64,
     /// Inbound rows: the arriving data segment `[segment_sequence, segment_sequence + segment_bytes)`.
@@ -327,14 +328,14 @@ struct CollectiveProgressContext {
     activated: bool,
 }
 
-/// `inbound_transport` is a compute stage's RoCE inbound predecessor's MTU and pacing interval
-/// (schema Amendment 5), or `(0, 0)`; transport stages write their own.
+/// Transport stages write their MTU (and a RoCE stage its pacing interval); a compute stage writes
+/// zero there, and the certificate writer names its inbound predecessors' transport (schema
+/// Amendment 5) from the image.
 fn collective_progress_record(
     context: CollectiveProgressContext,
     cause: PendingCollectiveProgress,
     generator: &crate::FlowGeneratorState,
     stage: Option<crate::CollectiveStage>,
-    inbound_transport: (u64, u64),
 ) -> Option<crate::CollectiveProgressRecord> {
     let stage = stage?;
     let dependencies = stage.dependencies;
@@ -358,15 +359,15 @@ fn collective_progress_record(
         packet_size_bytes: 0,
         interval_ns: 0,
         stop_time_ns: context.stop_time_ns,
-        local_predecessor: dependencies.local_predecessor,
-        inbound_predecessor: dependencies.inbound_predecessor,
         inbound_predecessor_bytes: dependencies.inbound_predecessor_bytes,
-        before_local_complete: cause.before_local_complete,
+        before_local_complete: cause.before_local_completed == dependencies.local.count(),
+        before_local_completed: cause.before_local_completed,
         before_inbound_complete: cause.before_inbound_complete,
         before_inbound_bytes: cause.before_inbound_bytes,
         activated: context.activated,
-        after_local_complete: dependencies.local_predecessor_complete,
-        after_inbound_complete: dependencies.inbound_predecessor_complete,
+        after_local_complete: dependencies.local_complete(),
+        after_local_completed: dependencies.local_completed,
+        after_inbound_complete: dependencies.inbound_complete(),
         after_inbound_bytes: dependencies.inbound_bytes_received,
         after_packets_emitted: generator.packets_emitted,
         after_bytes_emitted: generator.bytes_emitted,
@@ -414,6 +415,24 @@ fn collective_progress_record(
                 ..record
             })
         }
+        (FlowGeneratorKind::Constant(constant), crate::StageRole::Collective(identity)) => {
+            Some(crate::CollectiveProgressRecord {
+                collective_id: identity.collective_id,
+                algorithm: Some(identity.algorithm),
+                group_size: identity.group_size,
+                declared_total_bytes: identity.declared_total_bytes,
+                rank: identity.rank,
+                phase: Some(identity.phase),
+                step: identity.step,
+                chunk_offset_bytes: identity.chunk_offset_bytes,
+                chunk_bytes: identity.chunk_bytes,
+                packet_size_bytes: constant.packet_size_bytes,
+                interval_ns: constant.interval_ns,
+                stage_kind: crate::CollectiveStageKind::Notify,
+                duration_ns: constant.interval_ns + constant.first_departure_ns,
+                ..record
+            })
+        }
         (FlowGeneratorKind::Constant(_), crate::StageRole::Compute(compute)) => {
             Some(crate::CollectiveProgressRecord {
                 collective_id: compute.compute_id,
@@ -421,8 +440,6 @@ fn collective_progress_record(
                 rank: compute.rank,
                 stage_kind: crate::CollectiveStageKind::Compute,
                 duration_ns: compute.duration_ns,
-                packet_size_bytes: inbound_transport.0,
-                interval_ns: inbound_transport.1,
                 ..record
             })
         }
@@ -537,9 +554,9 @@ fn complete_local_successors(
             continue;
         };
         let mut dependencies = stage.dependencies;
-        if dependencies.local_predecessor != Some(completed)
-            || dependencies.local_predecessor_complete
-        {
+        // The index lists each successor once per predecessor, and a predecessor completes in
+        // exactly one event, so each local edge is counted once.
+        if dependencies.local_complete() {
             continue;
         }
         causes.push(PendingCollectiveProgress {
@@ -547,14 +564,14 @@ fn complete_local_successors(
             cause: crate::CollectiveActivationCause::LocalCompletion,
             cause_flow: completed,
             arrival_bytes: 0,
-            before_local_complete: dependencies.local_predecessor_complete,
-            before_inbound_complete: dependencies.inbound_predecessor_complete,
+            before_local_completed: dependencies.local_completed,
+            before_inbound_complete: dependencies.inbound_complete(),
             before_inbound_bytes: dependencies.inbound_bytes_received,
             segment_sequence: 0,
             segment_bytes: 0,
             completion,
         });
-        dependencies.local_predecessor_complete = true;
+        dependencies.local_completed += 1;
         stage.dependencies = dependencies;
         releasable.refresh(position, Some(*stage));
     }
@@ -598,9 +615,7 @@ fn record_inbound_progress(
             continue;
         };
         let mut dependencies = stage.dependencies;
-        if dependencies.inbound_predecessor != Some(inbound)
-            || dependencies.inbound_predecessor_complete
-        {
+        if dependencies.inbound_complete() {
             continue;
         }
         let before_inbound_bytes = dependencies.inbound_bytes_received;
@@ -614,8 +629,8 @@ fn record_inbound_progress(
             cause: crate::CollectiveActivationCause::InboundArrival,
             cause_flow: inbound,
             arrival_bytes,
-            before_local_complete: dependencies.local_predecessor_complete,
-            before_inbound_complete: dependencies.inbound_predecessor_complete,
+            before_local_completed: dependencies.local_completed,
+            before_inbound_complete: false,
             before_inbound_bytes,
             segment_sequence: sequence,
             segment_bytes: bytes,
@@ -627,9 +642,6 @@ fn record_inbound_progress(
             .ok_or(ExecutionError::CounterOverflow(node))?;
         if dependencies.inbound_bytes_received > dependencies.inbound_predecessor_bytes {
             return Err(ExecutionError::CounterOverflow(node));
-        }
-        if dependencies.inbound_bytes_received == dependencies.inbound_predecessor_bytes {
-            dependencies.inbound_predecessor_complete = true;
         }
         stage.dependencies = dependencies;
         releasable.refresh(position, Some(*stage));
@@ -914,6 +926,22 @@ pub fn run_scalar_counting_stage_scans_for_testing(
     Ok((transitions.finish(pending_events), dispatches, visits))
 }
 
+/// Test hook: a Scalar run with the service decisions made at PFC switch queues and the queued
+/// entries the PFC service paths read (`PfcServiceProbe`).
+///
+/// The run itself is `run_scalar_with_observations`; the probe only counts.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn run_scalar_counting_pfc_service_for_testing(
+    image: &SimulationImage,
+    observation_mode: ObservationMode,
+) -> Result<(RunResult, PfcServiceCounts), ExecutionError> {
+    let (transitions, pending_events) =
+        run_scalar_events(image, None, observation_mode, |_, _| {})?;
+    let counts = transitions.pfc_service_probe.counts;
+    Ok((transitions.finish(pending_events), counts))
+}
+
 /// Proves that the keyed stage path answers every query as the retired scans did, on `image`
 /// and after every event of a Scalar run over it.
 ///
@@ -939,8 +967,13 @@ pub fn assert_scalar_stage_index_equivalent_for_testing(
     };
     let (states, indices) = initial.hosts.slices();
     for (slot, (state, index)) in states.iter().zip(indices).enumerate() {
-        check_host_index(state, index.index(), image_flows.iter().copied())
-            .map_err(|mismatch| format!("host slot {slot} of the image: {mismatch}"))?;
+        check_host_index(
+            state,
+            &image.stage_joins,
+            index.index(),
+            image_flows.iter().copied(),
+        )
+        .map_err(|mismatch| format!("host slot {slot} of the image: {mismatch}"))?;
     }
     let mut first_mismatch = None;
     let run = run_scalar_events(
@@ -959,7 +992,9 @@ pub fn assert_scalar_stage_index_equivalent_for_testing(
             }
             let slot = node.state_slot as usize;
             let (states, indices) = transitions.hosts.slices();
-            if let Err(mismatch) = check_host_index(&states[slot], indices[slot].index(), []) {
+            if let Err(mismatch) =
+                check_host_index(&states[slot], &image.stage_joins, indices[slot].index(), [])
+            {
                 first_mismatch = Some(format!(
                     "host {:?} after event {:?}: {mismatch}",
                     node.id, event.key
@@ -1011,14 +1046,17 @@ enum HostStore {
 
 impl HostStore {
     /// The Scalar LP's store: the image's host states and an index built from each.
-    fn tables(states: Vec<HostState>) -> Self {
-        let indices = states.iter().map(HostStageSlot::build).collect();
+    fn tables(states: Vec<HostState>, joins: &[FlowId]) -> Self {
+        let indices = states
+            .iter()
+            .map(|state| HostStageSlot::build(state, joins))
+            .collect();
         Self::Table(Box::new(HostTables { states, indices }))
     }
 
     /// A CPU host LP's store: its one host and the index built from it.
-    fn local(state: HostState) -> Self {
-        let index = HostStageSlot::build(&state);
+    fn local(state: HostState, joins: &[FlowId]) -> Self {
+        let index = HostStageSlot::build(&state, joins);
         Self::Local(Box::new(HostEntry { state, index }))
     }
 
@@ -1073,6 +1111,10 @@ pub(crate) struct TransitionState<'image> {
     switch_states: Vec<SwitchState>,
     /// Executor-local redundant state, derived on construction and never serialized.
     switch_queue_bytes: Vec<Vec<u64>>,
+    /// Executor-local class orders of the FIFO PFC queues that have had a class paused, by state
+    /// slot and queue slot (`PfcClassOrder`); `None` until the first such queue, so an image whose
+    /// queues are never paused carries one empty pointer and nothing else. Never serialized.
+    switch_pfc_orders: Option<Box<PfcClassOrders>>,
     local_node: Option<NodeDescriptor>,
     packets: BTreeMap<PayloadId, ResidentPacket>,
     observation_mode: ObservationMode,
@@ -1092,6 +1134,8 @@ pub(crate) struct TransitionState<'image> {
     superseded_timers: Vec<SupersededTimer>,
     /// Test-only dispatch and pending-cause counts; empty in production builds.
     stage_probe: StageScanProbe,
+    /// Test-only PFC service-decision counts; empty in production builds.
+    pfc_service_probe: PfcServiceProbe,
 }
 
 /// Identity of a retransmission-timeout event that stopped being a flow's armed timer.
@@ -1200,18 +1244,171 @@ struct PfcFramePlan {
 ///
 /// `Head` is the FIFO-order plan: every queued packet is eligible and the discipline always
 /// selects position zero, so the plan is the queue head and nothing else has to be inspected.
-/// `Eligible` is the per-packet scan that only the mechanisms which can reorder service or hold a
-/// packet back need — PFC pausing and the round-robin disciplines. The two are equivalent
-/// whenever `queue_serves_head` holds, so the fast plan is a cost reduction, not a behavior
-/// change.
+/// `PfcFirst` is the plan of a PFC queue under a head-serving discipline: the discipline selects
+/// position zero of the eligible packets, which is the first queued packet whose PFC class is not
+/// paused (`pfc_first_eligible`), so only that packet is inspected. `Eligible` is the per-packet
+/// scan that only the round-robin disciplines need, with or without PFC: they choose by class over
+/// the whole eligible list. `Head` and `PfcFirst` select exactly the packet `Eligible` would on
+/// the queues they serve, so the fast plans are a cost reduction, not a behavior change.
 enum SwitchServicePlan {
     Head(Option<PacketDescriptor>),
+    PfcFirst(Option<PfcSelection>),
     Eligible {
         positions: Vec<usize>,
         packets: Vec<PacketDescriptor>,
         priorities: Vec<usize>,
         incoming_links: Vec<Option<LinkId>>,
     },
+}
+
+/// The packet a `PfcFirst` plan serves: its queue position, record, PFC class and incoming link.
+#[derive(Clone, Copy)]
+struct PfcSelection {
+    position: usize,
+    packet: PacketDescriptor,
+    priority: usize,
+    incoming_link: Option<LinkId>,
+}
+
+/// The packets of one FIFO PFC queue by PFC class, in queue order, keyed by arrival order.
+///
+/// A FIFO queue appends every admitted packet (`switch_remote_arrival`) and removes only the
+/// packet it serves, so queue order is arrival order. Numbering the packets in arrival order
+/// (`next_seq`) therefore gives every queued packet a key that increases along the queue, and each
+/// class's keys, kept in queue order, form a sorted sequence. Then:
+/// - the first queued packet whose class is not paused is the smallest front key among the
+///   classes that are not paused: one comparison per class, with no queued packet read;
+/// - its queue position is the number of keys below its own, summed over the classes by binary
+///   search, so the queue itself is not scanned either.
+///
+/// It is built from the queue when a class of the queue is first paused (a PFC PAUSE frame, or a
+/// paused class in the state the run starts from), so a queue that is never paused pays nothing;
+/// from then on every admission appends to it and every service removes the served packet. The
+/// served packet is always the front of its class: it is either the queue head, whose key is the
+/// smallest of all, or the packet the order itself selected.
+struct PfcClassOrder {
+    /// Key of the next admitted packet.
+    next_seq: u64,
+    /// Keys of each class's queued packets, in queue order.
+    classes: [std::collections::VecDeque<u64>; 8],
+}
+
+impl PfcClassOrder {
+    /// The order of an empty queue; `push` each queued packet's class, in queue order, to derive
+    /// the order of a nonempty one.
+    fn new() -> Self {
+        Self {
+            next_seq: 0,
+            classes: Default::default(),
+        }
+    }
+
+    /// Appends one admitted packet of `class`.
+    fn push(&mut self, class: usize) {
+        self.classes[class].push_back(self.next_seq);
+        self.next_seq += 1;
+    }
+
+    /// Removes the served packet, the first queued packet of `class`, and returns its key.
+    fn pop(&mut self, class: usize) -> Option<u64> {
+        self.classes[class].pop_front()
+    }
+
+    /// The queue position of the first queued packet whose class `pfc` does not pause.
+    fn first_unpaused_position(&self, pfc: &crate::PfcQueueState) -> Option<usize> {
+        let first = self
+            .classes
+            .iter()
+            .enumerate()
+            .filter(|(class, _)| !pfc.is_paused(*class))
+            .filter_map(|(_, keys)| keys.front().copied())
+            .min()?;
+        Some(
+            self.classes
+                .iter()
+                .map(|keys| keys.partition_point(|key| *key < first))
+                .sum(),
+        )
+    }
+}
+
+/// The class orders of a `TransitionState`'s FIFO PFC queues, by (state slot, queue slot); boxed
+/// behind one pointer so that `TransitionState` does not grow (`transition_state_keeps_main_size`).
+#[derive(Default)]
+struct PfcClassOrders(BTreeMap<(usize, usize), PfcClassOrder>);
+
+/// What construction derives from the switch queues it is given.
+struct DerivedSwitchQueues {
+    /// Each queue's byte counter, by state slot and queue slot.
+    bytes: Vec<Vec<u64>>,
+    /// The (state slot, queue slot) of each FIFO PFC queue that starts with a class paused, whose
+    /// class order construction then builds (`ensure_pfc_order`).
+    paused_fifo_queues: Vec<(usize, usize)>,
+}
+
+/// Whether any PFC class of a queue is paused.
+fn pfc_any_paused(pfc: &crate::PfcQueueState) -> bool {
+    pfc.paused_by_controller
+        .iter()
+        .any(|controllers| !controllers.is_empty())
+}
+
+/// Test-only count of the service decisions made at PFC switch queues and of the queued entries
+/// they read.
+///
+/// An entry is *read* when the decision looks up its packet record (and from it the flow's PFC
+/// class or the packet's incoming link): that per-entry work is what a whole-queue plan repeats on
+/// every decision. Without the test hooks the probe is empty and `note` compiles to nothing, so the
+/// count can neither cost a production run anything nor influence it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PfcServiceProbe {
+    #[cfg(feature = "planner-test-hooks")]
+    counts: PfcServiceCounts,
+}
+
+/// What `PfcServiceProbe` counts (test hooks only).
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PfcServiceCounts {
+    /// `TxReady` decisions at PFC switch queues.
+    pub decisions: u64,
+    /// Queued entries the PFC service paths read.
+    pub reads: u64,
+    /// First-eligible decisions (FIFO, static priority and WFQ queues) that served a packet behind
+    /// the queue head, past a paused class.
+    pub past_head: u64,
+}
+
+impl PfcServiceProbe {
+    /// Records one `TxReady` decision at a PFC queue that read `entries` queued entries and
+    /// served the packet at queue position `served` (`None` when nothing was eligible).
+    #[inline]
+    fn note_decision(&mut self, entries: usize, served: Option<usize>) {
+        let _ = served;
+        #[cfg(feature = "planner-test-hooks")]
+        {
+            self.counts.decisions = self.counts.decisions.saturating_add(1);
+            if served.is_some_and(|position| position > 0) {
+                self.counts.past_head = self.counts.past_head.saturating_add(1);
+            }
+        }
+        self.note_reads(entries);
+    }
+
+    /// Records `entries` queued entries read outside a `TxReady` decision: the first-eligible
+    /// search after a transmission completes and on a PFC control frame.
+    #[inline]
+    fn note_reads(&mut self, entries: usize) {
+        let _ = entries;
+        #[cfg(feature = "planner-test-hooks")]
+        {
+            self.counts.reads = self
+                .counts
+                .reads
+                .saturating_add(u64::try_from(entries).unwrap_or(u64::MAX));
+        }
+    }
 }
 
 /// Projects an eligible-packet list onto the record shape the round-robin certificates carry.
@@ -1226,19 +1423,90 @@ fn scheduler_packets(packets: &[PacketDescriptor]) -> Vec<crate::SchedulerPacket
         .collect()
 }
 
+const fn scheduler_packet(packet: PacketDescriptor) -> crate::SchedulerPacket {
+    crate::SchedulerPacket {
+        payload: packet.id,
+        flow: packet.flow,
+        size_bytes: packet.size_bytes,
+    }
+}
+
+/// The SP record of one transition of `packet` at an SP queue with class `priorities`.
+fn sp_record(
+    kind: crate::SpTransitionKind,
+    key: EventKey,
+    node: NodeId,
+    queue_slot: usize,
+    priorities: &[u64],
+    packet: PacketDescriptor,
+    departure_time_ns: Option<u64>,
+) -> Result<crate::MechanismTransitionRecord, ExecutionError> {
+    let class = scheduler_class(packet.flow, priorities.len())
+        .ok_or(ExecutionError::InvalidSchedulerState(node))?;
+    Ok(crate::MechanismTransitionRecord::Sp(
+        crate::SpTransitionRecord {
+            key,
+            node,
+            queue_id: u64::try_from(queue_slot).unwrap_or(u64::MAX),
+            kind,
+            class_count: u64::try_from(priorities.len()).unwrap_or(u64::MAX),
+            packet: scheduler_packet(packet),
+            class_id: u64::try_from(class).unwrap_or(u64::MAX),
+            priority: priorities[class],
+            departure_time_ns,
+        },
+    ))
+}
+
+/// The WFQ record of one transition at a WFQ queue, from its state `wfq` after the transition.
+#[allow(clippy::too_many_arguments)]
+fn wfq_record(
+    kind: crate::WfqTransitionKind,
+    key: EventKey,
+    node: NodeId,
+    queue_slot: usize,
+    rate_bps: u64,
+    wfq: &WfqSchedulerState,
+    packet: PacketDescriptor,
+    virtual_start: Option<crate::ExactRational>,
+    finish: Option<crate::ExactRational>,
+    queued_packets: Vec<crate::WfqQueuedPacket>,
+    paused_priorities: Vec<u8>,
+) -> crate::MechanismTransitionRecord {
+    crate::MechanismTransitionRecord::Wfq(Box::new(crate::WfqTransitionRecord {
+        key,
+        node,
+        queue_id: u64::try_from(queue_slot).unwrap_or(u64::MAX),
+        kind,
+        rate_bps,
+        weights: wfq.weights.clone(),
+        packet: scheduler_packet(packet),
+        virtual_start,
+        finish,
+        after: crate::WfqReplayState::of(wfq),
+        queued_packets,
+        paused_priorities,
+        pfc_priority: 0,
+    }))
+}
+
 /// Whether one queue's mechanisms always select the queue head with no per-packet inspection.
 ///
 /// A queue without a PFC monitor cannot report a paused priority, so every queued packet is
-/// eligible. FIFO, static priority and weighted fair queueing all maintain their service order in
-/// the queue itself, which is exactly why `scheduler_select_position` answers position zero for
-/// all three; deficit and weighted round robin choose by class and need the eligible-packet list.
-/// The match is deliberately exhaustive: a new discipline must be classified here before it can
-/// compile, rather than silently inheriting the head-only plan.
+/// eligible, and a head-serving discipline (`scheduler_serves_head`) serves the head.
 fn queue_serves_head(queue: &crate::SwitchQueueState) -> bool {
-    if queue.pfc.is_some() {
-        return false;
-    }
-    match queue.scheduler {
+    queue.pfc.is_none() && scheduler_serves_head(&queue.scheduler)
+}
+
+/// Whether a discipline always selects position zero of the eligible packets.
+///
+/// FIFO, static priority and weighted fair queueing all maintain their service order in the queue
+/// itself, which is exactly why `scheduler_select_position` answers position zero for all three;
+/// deficit and weighted round robin choose by class and need the eligible-packet list. The match
+/// is deliberately exhaustive: a new discipline must be classified here before it can compile,
+/// rather than silently inheriting the head-only and first-eligible plans.
+fn scheduler_serves_head(scheduler: &SchedulerKind) -> bool {
+    match scheduler {
         SchedulerKind::Fifo
         | SchedulerKind::StaticPriority { .. }
         | SchedulerKind::WeightedFairQueue(_) => true,
@@ -1302,15 +1570,19 @@ impl<'image> TransitionState<'image> {
                 .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
         }
 
-        let hosts = HostStore::tables(image.host_states.clone());
+        let hosts = HostStore::tables(image.host_states.clone(), &image.stage_joins);
         let switch_states = image.switch_states.clone();
-        let switch_queue_bytes = derive_switch_queue_bytes(image, &switch_states, None, &packets)?;
+        let DerivedSwitchQueues {
+            bytes: switch_queue_bytes,
+            paused_fifo_queues,
+        } = derive_switch_queue_bytes(image, &switch_states, None, &packets)?;
 
-        Ok(Self {
+        let mut state = Self {
             image,
             hosts,
             switch_states,
             switch_queue_bytes,
+            switch_pfc_orders: None,
             local_node: None,
             packets,
             observation_mode,
@@ -1324,7 +1596,12 @@ impl<'image> TransitionState<'image> {
             tcp_sent_segments,
             superseded_timers: Vec::new(),
             stage_probe: StageScanProbe::default(),
-        })
+            pfc_service_probe: PfcServiceProbe::default(),
+        };
+        for (state_slot, queue_slot) in paused_fifo_queues {
+            state.ensure_pfc_order(state_slot, queue_slot)?;
+        }
+        Ok(state)
     }
 
     pub(crate) fn new_local(
@@ -1345,7 +1622,7 @@ impl<'image> TransitionState<'image> {
                         kind: node.kind,
                         state_slot: node.state_slot,
                     })?;
-                (HostStore::local(state), Vec::new())
+                (HostStore::local(state, &image.stage_joins), Vec::new())
             }
             NodeKind::Switch => {
                 let state = image
@@ -1401,14 +1678,17 @@ impl<'image> TransitionState<'image> {
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
         }
 
-        let switch_queue_bytes =
-            derive_switch_queue_bytes(image, &switch_states, Some(node), &resident)?;
+        let DerivedSwitchQueues {
+            bytes: switch_queue_bytes,
+            paused_fifo_queues,
+        } = derive_switch_queue_bytes(image, &switch_states, Some(node), &resident)?;
 
-        Ok(Self {
+        let mut state = Self {
             image,
             hosts,
             switch_states,
             switch_queue_bytes,
+            switch_pfc_orders: None,
             local_node: Some(node),
             packets: resident,
             observation_mode,
@@ -1422,7 +1702,12 @@ impl<'image> TransitionState<'image> {
             tcp_sent_segments,
             superseded_timers: Vec::new(),
             stage_probe: StageScanProbe::default(),
-        })
+            pfc_service_probe: PfcServiceProbe::default(),
+        };
+        for (state_slot, queue_slot) in paused_fifo_queues {
+            state.ensure_pfc_order(state_slot, queue_slot)?;
+        }
+        Ok(state)
     }
 
     /// Records that `timer` stopped being the armed timer of a flow owned by `node`.
@@ -1847,12 +2132,23 @@ impl<'image> TransitionState<'image> {
                     }),
             )
         };
-        if let (FlowGeneratorKind::Constant(_), Some(duration_ns)) = (kind, compute_duration) {
+        if let (FlowGeneratorKind::Constant(constant), duration) = (kind, compute_duration) {
+            // A compute stage's token is a zero-byte `Data` timer; a stage notify's (a collective
+            // stage on a constant generator, P16 H2) is its chunk, which crosses to the target
+            // when the lead elapses.
+            let (duration_ns, token) = match duration {
+                Some(duration_ns) => (duration_ns, (0, PacketKind::Data)),
+                None => (
+                    constant.interval_ns,
+                    (constant.packet_size_bytes, PacketKind::StageNotify),
+                ),
+            };
             return self.start_compute_stage(
                 node,
                 parent,
                 flow,
                 duration_ns,
+                token,
                 cause,
                 ordinal,
                 children,
@@ -1874,14 +2170,11 @@ impl<'image> TransitionState<'image> {
     }
 
     /// Releases a RoCE collective stage at `t`, the parent event's time (design note §5.2,
-    /// rulings C2 and C5): the pacing grid and the DCQCN control timer, held at zero while the
-    /// stage was gated, are anchored at `t`, the pacer is armed with its first tick at `t`, and the
-    /// control tick follows one control interval later if it falls within the stop. The pair is
-    /// then exactly a queue pair whose initial delay is `t`; its retransmission timeout is armed
-    /// by its first send, and a tick that finds its data class paused parks it (H1).
-    ///
-    /// The ticks are emitted in a plain pair's order (pacing, then control), so a control tick on
-    /// the pacing grid precedes the pacing tick of the same instant, as for a lowered pair.
+    /// rulings C2 and C5): the pacing grid, held at zero while the stage was gated, is anchored at
+    /// `t`, and the pacer is armed with its first tick at `t`. The pair is then exactly a queue pair
+    /// whose initial delay is `t`; its retransmission timeout is armed by its first send, and a tick
+    /// that finds its data class paused parks it (H1). Its DCQCN controller stays pristine: the
+    /// Mellanox form starts its timers at the first feedback (P16), so nothing is anchored.
     // Out of line: it runs once per stage, and must not grow `activate_wrapped_stage`'s TCP path.
     #[inline(never)]
     fn start_roce_stage(
@@ -1894,8 +2187,7 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let now = parent.key.time_ns;
-        let stop_time_ns = self.image.stop_time_ns;
-        let (pacing_token, control) = {
+        let pacing_token = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position = index
                 .first_generator(flow)
@@ -1911,11 +2203,7 @@ impl<'image> TransitionState<'image> {
                     payload: parent.payload,
                 });
             };
-            let control_ns = now
-                .checked_add(roce.controller.config.control_interval_ns)
-                .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
             roce.pacer.first_pacing_time_ns = now;
-            roce.controller.next_control_time_ns = control_ns;
             roce.pacer_armed = true;
             generator.next_emission = crate::ScheduledEmission {
                 status: crate::roce::armed_status(&roce),
@@ -1923,33 +2211,30 @@ impl<'image> TransitionState<'image> {
                 payload: roce.pacing_timer_payload,
             };
             generator.kind = FlowGeneratorKind::Roce(roce);
-            (
-                roce.pacing_timer_payload,
-                (control_ns <= stop_time_ns).then_some((roce.control_timer_payload, control_ns)),
-            )
+            roce.pacing_timer_payload
         };
         self.push_stage_progress(node, parent, flow, cause, ordinal, true)?;
-        let ticks = [Some((pacing_token, now)), control];
-        for (payload, time_ns) in ticks.into_iter().flatten() {
-            self.emit_from_host(
-                node,
-                parent,
-                ChildEmission {
-                    target: node.id,
-                    kind: EventKind::PacingTimer,
-                    payload,
-                    time_ns,
-                },
-                children,
-            )?;
-        }
+        self.emit_from_host(
+            node,
+            parent,
+            ChildEmission {
+                target: node.id,
+                kind: EventKind::PacingTimer,
+                payload: pacing_token,
+                time_ns: now,
+            },
+            children,
+        )?;
         Ok(())
     }
 
-    /// Starts a released compute interval: a source-local timer fires `duration_ns` later.
+    /// Starts a released compute interval, or a stage notify's lead: a source-local timer fires
+    /// `duration_ns` later.
     ///
-    /// The zero-byte token only names the timer event; it is never enqueued or transmitted. A
-    /// deadline beyond the stop time leaves the stage `Stopped` without an event.
+    /// The token, `(size_bytes, kind)`, names the timer event: a compute stage's zero-byte `Data`
+    /// token is never enqueued or transmitted; a stage notify's carries its chunk across its lane
+    /// when the timer fires. A deadline beyond the stop time leaves the stage `Stopped` without an
+    /// event.
     #[allow(clippy::too_many_arguments)]
     fn start_compute_stage(
         &mut self,
@@ -1957,6 +2242,7 @@ impl<'image> TransitionState<'image> {
         parent: Event,
         flow: FlowId,
         duration_ns: u64,
+        (token_size_bytes, token_kind): (u64, PacketKind),
         cause: PendingCollectiveProgress,
         ordinal: u64,
         children: &mut Vec<Event>,
@@ -2004,9 +2290,9 @@ impl<'image> TransitionState<'image> {
                 PacketDescriptor {
                     id: payload,
                     flow,
-                    size_bytes: 0,
+                    size_bytes: token_size_bytes,
                     ecn_marked: false,
-                    kind: PacketKind::Data,
+                    kind: token_kind,
                 },
                 Some(parent.key.time_ns),
             )?;
@@ -2086,6 +2372,120 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
+    /// A stage notify's lead ends (P16 H2): the sender's stage finishes, with its one message
+    /// emitted, and its notify leaves on the lane to the target host, arriving `lane` later (the
+    /// generator's `first_departure_ns`). Then the stage's local successors are released, after
+    /// the transition's own emission, as every stage pass runs.
+    #[inline(never)]
+    fn host_notify_timer(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        flow: FlowId,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut causes = PendingCauses::default();
+        let lane_ns = {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            let position = index
+                .first_generator(flow)
+                .ok_or(ExecutionError::UnknownGenerator {
+                    node: node.id,
+                    flow,
+                })?;
+            let generator = &mut state.generators[position];
+            let FlowGeneratorKind::Constant(constant) = generator.kind else {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: event.payload,
+                });
+            };
+            if generator.next_emission.status != GeneratorStatus::Scheduled
+                || generator.next_emission.payload != event.payload
+                || generator.next_emission.departure_time_ns != event.key.time_ns
+            {
+                return Err(ExecutionError::UnexpectedGeneratorEmission {
+                    node: node.id,
+                    flow,
+                    payload: event.payload,
+                });
+            }
+            generator.next_emission.status = GeneratorStatus::Finished;
+            generator.packets_emitted = 1;
+            generator.bytes_emitted = constant.packet_size_bytes;
+            let completion = CompletionSignal {
+                ack_number: 0,
+                origin_ns: event.key.time_ns - constant.interval_ns,
+                delay_ns: constant.interval_ns,
+            };
+            complete_local_successors(
+                &state.generators,
+                &mut state.stages,
+                index,
+                flow,
+                completion,
+                &mut causes,
+            );
+            constant.first_departure_ns
+        };
+        let target = self.flow(flow)?.target;
+        let arrival_ns = event
+            .key
+            .time_ns
+            .checked_add(lane_ns)
+            .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
+        self.emit_from_host(
+            node,
+            event,
+            ChildEmission {
+                target,
+                kind: EventKind::RemoteArrival,
+                payload: event.payload,
+                time_ns: arrival_ns,
+            },
+            children,
+        )?;
+        if !causes.is_empty() {
+            self.activate_ready_collectives(node, event, causes, children)?;
+        }
+        Ok(())
+    }
+
+    /// A stage notify arrives at its target (P16 H2): the whole chunk is delivered at once, so
+    /// the stages waiting on it as their inbound predecessor advance by it, and are released.
+    #[inline(never)]
+    fn host_notify_arrival(
+        &mut self,
+        node: NodeDescriptor,
+        event: Event,
+        packet: PacketDescriptor,
+        children: &mut Vec<Event>,
+    ) -> Result<(), ExecutionError> {
+        let mut causes = PendingCauses::default();
+        {
+            let (mut state, index) = self.host_parts_mut(node)?;
+            record_inbound_progress(
+                &state.generators,
+                &mut state.stages,
+                index,
+                packet.flow,
+                InboundProgress::Segment {
+                    sequence: 0,
+                    bytes: packet.size_bytes,
+                    advance: packet.size_bytes,
+                },
+                node.id,
+                &mut causes,
+            )?;
+        }
+        self.mark_terminal(event.payload)?;
+        if !causes.is_empty() {
+            self.activate_ready_collectives(node, event, causes, children)?;
+        }
+        Ok(())
+    }
+
     /// Records one prerequisite transition of a wrapped stage under full observation.
     fn push_stage_progress(
         &mut self,
@@ -2108,24 +2508,6 @@ impl<'image> TransitionState<'image> {
                 flow,
             })?;
         let stage = state.stages.stage(position);
-        // Schema Amendment 5: a compute stage after a RoCE collective names that queue pair's MTU
-        // and pacing interval. Its local predecessor is the same rank's final stage of the same
-        // collective, on this host (the validator requires both predecessors to agree), so the
-        // values are read through the stage index, keyed and in constant time.
-        let inbound_transport = stage
-            .filter(|stage| {
-                matches!(stage.role, crate::StageRole::Compute(_))
-                    && stage.dependencies.inbound_predecessor.is_some()
-            })
-            .and_then(|stage| stage.dependencies.local_predecessor)
-            .and_then(|local| index.first_generator(local))
-            .and_then(|local| match state.generators[local].kind {
-                FlowGeneratorKind::Roce(roce) => {
-                    Some((roce.pacer.mtu_bytes, roce.pacer.pacing_interval_ns))
-                }
-                _ => None,
-            })
-            .unwrap_or((0, 0));
         let record = collective_progress_record(
             CollectiveProgressContext {
                 key: parent.key,
@@ -2137,7 +2519,6 @@ impl<'image> TransitionState<'image> {
             cause,
             &state.generators[position],
             stage,
-            inbound_transport,
         )
         .ok_or(ExecutionError::UnexpectedGeneratorEmission {
             node: node.id,
@@ -2490,6 +2871,7 @@ impl<'image> TransitionState<'image> {
             None
         };
 
+        let ecn_seed = self.image.seed;
         let (disposition, schedule_ready, mark_packet, pfc_plan, pfc_transition, aqm_transition) = {
             let state = self.switch_state_mut(node)?;
             state.arrived_packets = state
@@ -2523,27 +2905,30 @@ impl<'image> TransitionState<'image> {
             let (action, aqm_transition) = if pfc_overflow {
                 (QueueAdmissionAction::Drop, None)
             } else {
-                let before = queue.drop_mark;
-                let action = drop_mark_decision(
-                    &mut queue.drop_mark,
-                    queue.queue_capacity_packets,
-                    queue_len,
-                    queue_bytes,
-                    packet.size_bytes,
-                    node.id,
-                )?;
-                let action = if action == QueueAdmissionAction::Mark && !packet.kind.is_data() {
-                    QueueAdmissionAction::Enqueue
-                } else {
-                    action
-                };
-                let transition = (before != crate::DropMarkPolicy::TailDrop).then_some((
-                    before,
-                    queue.drop_mark,
-                    action,
-                    queue_len,
-                ));
-                (action, transition)
+                match &queue.drop_mark {
+                    crate::DropMarkPolicy::TailDrop => (
+                        taildrop_action(
+                            queue.queue_capacity_packets,
+                            queue_len,
+                            queue_bytes,
+                            packet.size_bytes,
+                            node.id,
+                        )?,
+                        None,
+                    ),
+                    crate::DropMarkPolicy::EcnRamp(policy) => {
+                        let action = ecn_ramp_action(
+                            policy,
+                            queue_bytes,
+                            packet,
+                            ecn_seed,
+                            node.id,
+                            queue_id,
+                            event.payload,
+                        );
+                        (action, Some((*policy, action)))
+                    }
+                }
             };
             if action == QueueAdmissionAction::Drop {
                 state.dropped_packets = state
@@ -2664,8 +3049,14 @@ impl<'image> TransitionState<'image> {
             *counter = counter
                 .checked_add(packet.size_bytes)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
+            // Only a FIFO PFC queue keeps an order, and it appended the packet.
+            if queue_has_pfc {
+                if let Some(order) = self.pfc_order_mut(state_slot, queue_slot) {
+                    order.push(priority);
+                }
+            }
             #[cfg(debug_assertions)]
-            self.debug_assert_switch_queue_bytes(node, state_slot, queue_slot);
+            self.debug_assert_switch_queue_aux(node, state_slot, queue_slot);
         }
 
         if mark_packet {
@@ -2675,19 +3066,17 @@ impl<'image> TransitionState<'image> {
 
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.extend(pfc_transition);
-            if let Some((before, after, action, queued_packets_before)) = aqm_transition {
+            if let Some((policy, action)) = aqm_transition {
                 self.aqm_transitions.push(AqmTransitionRecord {
                     key: event.key,
                     node: node.id,
                     queue_id,
                     payload: event.payload,
-                    queued_packets_before,
                     queued_bytes_before: queue_bytes,
                     packet_size_bytes: packet.size_bytes,
                     ecn_before: packet_ecn_before,
                     ecn_after: packet.ecn_marked,
-                    before,
-                    after,
+                    policy,
                     action: match action {
                         QueueAdmissionAction::Enqueue => AqmTransitionAction::Enqueue,
                         QueueAdmissionAction::Mark => AqmTransitionAction::Mark,
@@ -2722,6 +3111,10 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
+    /// Kept out of line: inlined into `dispatch`, this PFC-only handler changed the code the
+    /// compiler emits for every other event, and Scalar E1, which carries no PFC, ran about 0.2%
+    /// more instructions (paired icount at P16 `b2cdd12`, `days-gpu/evidence/P16/pfcperf/`).
+    #[inline(never)]
     fn switch_pfc_remote_arrival(
         &mut self,
         node: NodeDescriptor,
@@ -2730,29 +3123,8 @@ impl<'image> TransitionState<'image> {
         children: &mut Vec<Event>,
     ) -> Result<(), ExecutionError> {
         let priority = usize::from(header.priority);
-        let queued = {
-            let state = self.switch_state(node)?;
-            let queue = state
-                .queues
-                .iter()
-                .find(|queue| queue.egress_link == Some(header.controlled_link))
-                .ok_or(ExecutionError::MissingSwitchQueue {
-                    node: node.id,
-                    egress_link: Some(header.controlled_link),
-                })?;
-            queue
-                .queue
-                .iter()
-                .map(|payload| {
-                    let packet = self.packet(*payload)?;
-                    Ok((
-                        *payload,
-                        usize::from(self.flow(packet.flow)?.packet_priority(packet.kind)),
-                    ))
-                })
-                .collect::<Result<Vec<_>, ExecutionError>>()?
-        };
-        let (schedule_payload, transition) = {
+        let state_slot = self.local_state_slot(node)?;
+        let (queue_slot, may_schedule, transition) = {
             let state = self.switch_state_mut(node)?;
             let (queue_id, queue) = state
                 .queues
@@ -2772,26 +3144,18 @@ impl<'image> TransitionState<'image> {
                 .copied()
                 .collect::<Vec<_>>();
             let was_paused = pfc.is_paused(priority);
-            let schedule_payload = if header.pause {
+            let resumed = if header.pause {
                 pfc.paused_by_controller[priority].insert(event.key.origin_node);
-                None
+                false
             } else if !pfc.paused_by_controller[priority].remove(&event.key.origin_node) {
                 // Duplicate/early resume is an idempotent no-op.
-                None
+                false
             } else if pfc.is_paused(priority) {
                 // Another controller still owns the aggregate pause.
-                None
+                false
             } else {
                 debug_assert!(was_paused);
-                let payload = queued.iter().find_map(|(payload, packet_priority)| {
-                    (!pfc.is_paused(*packet_priority)).then_some(*payload)
-                });
-                if payload.is_some() && queue.in_service.is_none() && !queue.tx_ready_pending {
-                    queue.tx_ready_pending = true;
-                    payload
-                } else {
-                    None
-                }
+                true
             };
             let transition =
                 crate::MechanismTransitionRecord::PfcControl(crate::PfcControlTransitionRecord {
@@ -2809,8 +3173,42 @@ impl<'image> TransitionState<'image> {
                     before_controllers,
                     after_controllers: pfc.paused_by_controller[priority].iter().copied().collect(),
                 });
-            (schedule_payload, transition)
+            (
+                queue_id,
+                resumed && queue.in_service.is_none() && !queue.tx_ready_pending,
+                transition,
+            )
         };
+        // A paused FIFO queue keeps its class order from the first pause on.
+        let mut probed_reads = if header.pause {
+            self.ensure_pfc_order(state_slot, queue_slot)?
+        } else {
+            0
+        };
+        // A resume that unpauses the class lets an idle queue serve its first eligible packet.
+        let schedule_payload = if may_schedule {
+            let (first, reads) = {
+                let queue = &self.switch_state(node)?.queues[queue_slot];
+                let pfc = queue
+                    .pfc
+                    .as_ref()
+                    .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+                let order = self.pfc_order(state_slot, queue_slot);
+                self.pfc_first_eligible(node, queue, pfc, order)?
+            };
+            probed_reads += reads;
+            if let Some((_, payload)) = first {
+                self.switch_state_mut(node)?.queues[queue_slot].tx_ready_pending = true;
+                Some(payload)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        self.pfc_service_probe.note_reads(probed_reads);
+        #[cfg(debug_assertions)]
+        self.debug_assert_switch_queue_aux(node, state_slot, queue_slot);
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.push(transition);
         }
@@ -2927,16 +3325,33 @@ impl<'image> TransitionState<'image> {
                     return Err(ExecutionError::InvalidSchedulerState(node.id));
                 };
                 let before = crate::roce::RoceSenderView::of(generator, &roce);
+                let flow = generator.flow;
+                // A phase-0 transition: the controller instants before `now` apply first.
+                let complete = roce.snd_una >= roce.pacer.total_bytes;
+                let materialized = dcqcn_materialize(&mut roce.controller, complete, now)
+                    .filter(|(_, advance)| advance.applied_rate_change());
+                if let Some((controller_before, advance)) = materialized {
+                    records.push(crate::MechanismTransitionRecord::Dcqcn(dcqcn_record(
+                        event.key,
+                        node.id,
+                        flow,
+                        crate::DcqcnTransitionKind::Advance,
+                        now,
+                        advance,
+                        false,
+                        controller_before,
+                        roce.controller,
+                    )));
+                }
                 let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
                 settle_roce_sender(generator, &roce, generator.next_emission.status);
                 generator.kind = FlowGeneratorKind::Roce(roce);
-                let flow = generator.flow;
                 records.push(roce_sender_record(
                     event.key,
                     node.id,
                     flow,
                     crate::RoceSenderKind::Resume,
-                    false,
+                    None,
                     image_flow_priority(image, flow)?,
                     &roce,
                     None,
@@ -3019,6 +3434,9 @@ impl<'image> TransitionState<'image> {
             // `dispatch` (`hostpfc-impl/tooling/inline-probe/`).
             PacketKind::Pfc(header) => {
                 return self.host_pfc_remote_arrival(node, event, header, children);
+            }
+            PacketKind::StageNotify => {
+                return self.host_notify_arrival(node, event, packet, children);
             }
             _ => {}
         }
@@ -3191,28 +3609,36 @@ impl<'image> TransitionState<'image> {
                 .arrivals
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
-            // A queue pair's reaction point is DCQCN's own; the rate change also moves its pacer's
-            // next-tick prediction.
-            let (before, after, applied) = match generator.kind {
+            // A feedback (P16 ruling D4): the controller instants before `now` apply, then the
+            // feedback. A complete flow's controller is frozen and ignores it (ruling D11). A
+            // queue pair's rate change also moves its pacer's next-tick prediction.
+            let now = event.key.time_ns;
+            let applied = match generator.kind {
                 FlowGeneratorKind::Dcqcn(mut dcqcn) => {
-                    let before = dcqcn.controller;
-                    let applied = dcqcn
-                        .controller
-                        .on_cnp(event.key.time_ns)
-                        .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-                    dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
-                    generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
-                    (before, dcqcn.controller, applied)
+                    if !matches!(
+                        generator.next_emission.status,
+                        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                    ) {
+                        None
+                    } else {
+                        let before = dcqcn.controller;
+                        let advance = dcqcn.controller.on_feedback(now);
+                        dcqcn.rate.rate_numerator_bits_per_second =
+                            dcqcn.controller.current_rate_bps;
+                        generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
+                        Some((before, advance, dcqcn.controller))
+                    }
                 }
                 FlowGeneratorKind::Roce(mut roce) => {
-                    let before = roce.controller;
-                    let applied = roce
-                        .controller
-                        .on_cnp(event.key.time_ns)
-                        .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-                    settle_roce_sender(generator, &roce, generator.next_emission.status);
-                    generator.kind = FlowGeneratorKind::Roce(roce);
-                    (before, roce.controller, applied)
+                    if roce.snd_una >= roce.pacer.total_bytes {
+                        None
+                    } else {
+                        let before = roce.controller;
+                        let advance = roce.controller.on_feedback(now);
+                        settle_roce_sender(generator, &roce, generator.next_emission.status);
+                        generator.kind = FlowGeneratorKind::Roce(roce);
+                        Some((before, advance, roce.controller))
+                    }
                 }
                 _ => {
                     return Err(ExecutionError::UnknownGenerator {
@@ -3221,20 +3647,23 @@ impl<'image> TransitionState<'image> {
                     });
                 }
             };
-            crate::DcqcnTransitionRecord {
-                key: event.key,
-                node: node.id,
-                flow: packet.flow,
-                kind: crate::DcqcnTransitionKind::Cnp,
-                applied,
-                emitted_bytes: 0,
-                before,
-                after,
-            }
+            applied.map(|(before, advance, after)| {
+                dcqcn_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    crate::DcqcnTransitionKind::Feedback,
+                    now,
+                    advance,
+                    false,
+                    before,
+                    after,
+                )
+            })
         };
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions
-                .push(crate::MechanismTransitionRecord::Dcqcn(transition));
+                .extend(transition.map(crate::MechanismTransitionRecord::Dcqcn));
         }
         self.record_arrival(node.id, packet, event.key, ArrivalDisposition::Feedback)?;
         self.mark_terminal(packet.id)
@@ -3642,6 +4071,10 @@ impl<'image> TransitionState<'image> {
         if packet.kind == PacketKind::RocePacingTimer {
             return self.host_roce_pacing_timer(node, event, packet, children);
         }
+        // A stage notify's token names its sender's timer (P16 H2).
+        if packet.kind == PacketKind::StageNotify {
+            return self.host_notify_timer(node, event, packet.flow, children);
+        }
         let compute_stage_owns = {
             let (state, index) = self.host_parts_mut(node)?;
             index
@@ -3656,9 +4089,6 @@ impl<'image> TransitionState<'image> {
         };
         if compute_stage_owns {
             return self.host_compute_timer(node, event, packet.flow, children);
-        }
-        if packet.kind == PacketKind::DcqcnControlTimer {
-            return self.host_dcqcn_control_timer(node, event, packet, children);
         }
         let dcqcn_owns = {
             let (state, index) = self.host_parts_mut(node)?;
@@ -3890,7 +4320,8 @@ impl<'image> TransitionState<'image> {
         let mut next_packet = None;
         let mut next_timer = None;
         let mut terminal_unused_token = false;
-        let mut byte_transition = None;
+        let mut tick_transition = None;
+        let full = self.observation_mode == ObservationMode::Full;
 
         {
             let state = self.host_state_mut(node)?;
@@ -3914,6 +4345,12 @@ impl<'image> TransitionState<'image> {
                 return Ok(());
             }
 
+            // A phase-1 transition: the controller instants at or before `now` apply before the
+            // tick reads the rate (P16 ruling D2).
+            let bound = event.key.time_ns.saturating_add(1);
+            let controller_before = dcqcn.controller;
+            let mut advance = dcqcn_materialize(&mut dcqcn.controller, false, bound)
+                .map_or(crate::DcqcnAdvance::default(), |(_, advance)| advance);
             let scale = pacing_credit_scale(dcqcn.rate.rate_denominator)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
             let tick_credit = pacing_tick_credit(
@@ -3942,21 +4379,6 @@ impl<'image> TransitionState<'image> {
                     .sourced_packets
                     .checked_add(1)
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
-                let before = dcqcn.controller;
-                let applied = dcqcn
-                    .controller
-                    .on_bytes_emitted(packet.size_bytes)
-                    .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-                byte_transition = Some(crate::DcqcnTransitionRecord {
-                    key: event.key,
-                    node: node.id,
-                    flow: packet.flow,
-                    kind: crate::DcqcnTransitionKind::Bytes,
-                    applied,
-                    emitted_bytes: packet.size_bytes,
-                    before,
-                    after: dcqcn.controller,
-                });
                 emitted = true;
             }
             dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
@@ -4021,17 +4443,41 @@ impl<'image> TransitionState<'image> {
                 } else {
                     GeneratorStatus::Stopped
                 };
+                // The flow is complete: its controller freezes at this tick (ruling D11).
+                let settled = dcqcn.controller.settle(bound);
+                advance.alpha_ticks += settled.alpha_ticks;
+                advance.increase_fires += settled.increase_fires;
+                advance.decrease_cuts += settled.decrease_cuts;
                 if let Some(candidate_time) = candidate_time {
                     generator.next_emission.departure_time_ns = candidate_time;
                 }
                 terminal_unused_token = !emitted;
+            }
+            dcqcn.rate.rate_numerator_bits_per_second = dcqcn.controller.current_rate_bps;
+            // Every tick of an unreliable flow is a row (ruling D17); the rate it read is the
+            // row's `after.current_rate_bps`, unchanged by a freeze.
+            if full {
+                tick_transition = Some(dcqcn_record(
+                    event.key,
+                    node.id,
+                    packet.flow,
+                    crate::DcqcnTransitionKind::Tick,
+                    bound,
+                    advance,
+                    !matches!(
+                        generator.next_emission.status,
+                        GeneratorStatus::Scheduled | GeneratorStatus::Blocked
+                    ),
+                    controller_before,
+                    dcqcn.controller,
+                ));
             }
             generator.kind = FlowGeneratorKind::Dcqcn(dcqcn);
         }
 
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions
-                .extend(byte_transition.map(crate::MechanismTransitionRecord::Dcqcn));
+                .extend(tick_transition.map(crate::MechanismTransitionRecord::Dcqcn));
         }
         if emitted {
             self.set_source_time(packet.id, event.key.time_ns)?;
@@ -4083,93 +4529,6 @@ impl<'image> TransitionState<'image> {
         Ok(())
     }
 
-    fn host_dcqcn_control_timer(
-        &mut self,
-        node: NodeDescriptor,
-        event: Event,
-        packet: PacketDescriptor,
-        children: &mut Vec<Event>,
-    ) -> Result<(), ExecutionError> {
-        let stop_time_ns = self.image.stop_time_ns;
-        let (transition, next_time_ns, queue_pair) = {
-            // Keyed, as the CNP arrival is.
-            let (mut state, index) = self.host_parts_mut(node)?;
-            let position =
-                index
-                    .first_generator(packet.flow)
-                    .ok_or(ExecutionError::UnknownGenerator {
-                        node: node.id,
-                        flow: packet.flow,
-                    })?;
-            let generator = &mut state.generators[position];
-            let (control_payload, controller) = match generator.kind {
-                FlowGeneratorKind::Dcqcn(dcqcn) => (dcqcn.control_timer_payload, dcqcn.controller),
-                FlowGeneratorKind::Roce(roce) => (roce.control_timer_payload, roce.controller),
-                _ => return Ok(()),
-            };
-            let queue_pair = matches!(generator.kind, FlowGeneratorKind::Roce(_));
-            if control_payload != packet.id || controller.next_control_time_ns != event.key.time_ns
-            {
-                return Ok(());
-            }
-            let mut after = controller;
-            let applied = after
-                .on_control_timer(event.key.time_ns)
-                .map_err(|_| ExecutionError::CounterOverflow(node.id))?;
-            let mut next_time_ns =
-                (after.next_control_time_ns <= stop_time_ns).then_some(after.next_control_time_ns);
-            match &mut generator.kind {
-                FlowGeneratorKind::Dcqcn(dcqcn) => {
-                    dcqcn.controller = after;
-                    dcqcn.rate.rate_numerator_bits_per_second = after.current_rate_bps;
-                }
-                FlowGeneratorKind::Roce(roce) => {
-                    roce.controller = after;
-                    // Ruling D2: a completed queue pair's control tick applies and is not re-armed.
-                    if roce.snd_una >= roce.pacer.total_bytes {
-                        next_time_ns = None;
-                    }
-                    let roce = *roce;
-                    settle_roce_sender(generator, &roce, generator.next_emission.status);
-                }
-                _ => unreachable!("matched above"),
-            }
-            let transition = crate::DcqcnTransitionRecord {
-                key: event.key,
-                node: node.id,
-                flow: packet.flow,
-                kind: crate::DcqcnTransitionKind::Control,
-                applied,
-                emitted_bytes: 0,
-                before: controller,
-                after,
-            };
-            (transition, next_time_ns, queue_pair)
-        };
-        if self.observation_mode == ObservationMode::Full {
-            self.mechanism_transitions
-                .push(crate::MechanismTransitionRecord::Dcqcn(transition));
-        }
-        if let Some(time_ns) = next_time_ns {
-            self.emit_from_host(
-                node,
-                event,
-                ChildEmission {
-                    target: node.id,
-                    kind: EventKind::PacingTimer,
-                    payload: packet.id,
-                    time_ns,
-                },
-                children,
-            )?;
-        } else if !queue_pair {
-            // A queue pair's tokens stay resident for the life of the pair: they are part of
-            // its state, which a later NACK may need to restart, and of any resumed image.
-            self.mark_terminal(packet.id)?;
-        }
-        Ok(())
-    }
-
     /// A RoCE queue pair's pacing tick (design note §5, step 2): one tick of credit at the
     /// controller's current rate; the packet at `next_psn`, a first transmission or a Go-back-N
     /// retransmission, is sent when the credit covers it. The pacer re-arms one interval later
@@ -4196,7 +4555,7 @@ impl<'image> TransitionState<'image> {
             flow: packet.flow,
             payload: event.payload,
         };
-        let (emission, next_tick_ns, timer_ns, byte_transition, record) = 'tick: {
+        let (emission, next_tick_ns, timer_ns, dcqcn_transition, record) = 'tick: {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position = index.first_generator(packet.flow).ok_or(unexpected)?;
             let generator = &mut state.generators[position];
@@ -4211,6 +4570,25 @@ impl<'image> TransitionState<'image> {
             }
             let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
             roce.pacer_armed = false;
+            // A phase-1 transition: the controller instants at or before `now` apply before the
+            // tick reads the rate or settles its prediction (P16 ruling D2).
+            let bound = now.saturating_add(1);
+            let complete = roce.snd_una >= roce.pacer.total_bytes;
+            let dcqcn_transition = dcqcn_materialize(&mut roce.controller, complete, bound)
+                .filter(|(_, advance)| full && advance.applied_rate_change())
+                .map(|(controller_before, advance)| {
+                    dcqcn_record(
+                        event.key,
+                        node.id,
+                        packet.flow,
+                        crate::DcqcnTransitionKind::Advance,
+                        bound,
+                        advance,
+                        false,
+                        controller_before,
+                        roce.controller,
+                    )
+                });
             let total = roce.pacer.total_bytes;
             // Host-link PFC, tested first (LeanGuard's writer contract, `leanguard.md` §12): a
             // tick that finds its data class paused at its host sends nothing, adds no credit and
@@ -4236,7 +4614,7 @@ impl<'image> TransitionState<'image> {
                         node.id,
                         packet.flow,
                         crate::RoceSenderKind::Tick,
-                        true,
+                        Some(crate::roce::TickPark::ClassPaused),
                         class,
                         &roce,
                         None,
@@ -4246,11 +4624,37 @@ impl<'image> TransitionState<'image> {
                         crate::roce::RoceSenderView::of(generator, &roce),
                     )
                 });
-                break 'tick (None, None, None, None, record);
+                break 'tick (None, None, None, dcqcn_transition, record);
+            }
+            // P16 ruling D7: a tick that finds the window closed, at the rate as of the tick,
+            // sends nothing, adds no credit and parks until feedback moves `snd_una`. Without a
+            // window this is one zero test.
+            if roce.window_bytes != 0 && roce.next_psn < total && crate::roce::window_bound(&roce) {
+                roce.window_parked = true;
+                let class = image_flow_priority(image, packet.flow)?;
+                let generator = &mut state.generators[position];
+                settle_roce_sender(generator, &roce, GeneratorStatus::Blocked);
+                generator.kind = FlowGeneratorKind::Roce(roce);
+                let record = before.map(|before| {
+                    roce_sender_record(
+                        event.key,
+                        node.id,
+                        packet.flow,
+                        crate::RoceSenderKind::Tick,
+                        Some(crate::roce::TickPark::WindowBlocked),
+                        class,
+                        &roce,
+                        None,
+                        None,
+                        None,
+                        before,
+                        crate::roce::RoceSenderView::of(generator, &roce),
+                    )
+                });
+                break 'tick (None, None, None, dcqcn_transition, record);
             }
             let mut rate_bps = None;
             let mut emission = None;
-            let mut byte_transition = None;
             let mut timer_ns = None;
             let overflow = ExecutionError::CounterOverflow(node.id);
             if roce.next_psn < total {
@@ -4286,22 +4690,6 @@ impl<'image> TransitionState<'image> {
                         generator.packets_emitted =
                             generator.packets_emitted.checked_add(1).ok_or(overflow)?;
                     }
-                    // Every transmitted byte, retransmissions included, feeds the byte counter.
-                    let controller_before = roce.controller;
-                    let applied = roce
-                        .controller
-                        .on_bytes_emitted(size)
-                        .map_err(|_| overflow)?;
-                    byte_transition = full.then_some(crate::DcqcnTransitionRecord {
-                        key: event.key,
-                        node: node.id,
-                        flow: packet.flow,
-                        kind: crate::DcqcnTransitionKind::Bytes,
-                        applied,
-                        emitted_bytes: size,
-                        before: controller_before,
-                        after: roce.controller,
-                    });
                     if roce.rto_ns != 0 && !outstanding_before {
                         let deadline = now
                             .checked_add(roce.rto_ns)
@@ -4343,7 +4731,7 @@ impl<'image> TransitionState<'image> {
                     node.id,
                     packet.flow,
                     crate::RoceSenderKind::Tick,
-                    false,
+                    None,
                     image_flow_priority(image, packet.flow)?,
                     &roce,
                     rate_bps,
@@ -4354,11 +4742,11 @@ impl<'image> TransitionState<'image> {
                 )),
                 None => None,
             };
-            (emission, next_tick_ns, timer_ns, byte_transition, record)
+            (emission, next_tick_ns, timer_ns, dcqcn_transition, record)
         };
         if full {
             self.mechanism_transitions
-                .extend(byte_transition.map(crate::MechanismTransitionRecord::Dcqcn));
+                .extend(dcqcn_transition.map(crate::MechanismTransitionRecord::Dcqcn));
             self.mechanism_transitions.extend(record);
         }
         if let Some(time_ns) = next_tick_ns {
@@ -4440,7 +4828,7 @@ impl<'image> TransitionState<'image> {
         self.mark_terminal(packet.id)?;
         let now = event.key.time_ns;
         let stop_time_ns = self.image.stop_time_ns;
-        let (superseded_ns, timer_ns, tick_ns, token, record, completed_stage) = {
+        let (superseded_ns, timer_ns, tick_ns, token, record, dcqcn_transition, completed_stage) = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position =
                 index
@@ -4462,6 +4850,12 @@ impl<'image> TransitionState<'image> {
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node.id))?;
             let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
+            // A phase-0 transition: the controller instants before `now` apply first (P16 ruling
+            // D2); the ACK that completes the pair then freezes the controller (ruling D11).
+            let total = roce.pacer.total_bytes;
+            let controller_before = roce.controller;
+            let mut advance = dcqcn_materialize(&mut roce.controller, roce.snd_una >= total, now)
+                .map_or(crate::DcqcnAdvance::default(), |(_, advance)| advance);
             let acknowledgment = header.acknowledgment;
             if acknowledgment > generator.bytes_emitted {
                 return Err(ExecutionError::InconsistentRocePacket {
@@ -4503,6 +4897,40 @@ impl<'image> TransitionState<'image> {
                 }
                 tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
             }
+            let froze = snd_una_before < total && roce.snd_una >= total;
+            if froze {
+                let settled = roce.controller.settle(now);
+                advance.alpha_ticks += settled.alpha_ticks;
+                advance.increase_fires += settled.increase_fires;
+                advance.decrease_cuts += settled.decrease_cuts;
+            }
+            // The ECN echo is the pair's congestion feedback (ruling D4), ignored once the pair is
+            // complete (ruling D11), as HPCC's `QpComplete` precedes `cnp_received_mlx`.
+            let feedback = header.ce_echo && roce.snd_una < total;
+            if feedback {
+                let fed = roce.controller.on_feedback(now);
+                advance.alpha_ticks += fed.alpha_ticks;
+                advance.increase_fires += fed.increase_fires;
+                advance.decrease_cuts += fed.decrease_cuts;
+            }
+            let dcqcn_transition = (full && (feedback || froze || advance.applied_rate_change()))
+                .then(|| {
+                    dcqcn_record(
+                        event.key,
+                        node.id,
+                        packet.flow,
+                        if feedback {
+                            crate::DcqcnTransitionKind::Feedback
+                        } else {
+                            crate::DcqcnTransitionKind::Advance
+                        },
+                        now,
+                        advance,
+                        froze,
+                        controller_before,
+                        roce.controller,
+                    )
+                });
             settle_roce_sender(generator, &roce, generator.next_emission.status);
             generator.kind = FlowGeneratorKind::Roce(roce);
             leave_parked_list(state.pfc, data_class, position, generator, &roce);
@@ -4517,11 +4945,11 @@ impl<'image> TransitionState<'image> {
                     } else {
                         crate::RoceSenderKind::Ack
                     },
-                    false,
+                    None,
                     data_class,
                     &roce,
                     None,
-                    Some(acknowledgment),
+                    Some(header),
                     None,
                     before,
                     crate::roce::RoceSenderView::of(generator, &roce),
@@ -4531,7 +4959,6 @@ impl<'image> TransitionState<'image> {
             // to its total (design note §4); a NACK carries the receiver's frontier, which stays
             // below the total, and later ACKs at the total are stale, so exactly one ACK does.
             // The stage record is read only then, once per pair.
-            let total = roce.pacer.total_bytes;
             let completed_stage = (snd_una_before < total
                 && roce.snd_una >= total
                 && state.stages.stage(position).is_some())
@@ -4542,6 +4969,7 @@ impl<'image> TransitionState<'image> {
                 tick_ns,
                 roce.pacing_timer_payload,
                 record,
+                dcqcn_transition,
                 completed_stage,
             )
         };
@@ -4553,6 +4981,8 @@ impl<'image> TransitionState<'image> {
             });
         }
         if self.observation_mode == ObservationMode::Full {
+            self.mechanism_transitions
+                .extend(dcqcn_transition.map(crate::MechanismTransitionRecord::Dcqcn));
             self.mechanism_transitions.extend(record);
         }
         self.emit_roce_timers(node, event, token, tick_ns, timer_ns, children)?;
@@ -4565,7 +4995,7 @@ impl<'image> TransitionState<'image> {
                 delay_ns: unloaded_round_trip_ns(
                     self.image,
                     packet.flow,
-                    header.acknowledged_bytes,
+                    u64::from(header.acknowledged_bytes),
                     packet.size_bytes,
                 )?,
             };
@@ -4604,7 +5034,7 @@ impl<'image> TransitionState<'image> {
         let stop_time_ns = self.image.stop_time_ns;
         let full = self.observation_mode == ObservationMode::Full;
         let data_class = image_flow_priority(self.image, flow)?;
-        let (timer_ns, tick_ns, record) = {
+        let (timer_ns, tick_ns, record, dcqcn_transition) = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let position = index
                 .first_generator(flow)
@@ -4635,6 +5065,25 @@ impl<'image> TransitionState<'image> {
                 return Ok(());
             }
             let before = full.then(|| crate::roce::RoceSenderView::of(generator, &roce));
+            // A phase-1 transition: the controller instants at or before `now` apply before the
+            // restart settles the pacer's prediction (P16 ruling D2). An armed timeout implies an
+            // incomplete pair.
+            let bound = now.saturating_add(1);
+            let dcqcn_transition = dcqcn_materialize(&mut roce.controller, false, bound)
+                .filter(|(_, advance)| full && advance.applied_rate_change())
+                .map(|(controller_before, advance)| {
+                    dcqcn_record(
+                        event.key,
+                        node.id,
+                        flow,
+                        crate::DcqcnTransitionKind::Advance,
+                        bound,
+                        advance,
+                        false,
+                        controller_before,
+                        roce.controller,
+                    )
+                });
             roce.next_psn = roce.snd_una;
             let deadline = now
                 .checked_add(roce.rto_ns)
@@ -4651,7 +5100,7 @@ impl<'image> TransitionState<'image> {
                     node.id,
                     flow,
                     crate::RoceSenderKind::Timeout,
-                    false,
+                    None,
                     data_class,
                     &roce,
                     None,
@@ -4661,9 +5110,11 @@ impl<'image> TransitionState<'image> {
                     crate::roce::RoceSenderView::of(generator, &roce),
                 )
             });
-            (Some(deadline), tick_ns, record)
+            (Some(deadline), tick_ns, record, dcqcn_transition)
         };
         if full {
+            self.mechanism_transitions
+                .extend(dcqcn_transition.map(crate::MechanismTransitionRecord::Dcqcn));
             self.mechanism_transitions.extend(record);
         }
         self.emit_roce_timers(node, event, event.payload, tick_ns, timer_ns, children)
@@ -4702,9 +5153,8 @@ impl<'image> TransitionState<'image> {
 
     /// A RoCE data packet at its queue pair's receiver (design note §5, step 9).
     ///
-    /// The DCQCN notification point decides a CNP exactly as for a DCQCN flow; then the Go-back-N
-    /// receiver accepts the in-order packet, or drops the packet and answers it. The CNP is
-    /// allocated and enqueued before the ACK or NACK (ordering S1).
+    /// The Go-back-N receiver accepts the in-order packet, or drops the packet and answers it. An
+    /// ACK or NACK echoes the packet's CE mark; the receiver sends no CNP (P16 rulings D4, D5).
     // Out of line: queue-pair transitions must not grow the shared `dispatch` that every
     // event of every image runs through (P15 inlining check, `qp-impl/callsites.txt`).
     #[inline(never)]
@@ -4726,7 +5176,7 @@ impl<'image> TransitionState<'image> {
         let now = event.key.time_ns;
         let node_count = u64::try_from(self.image.nodes.len()).unwrap_or(u64::MAX);
         let congestion_experienced = packet.ecn_codepoint() == crate::EcnCodepoint::Ce;
-        let (cnp, feedback, schedule_ready, record, stage_causes) = {
+        let (feedback, schedule_ready, record, stage_causes) = {
             let (mut state, index) = self.host_parts_mut(node)?;
             let unknown = ExecutionError::UnknownGenerator {
                 node: node.id,
@@ -4734,7 +5184,7 @@ impl<'image> TransitionState<'image> {
             };
             let receivers = state.roce_receivers.as_deref_mut().ok_or(unknown)?;
             let position = receivers
-                .binary_search_by_key(&packet.flow, |receiver| receiver.np.flow)
+                .binary_search_by_key(&packet.flow, |receiver| receiver.flow)
                 .map_err(|_| unknown)?;
             let receiver = &mut receivers[position];
             if header
@@ -4748,11 +5198,6 @@ impl<'image> TransitionState<'image> {
                 });
             }
             let before = crate::roce::RoceReceiverView::of(receiver);
-            let cnp_sent = crate::roce::notification_point_sends_cnp(
-                &mut receiver.np,
-                now,
-                congestion_experienced,
-            );
             let action = crate::roce::receive(receiver, header.psn, packet.size_bytes, now);
             let receiver = *receiver;
             // A collective stage waiting on this queue pair counts the receiver's Go-back-N
@@ -4790,18 +5235,13 @@ impl<'image> TransitionState<'image> {
                     .ok_or(ExecutionError::CounterOverflow(node.id))?;
                 Ok(payload)
             };
-            let cnp = cnp_sent
-                .then(&mut allocate)
-                .transpose()?
-                .map(|payload| (payload, receiver.np.cnp_size_bytes));
             let feedback = action
                 .sends_feedback()
                 .then(&mut allocate)
                 .transpose()?
                 .map(|payload| (payload, receiver.ack_size_bytes, action));
-            let schedule_ready = (cnp.is_some() || feedback.is_some())
-                && state.in_service.is_none()
-                && !*state.tx_ready_pending;
+            let schedule_ready =
+                feedback.is_some() && state.in_service.is_none() && !*state.tx_ready_pending;
             if schedule_ready {
                 *state.tx_ready_pending = true;
             }
@@ -4815,7 +5255,6 @@ impl<'image> TransitionState<'image> {
                     nack_interval_ns: receiver.nack_interval_ns,
                     duplicate_ack: receiver.duplicate_ack,
                     ack_size_bytes: receiver.ack_size_bytes,
-                    cnp_interval_ns: receiver.np.cnp_interval_ns,
                     packet_psn: header.psn,
                     packet_bytes: packet.size_bytes,
                     packet_sent_time_ns: header.sent_time_ns,
@@ -4824,13 +5263,12 @@ impl<'image> TransitionState<'image> {
                     action,
                     feedback_acknowledgment: feedback.map(|_| receiver.expected_psn),
                     feedback_payload: feedback.map(|(payload, ..)| payload),
-                    cnp_payload: cnp.map(|(payload, _)| payload),
+                    feedback_ce_echo: feedback.map(|_| congestion_experienced),
                     before,
                     after: crate::roce::RoceReceiverView::of(&receiver),
                 }),
             );
             (
-                cnp,
                 feedback.map(|feedback| (feedback, receiver.expected_psn)),
                 schedule_ready,
                 record,
@@ -4843,26 +5281,18 @@ impl<'image> TransitionState<'image> {
             self.mechanism_transitions.push(record);
         }
         let mut first = None;
-        if let Some((payload, size_bytes)) = cnp {
-            let cnp = PacketDescriptor {
-                id: payload,
-                flow: packet.flow,
-                size_bytes,
-                ecn_marked: false,
-                kind: PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
-                    trigger_payload: packet.id,
-                }),
-            };
-            self.insert_packet(cnp, Some(now))?;
-            self.enqueue_source_packet(node, payload)?;
-            self.record_sourced(node.id, cnp)?;
-            first.get_or_insert(payload);
-        }
         if let Some(((payload, size_bytes, action), frontier)) = feedback {
+            // The ECN echo of the packet that triggered the ACK or NACK (rulings D4 and D5).
             let header = crate::RoceAckHeader {
                 acknowledgment: frontier,
                 echoed_sent_time_ns: header.sent_time_ns,
-                acknowledged_bytes: packet.size_bytes,
+                acknowledged_bytes: u32::try_from(packet.size_bytes).map_err(|_| {
+                    ExecutionError::InconsistentRocePacket {
+                        flow: packet.flow,
+                        payload: packet.id,
+                    }
+                })?,
+                ce_echo: congestion_experienced,
             };
             let reply = PacketDescriptor {
                 id: payload,
@@ -4946,12 +5376,15 @@ impl<'image> TransitionState<'image> {
             });
         };
 
+        let state_slot = self.local_state_slot(node)?;
+        let mut probed_entries = None;
         let plan = {
             let state = self.switch_state(node)?;
-            let queue = state
+            let (queue_slot, queue) = state
                 .queues
                 .iter()
-                .find(|queue| queue.egress_link == Some(egress_link))
+                .enumerate()
+                .find(|(_, queue)| queue.egress_link == Some(egress_link))
                 .ok_or(ExecutionError::MissingSwitchQueue {
                     node: node.id,
                     egress_link: Some(egress_link),
@@ -4964,7 +5397,35 @@ impl<'image> TransitionState<'image> {
                         .map(|payload| self.packet(*payload))
                         .transpose()?,
                 )
+            } else if let Some(pfc) = queue
+                .pfc
+                .as_ref()
+                .filter(|_| scheduler_serves_head(&queue.scheduler))
+            {
+                // The discipline serves position zero of the eligible packets: the first queued
+                // packet whose class is not paused. Only that packet is read.
+                let order = self.pfc_order(state_slot, queue_slot);
+                let (first, reads) = self.pfc_first_eligible(node, queue, pfc, order)?;
+                let selection = first
+                    .map(|(position, payload)| {
+                        let packet = self.packet(payload)?;
+                        Ok::<_, ExecutionError>(PfcSelection {
+                            position,
+                            packet,
+                            priority: self.packet_pfc_class(packet)?,
+                            incoming_link: self.packet_incoming_link_at(packet, node.id)?,
+                        })
+                    })
+                    .transpose()?;
+                probed_entries = Some((
+                    reads + usize::from(selection.is_some()),
+                    selection.map(|selection| selection.position),
+                ));
+                SwitchServicePlan::PfcFirst(selection)
             } else {
+                if queue.pfc.is_some() {
+                    probed_entries = Some((queue.queue.len(), None));
+                }
                 let mut positions = Vec::new();
                 let mut packets = Vec::new();
                 let mut priorities = Vec::new();
@@ -4992,8 +5453,18 @@ impl<'image> TransitionState<'image> {
                 }
             }
         };
-        let state_slot = self.local_state_slot(node)?;
-        let (payload, selected_packet, queue_slot, pfc_plan, pfc_transition, scheduler_transition) = 'service: {
+        if let Some((entries, served)) = probed_entries {
+            self.pfc_service_probe.note_decision(entries, served);
+        }
+        let (
+            payload,
+            selected_packet,
+            selected_priority,
+            queue_slot,
+            pfc_plan,
+            pfc_transition,
+            scheduler_transition,
+        ) = 'service: {
             let state = self.switch_state_mut(node)?;
             let (queue_slot, queue) = state
                 .queues
@@ -5013,10 +5484,13 @@ impl<'image> TransitionState<'image> {
             }
 
             let (
+                position,
+                packet,
+                priority,
+                incoming_link,
+                scheduler_before,
+                scan_steps,
                 eligible_packets,
-                eligible_positions,
-                eligible_priorities,
-                eligible_incoming_links,
             ) = match &plan {
                 SwitchServicePlan::Head(head) => {
                     // Position zero of a queue whose every packet is eligible. The selection,
@@ -5039,26 +5513,52 @@ impl<'image> TransitionState<'image> {
                         )?;
                     }
                     queue.in_service = Some(payload);
-                    break 'service (payload, packet, queue_slot, None, None, None);
+                    break 'service (payload, packet, None, queue_slot, None, None, None);
+                }
+                SwitchServicePlan::PfcFirst(selection) => {
+                    // What the eligible-packet path computes for a head-serving discipline:
+                    // `scheduler_select_position` answers position zero of the eligible packets
+                    // without touching the scheduler, and the scheduler record is `None`.
+                    let Some(selection) = *selection else {
+                        return Ok(());
+                    };
+                    (
+                        selection.position,
+                        selection.packet,
+                        selection.priority,
+                        selection.incoming_link,
+                        None,
+                        0,
+                        &[][..],
+                    )
                 }
                 SwitchServicePlan::Eligible {
                     positions,
                     packets,
                     priorities,
                     incoming_links,
-                } => (packets, positions, priorities, incoming_links),
+                } => {
+                    let scheduler_before = matches!(
+                        queue.scheduler,
+                        SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_)
+                    )
+                    .then(|| queue.scheduler.clone());
+                    let Some((eligible_position, scan_steps)) =
+                        scheduler_select_position(&mut queue.scheduler, packets, node.id)?
+                    else {
+                        return Ok(());
+                    };
+                    (
+                        positions[eligible_position],
+                        packets[eligible_position],
+                        priorities[eligible_position],
+                        incoming_links[eligible_position],
+                        scheduler_before,
+                        scan_steps,
+                        &packets[..],
+                    )
+                }
             };
-            let scheduler_before = matches!(
-                queue.scheduler,
-                SchedulerKind::DeficitRoundRobin(_) | SchedulerKind::WeightedRoundRobin(_)
-            )
-            .then(|| queue.scheduler.clone());
-            let Some((eligible_position, scan_steps)) =
-                scheduler_select_position(&mut queue.scheduler, eligible_packets, node.id)?
-            else {
-                return Ok(());
-            };
-            let position = eligible_positions[eligible_position];
             let payload = queue
                 .queue
                 .remove(position)
@@ -5072,9 +5572,6 @@ impl<'image> TransitionState<'image> {
                 )?;
             }
             queue.in_service = Some(payload);
-            let packet = eligible_packets[eligible_position];
-            let priority = eligible_priorities[eligible_position];
-            let incoming_link = eligible_incoming_links[eligible_position];
             let queue_id = u64::try_from(queue_slot).unwrap_or(u64::MAX);
             let ingress = queue.pfc.as_mut().and_then(|pfc| {
                 pfc.ingresses
@@ -5174,6 +5671,7 @@ impl<'image> TransitionState<'image> {
             (
                 payload,
                 packet,
+                Some(priority),
                 queue_slot,
                 pfc_plan,
                 pfc_transition,
@@ -5185,12 +5683,24 @@ impl<'image> TransitionState<'image> {
         *counter = counter
             .checked_sub(selected_packet.size_bytes)
             .ok_or(ExecutionError::CounterOverflow(node.id))?;
+        // A queue keeps an order only under FIFO, where the served packet is the first of its
+        // class: the head, or the packet the order selected (`PfcClassOrder`).
+        if let Some(priority) = selected_priority {
+            if let Some(order) = self.pfc_order_mut(state_slot, queue_slot) {
+                let served = order.pop(priority);
+                debug_assert!(
+                    served.is_some(),
+                    "a FIFO PFC queue served a class it holds no packet of"
+                );
+            }
+        }
         #[cfg(debug_assertions)]
-        self.debug_assert_switch_queue_bytes(node, state_slot, queue_slot);
+        self.debug_assert_switch_queue_aux(node, state_slot, queue_slot);
 
         if self.observation_mode == ObservationMode::Full {
             self.mechanism_transitions.extend(pfc_transition);
             self.mechanism_transitions.extend(scheduler_transition);
+            self.observe_service_start(node, queue_slot, event.key)?;
         }
 
         let link = self.link(egress_link)?;
@@ -5252,12 +5762,13 @@ impl<'image> TransitionState<'image> {
         };
         let rate_bps = self.link(egress_link)?.rate_bps;
 
-        let eligible_next_payload = {
+        let (eligible_next_payload, probed_reads) = {
             let state = self.switch_state(node)?;
-            let queue = state
+            let (queue_slot, queue) = state
                 .queues
                 .iter()
-                .find(|queue| queue.egress_link == Some(egress_link))
+                .enumerate()
+                .find(|(_, queue)| queue.egress_link == Some(egress_link))
                 .ok_or(ExecutionError::MissingSwitchQueue {
                     node: node.id,
                     egress_link: Some(egress_link),
@@ -5265,15 +5776,15 @@ impl<'image> TransitionState<'image> {
             // Without a PFC monitor no priority can be paused, so the first eligible packet is
             // the queue head and no per-packet inspection is observable.
             match &queue.pfc {
-                None => queue.queue.front().copied(),
-                Some(pfc) => queue.queue.iter().find_map(|payload| {
-                    let packet = self.packet(*payload).ok()?;
-                    let priority =
-                        usize::from(self.flow(packet.flow).ok()?.packet_priority(packet.kind));
-                    (!pfc.is_paused(priority)).then_some(*payload)
-                }),
+                None => (queue.queue.front().copied(), 0),
+                Some(pfc) => {
+                    let order = self.pfc_order(self.local_state_slot(node)?, queue_slot);
+                    let (first, reads) = self.pfc_first_eligible(node, queue, pfc, order)?;
+                    (first.map(|(_, payload)| payload), reads)
+                }
             }
         };
+        self.pfc_service_probe.note_reads(probed_reads);
         let next_payload = {
             let state = self.switch_state_mut(node)?;
             let queue = state
@@ -5513,6 +6024,258 @@ impl<'image> TransitionState<'image> {
             })
     }
 
+    /// The switch, queue slot and egress link of the queue `packet` uses at `node`, when `node`
+    /// is a switch; `None` at a host.
+    fn scheduler_queue_of(
+        &self,
+        node: NodeId,
+        packet: PacketDescriptor,
+    ) -> Result<Option<(NodeDescriptor, usize, LinkId)>, ExecutionError> {
+        let node = self.node(node)?;
+        if node.kind != NodeKind::Switch {
+            return Ok(None);
+        }
+        let Some(egress_link) = self.packet_egress_at(packet, node.id)? else {
+            return Ok(None);
+        };
+        let queue_slot = self
+            .switch_state(node)?
+            .queues
+            .iter()
+            .position(|queue| queue.egress_link == Some(egress_link))
+            .ok_or(ExecutionError::MissingSwitchQueue {
+                node: node.id,
+                egress_link: Some(egress_link),
+            })?;
+        Ok(Some((node, queue_slot, egress_link)))
+    }
+
+    /// Full observation only (P16 L2 certificates): records an admitted packet's enqueue at a
+    /// WFQ or SP queue, after the enqueue. A WFQ record carries the packet's finish tag and its
+    /// virtual start, the tag less its service `size_bytes * 8 / weight`.
+    #[cold]
+    #[inline(never)]
+    fn observe_scheduler_enqueue(
+        &mut self,
+        node: NodeId,
+        key: EventKey,
+        packet: PacketDescriptor,
+    ) -> Result<(), ExecutionError> {
+        let Some((node, queue_slot, _)) = self.scheduler_queue_of(node, packet)? else {
+            return Ok(());
+        };
+        let queue = &self.switch_state(node)?.queues[queue_slot];
+        let record = match &queue.scheduler {
+            SchedulerKind::StaticPriority { priorities } => {
+                let kind = crate::SpTransitionKind::Enqueue;
+                sp_record(kind, key, node.id, queue_slot, priorities, packet, None)?
+            }
+            SchedulerKind::WeightedFairQueue(wfq) => {
+                let finish = wfq.packet_finish_times.get(&packet.id).cloned().ok_or(
+                    ExecutionError::MissingWfqFinishTag {
+                        node: node.id,
+                        payload: packet.id,
+                    },
+                )?;
+                let class = scheduler_class(packet.flow, wfq.weights.len())
+                    .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+                let service = Ratio::new(
+                    BigUint::from(packet.size_bytes) * BigUint::from(8_u8),
+                    BigUint::from(wfq.weights[class]),
+                );
+                let egress_link = queue
+                    .egress_link
+                    .ok_or(ExecutionError::InvalidSchedulerState(node.id))?;
+                let pfc_priority = if queue.pfc.is_some() {
+                    self.flow(packet.flow)?.packet_priority(packet.kind)
+                } else {
+                    0
+                };
+                let mut record = wfq_record(
+                    crate::WfqTransitionKind::Enqueue,
+                    key,
+                    node.id,
+                    queue_slot,
+                    self.link(egress_link)?.rate_bps,
+                    wfq,
+                    packet,
+                    Some(finish.clone() - service),
+                    Some(finish),
+                    Vec::new(),
+                    Vec::new(),
+                );
+                if let crate::MechanismTransitionRecord::Wfq(wfq_record) = &mut record {
+                    wfq_record.pfc_priority = pfc_priority;
+                }
+                record
+            }
+            _ => return Ok(()),
+        };
+        self.mechanism_transitions.push(record);
+        Ok(())
+    }
+
+    /// Full observation only: records the WFQ or SP service start the `TxReady` at `key` just
+    /// performed at queue `queue_slot` of `node`: the packet it put in service, and the time the
+    /// transmission completes (the time `switch_tx_ready` gives the `TxComplete` it emits).
+    #[cold]
+    #[inline(never)]
+    fn observe_service_start(
+        &mut self,
+        node: NodeDescriptor,
+        queue_slot: usize,
+        key: EventKey,
+    ) -> Result<(), ExecutionError> {
+        let queue = &self.switch_state(node)?.queues[queue_slot];
+        if !matches!(
+            queue.scheduler,
+            SchedulerKind::StaticPriority { .. } | SchedulerKind::WeightedFairQueue(_)
+        ) {
+            return Ok(());
+        }
+        let (Some(served), Some(egress_link)) = (queue.in_service, queue.egress_link) else {
+            return Err(ExecutionError::InvalidSchedulerState(node.id));
+        };
+        let served = self.packet(served)?;
+        let link = self.link(egress_link)?;
+        let departure_time_ns = link
+            .arrival_time_ns(key.time_ns, served.size_bytes)?
+            .checked_sub(link.propagation_ns)
+            .ok_or(ExecutionError::Time(TimeError::ArrivalOverflow))?;
+        self.observe_scheduler_service_start(
+            node,
+            queue_slot,
+            key,
+            served,
+            egress_link,
+            departure_time_ns,
+        )
+    }
+
+    /// Full observation only (P16 L2 certificates): records a service start at a WFQ or SP
+    /// queue, after the selection. The WFQ record lists the served packet and then every packet
+    /// still waiting, in queue order, each with its finish tag and PFC class, and the PFC
+    /// priorities paused at the egress. The SP record carries the time the transmission
+    /// completes.
+    fn observe_scheduler_service_start(
+        &mut self,
+        node: NodeDescriptor,
+        queue_slot: usize,
+        key: EventKey,
+        selected: PacketDescriptor,
+        egress_link: LinkId,
+        departure_time_ns: u64,
+    ) -> Result<(), ExecutionError> {
+        let queue = &self.switch_state(node)?.queues[queue_slot];
+        let link = self.link(egress_link)?;
+        let record = match &queue.scheduler {
+            SchedulerKind::StaticPriority { priorities } => {
+                let kind = crate::SpTransitionKind::Schedule;
+                sp_record(
+                    kind,
+                    key,
+                    node.id,
+                    queue_slot,
+                    priorities,
+                    selected,
+                    Some(departure_time_ns),
+                )?
+            }
+            SchedulerKind::WeightedFairQueue(wfq) => {
+                let tag = |payload: PayloadId| {
+                    wfq.packet_finish_times.get(&payload).cloned().ok_or(
+                        ExecutionError::MissingWfqFinishTag {
+                            node: node.id,
+                            payload,
+                        },
+                    )
+                };
+                let mut queued_packets = Vec::with_capacity(queue.queue.len() + 1);
+                for waiting in std::iter::once(Ok(selected))
+                    .chain(queue.queue.iter().map(|payload| self.packet(*payload)))
+                {
+                    let waiting = waiting?;
+                    queued_packets.push(crate::WfqQueuedPacket {
+                        packet: scheduler_packet(waiting),
+                        pfc_priority: if queue.pfc.is_some() {
+                            self.flow(waiting.flow)?.packet_priority(waiting.kind)
+                        } else {
+                            0
+                        },
+                        finish: tag(waiting.id)?,
+                    });
+                }
+                let paused_priorities = queue.pfc.as_ref().map_or_else(Vec::new, |pfc| {
+                    (0..8_u8)
+                        .filter(|priority| pfc.is_paused(usize::from(*priority)))
+                        .collect()
+                });
+                wfq_record(
+                    crate::WfqTransitionKind::Select,
+                    key,
+                    node.id,
+                    queue_slot,
+                    link.rate_bps,
+                    wfq,
+                    selected,
+                    None,
+                    Some(tag(selected.id)?),
+                    queued_packets,
+                    paused_priorities,
+                )
+            }
+            _ => return Ok(()),
+        };
+        self.mechanism_transitions.push(record);
+        Ok(())
+    }
+
+    /// Full observation only (P16 L2 certificates): records a service completion at a WFQ or SP
+    /// queue, after the completion.
+    #[cold]
+    #[inline(never)]
+    fn observe_scheduler_completion(
+        &mut self,
+        node: NodeId,
+        key: EventKey,
+        packet: PacketDescriptor,
+    ) -> Result<(), ExecutionError> {
+        let Some((node, queue_slot, egress_link)) = self.scheduler_queue_of(node, packet)? else {
+            return Ok(());
+        };
+        let queue = &self.switch_state(node)?.queues[queue_slot];
+        let record = match &queue.scheduler {
+            SchedulerKind::StaticPriority { priorities } => {
+                let kind = crate::SpTransitionKind::Depart;
+                sp_record(
+                    kind,
+                    key,
+                    node.id,
+                    queue_slot,
+                    priorities,
+                    packet,
+                    Some(key.time_ns),
+                )?
+            }
+            SchedulerKind::WeightedFairQueue(wfq) => wfq_record(
+                crate::WfqTransitionKind::Complete,
+                key,
+                node.id,
+                queue_slot,
+                self.link(egress_link)?.rate_bps,
+                wfq,
+                packet,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+            ),
+            _ => return Ok(()),
+        };
+        self.mechanism_transitions.push(record);
+        Ok(())
+    }
+
     fn switch_sp_insertion_position(
         &self,
         node: NodeDescriptor,
@@ -5554,7 +6317,7 @@ impl<'image> TransitionState<'image> {
     }
 
     #[cfg(debug_assertions)]
-    fn debug_assert_switch_queue_bytes(
+    fn debug_assert_switch_queue_aux(
         &self,
         node: NodeDescriptor,
         state_slot: usize,
@@ -5570,6 +6333,169 @@ impl<'image> TransitionState<'image> {
             "switch {:?} queue {queue_slot} byte counter diverged from its contents",
             node.id,
         );
+        if let Some(order) = self.pfc_order(state_slot, queue_slot) {
+            // The keys, merged, list the queue's classes in queue order, below the next key.
+            let mut keyed = order
+                .classes
+                .iter()
+                .enumerate()
+                .flat_map(|(class, keys)| keys.iter().map(move |key| (*key, class)))
+                .collect::<Vec<_>>();
+            keyed.sort_unstable();
+            debug_assert!(
+                order
+                    .classes
+                    .iter()
+                    .all(|keys| keys.iter().is_sorted_by(|a, b| a < b)),
+                "switch {:?} queue {queue_slot} class order is not increasing",
+                node.id,
+            );
+            debug_assert!(keyed.last().is_none_or(|(key, _)| *key < order.next_seq));
+            let classes = queue
+                .queue
+                .iter()
+                .map(|payload| {
+                    self.packet(*payload)
+                        .and_then(|packet| self.packet_pfc_class(packet))
+                        .ok()
+                })
+                .collect::<Option<Vec<_>>>();
+            debug_assert_eq!(
+                Some(
+                    keyed
+                        .into_iter()
+                        .map(|(_, class)| class)
+                        .collect::<Vec<_>>()
+                ),
+                classes,
+                "switch {:?} queue {queue_slot} class order diverged from its contents",
+                node.id,
+            );
+        }
+    }
+
+    /// A packet's PFC class: its flow's priority, or the flow's feedback class for a CNP, ACK or
+    /// NACK (`FlowDescriptor::packet_priority`).
+    fn packet_pfc_class(&self, packet: PacketDescriptor) -> Result<usize, ExecutionError> {
+        Ok(usize::from(
+            self.flow(packet.flow)?.packet_priority(packet.kind),
+        ))
+    }
+
+    /// The queue position and payload of the first queued packet whose PFC class `pfc` does not
+    /// pause, with the number of queued entries read to find it.
+    ///
+    /// This is the packet the eligible-packet plan's position zero names. With no class paused it
+    /// is the head, and nothing is read. A FIFO queue with a paused class keeps a
+    /// `PfcClassOrder`, which answers without reading the queue. Static priority and WFQ insert
+    /// by rank, so queue order is not arrival order there; their search reads from the head up to
+    /// the packet, as their admission already does. DRR and WRR choose from the whole eligible
+    /// list on `TxReady`; after a transmission or a resume they search from the head likewise.
+    fn pfc_first_eligible(
+        &self,
+        node: NodeDescriptor,
+        queue: &crate::SwitchQueueState,
+        pfc: &crate::PfcQueueState,
+        order: Option<&PfcClassOrder>,
+    ) -> Result<(Option<(usize, PayloadId)>, usize), ExecutionError> {
+        let Some(head) = queue.queue.front().copied() else {
+            return Ok((None, 0));
+        };
+        if !pfc_any_paused(pfc) {
+            return Ok((Some((0, head)), 0));
+        }
+        let Some(order) = order else {
+            debug_assert!(
+                !matches!(queue.scheduler, SchedulerKind::Fifo),
+                "switch {:?}: a FIFO PFC queue with a paused class keeps a class order",
+                node.id,
+            );
+            return self.pfc_first_eligible_by_search(queue, pfc);
+        };
+        let first = order
+            .first_unpaused_position(pfc)
+            .map(|position| {
+                queue
+                    .queue
+                    .get(position)
+                    .map(|payload| (position, *payload))
+                    .ok_or(ExecutionError::InvalidSchedulerState(node.id))
+            })
+            .transpose()?;
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            Some(first),
+            self.pfc_first_eligible_by_search(queue, pfc)
+                .ok()
+                .map(|(search, _)| search),
+            "switch {:?}: the class order and the search disagree on the first eligible packet",
+            node.id,
+        );
+        Ok((first, 0))
+    }
+
+    /// `pfc_first_eligible` by reading the queue from the head.
+    fn pfc_first_eligible_by_search(
+        &self,
+        queue: &crate::SwitchQueueState,
+        pfc: &crate::PfcQueueState,
+    ) -> Result<(Option<(usize, PayloadId)>, usize), ExecutionError> {
+        for (position, payload) in queue.queue.iter().enumerate() {
+            if !pfc.is_paused(self.packet_pfc_class(self.packet(*payload)?)?) {
+                return Ok((Some((position, *payload)), position + 1));
+            }
+        }
+        Ok((None, queue.queue.len()))
+    }
+
+    /// The class order of a FIFO PFC queue that has had a class paused.
+    fn pfc_order(&self, state_slot: usize, queue_slot: usize) -> Option<&PfcClassOrder> {
+        self.switch_pfc_orders
+            .as_deref()?
+            .0
+            .get(&(state_slot, queue_slot))
+    }
+
+    fn pfc_order_mut(
+        &mut self,
+        state_slot: usize,
+        queue_slot: usize,
+    ) -> Option<&mut PfcClassOrder> {
+        self.switch_pfc_orders
+            .as_deref_mut()?
+            .0
+            .get_mut(&(state_slot, queue_slot))
+    }
+
+    /// Gives a FIFO PFC queue its class order if it has none; returns the queued entries read.
+    fn ensure_pfc_order(
+        &mut self,
+        state_slot: usize,
+        queue_slot: usize,
+    ) -> Result<usize, ExecutionError> {
+        let Some(queue) = self
+            .switch_states
+            .get(state_slot)
+            .and_then(|state| state.queues.get(queue_slot))
+        else {
+            return Ok(0);
+        };
+        if queue.pfc.is_none()
+            || !matches!(queue.scheduler, SchedulerKind::Fifo)
+            || self.pfc_order(state_slot, queue_slot).is_some()
+        {
+            return Ok(0);
+        }
+        let mut order = PfcClassOrder::new();
+        for payload in &queue.queue {
+            order.push(self.packet_pfc_class(self.packet(*payload)?)?);
+        }
+        let reads = queue.queue.len();
+        self.switch_pfc_orders
+            .get_or_insert_with(Box::default)
+            .0
+            .insert((state_slot, queue_slot), order);
+        Ok(reads)
     }
 
     fn link(&self, id: LinkId) -> Result<crate::LinkDescriptor, ExecutionError> {
@@ -6095,15 +7021,28 @@ impl<'image> TransitionState<'image> {
         add_summary(&mut self.summary.departed_packets, 1, node)?;
         add_summary(&mut self.summary.departed_bytes, packet.size_bytes, node)?;
         if self.observation_mode == ObservationMode::Full {
-            self.departures.push((
-                event_key,
-                PacketDeparture {
-                    payload: packet.id,
-                    time_ns: event_key.time_ns,
-                },
-            ));
+            self.observe_departure(node, packet, event_key)?;
         }
         Ok(())
+    }
+
+    /// Full observation only: retains a departure and records the WFQ or SP completion it ends.
+    #[cold]
+    #[inline(never)]
+    fn observe_departure(
+        &mut self,
+        node: NodeId,
+        packet: PacketDescriptor,
+        event_key: EventKey,
+    ) -> Result<(), ExecutionError> {
+        self.departures.push((
+            event_key,
+            PacketDeparture {
+                payload: packet.id,
+                time_ns: event_key.time_ns,
+            },
+        ));
+        self.observe_scheduler_completion(node, event_key, packet)
     }
 
     fn record_arrival(
@@ -6135,14 +7074,31 @@ impl<'image> TransitionState<'image> {
         add_summary(packets, 1, node)?;
         add_summary(bytes, packet.size_bytes, node)?;
         if self.observation_mode == ObservationMode::Full {
-            self.arrivals.push((
-                event_key,
-                PacketArrivalObservation {
-                    payload: packet.id,
-                    time_ns: event_key.time_ns,
-                    disposition,
-                },
-            ));
+            self.observe_arrival(node, packet, event_key, disposition)?;
+        }
+        Ok(())
+    }
+
+    /// Full observation only: retains an arrival and records the WFQ or SP enqueue it performs.
+    #[cold]
+    #[inline(never)]
+    fn observe_arrival(
+        &mut self,
+        node: NodeId,
+        packet: PacketDescriptor,
+        event_key: EventKey,
+        disposition: ArrivalDisposition,
+    ) -> Result<(), ExecutionError> {
+        self.arrivals.push((
+            event_key,
+            PacketArrivalObservation {
+                payload: packet.id,
+                time_ns: event_key.time_ns,
+                disposition,
+            },
+        ));
+        if disposition == ArrivalDisposition::Admitted {
+            self.observe_scheduler_enqueue(node, event_key, packet)?;
         }
         Ok(())
     }
@@ -6440,8 +7396,8 @@ fn scheduler_select_position(
         return Ok(None);
     }
     match scheduler {
-        // The three head-serving disciplines. `queue_serves_head` classifies exactly this set, and
-        // the two must be changed together.
+        // The three head-serving disciplines. `scheduler_serves_head` classifies exactly this
+        // set, and the two must be changed together.
         SchedulerKind::Fifo
         | SchedulerKind::StaticPriority { .. }
         | SchedulerKind::WeightedFairQueue(_) => Ok(Some((0, 0))),
@@ -6534,7 +7490,7 @@ fn derive_switch_queue_bytes(
     switch_states: &[SwitchState],
     local_node: Option<NodeDescriptor>,
     packets: &BTreeMap<PayloadId, ResidentPacket>,
-) -> Result<Vec<Vec<u64>>, ExecutionError> {
+) -> Result<DerivedSwitchQueues, ExecutionError> {
     let mut node_ids = vec![None; switch_states.len()];
     if let Some(node) = local_node {
         if node.kind == NodeKind::Switch {
@@ -6549,7 +7505,8 @@ fn derive_switch_queue_bytes(
             }
         }
     }
-    switch_states
+    let mut paused_fifo_queues = Vec::new();
+    let bytes = switch_states
         .iter()
         .enumerate()
         .map(|(state_slot, state)| {
@@ -6558,7 +7515,13 @@ fn derive_switch_queue_bytes(
             state
                 .queues
                 .iter()
-                .map(|queue| {
+                .enumerate()
+                .map(|(queue_slot, queue)| {
+                    if matches!(queue.scheduler, SchedulerKind::Fifo)
+                        && queue.pfc.as_ref().is_some_and(pfc_any_paused)
+                    {
+                        paused_fifo_queues.push((state_slot, queue_slot));
+                    }
                     queue.queue.iter().try_fold(0_u64, |total, payload| {
                         let packet = packets
                             .get(payload)
@@ -6570,12 +7533,43 @@ fn derive_switch_queue_bytes(
                 })
                 .collect()
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+    Ok(DerivedSwitchQueues {
+        bytes,
+        paused_fifo_queues,
+    })
 }
 
-fn drop_mark_decision(
-    policy: &mut crate::DropMarkPolicy,
-    taildrop_capacity_packets: u64,
+/// The ECN ramp's decision for one arrival (`crate::ecn_ramp`); the draw, keyed by the image
+/// seed, the switch LP, the queue slot and the arrival's payload, is computed only inside the ramp
+/// for ECN-capable data.
+fn ecn_ramp_action(
+    policy: &crate::EcnRampPolicy,
+    queued_bytes: u64,
+    packet: PacketDescriptor,
+    seed: u64,
+    node: NodeId,
+    queue_id: u64,
+    payload: PayloadId,
+) -> QueueAdmissionAction {
+    use crate::ecn_ramp::{EcnRampAction, ecn_draw, ecn_queue_key, ecn_ramp_decision};
+    match ecn_ramp_decision(
+        policy,
+        queued_bytes,
+        packet.size_bytes,
+        packet.kind.is_data(),
+        || ecn_draw(ecn_queue_key(seed, node.0, queue_id), payload.0),
+    ) {
+        EcnRampAction::Enqueue => QueueAdmissionAction::Enqueue,
+        EcnRampAction::Mark => QueueAdmissionAction::Mark,
+        EcnRampAction::Drop => QueueAdmissionAction::Drop,
+    }
+}
+
+/// Tail drop at the queue's packet capacity (zero is unbounded); an arrival whose byte total is
+/// unrepresentable also drops.
+fn taildrop_action(
+    capacity_packets: u64,
     queued_packets: u64,
     queued_bytes: u64,
     packet_size_bytes: u64,
@@ -6584,105 +7578,15 @@ fn drop_mark_decision(
     let post_packets = queued_packets
         .checked_add(1)
         .ok_or(ExecutionError::CounterOverflow(node))?;
-    let post_bytes = queued_bytes.checked_add(packet_size_bytes);
-    match policy {
-        crate::DropMarkPolicy::TailDrop => Ok(
-            if post_bytes.is_none()
-                || taildrop_capacity_packets != 0 && post_packets > taildrop_capacity_packets
-            {
-                QueueAdmissionAction::Drop
-            } else {
-                QueueAdmissionAction::Enqueue
-            },
-        ),
-        crate::DropMarkPolicy::EcnThreshold(config) => {
-            let Some(post_bytes) = post_bytes else {
-                return Ok(QueueAdmissionAction::Drop);
-            };
-            let post_depth = match config.unit {
-                crate::QueueDepthUnit::Packets => post_packets,
-                crate::QueueDepthUnit::Bytes => post_bytes,
-            };
-            Ok(if config.capacity != 0 && post_depth > config.capacity {
-                QueueAdmissionAction::Drop
-            } else if post_depth >= config.threshold {
-                QueueAdmissionAction::Mark
-            } else {
-                QueueAdmissionAction::Enqueue
-            })
-        }
-        crate::DropMarkPolicy::Red(state) => {
-            // Let S=2^32, A' = floor((511*A + sample*S)/512), and
-            // p(A') = p_num*(A'-min*S)/(p_den*(max-min)*S). In the open threshold
-            // interval, increment c and signal exactly when c*p(A') >= 1, then reset c.
-            // At/below min resets without signaling; at/above max signals and resets.
-            const RED_AVERAGE_SCALE: u128 = 1_u128 << 32;
-            let sample_depth = match state.unit {
-                crate::QueueDepthUnit::Packets => queued_packets,
-                crate::QueueDepthUnit::Bytes => queued_bytes,
-            };
-            let post_depth = match state.unit {
-                crate::QueueDepthUnit::Packets => Some(post_packets),
-                crate::QueueDepthUnit::Bytes => post_bytes,
-            };
-            let weighted_previous = state
-                .average_scaled
-                .checked_mul(511)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            let weighted_sample = u128::from(sample_depth)
-                .checked_mul(RED_AVERAGE_SCALE)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            state.average_scaled = weighted_previous
-                .checked_add(weighted_sample)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?
-                / 512;
-
-            if post_bytes.is_none()
-                || post_depth.is_none_or(|depth| state.capacity != 0 && depth > state.capacity)
-            {
-                return Ok(QueueAdmissionAction::Drop);
-            }
-            let min_scaled = u128::from(state.min_threshold)
-                .checked_mul(RED_AVERAGE_SCALE)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            let max_scaled = u128::from(state.max_threshold)
-                .checked_mul(RED_AVERAGE_SCALE)
-                .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-            let signal = if state.average_scaled <= min_scaled {
-                state.counter = 0;
-                false
-            } else if state.average_scaled >= max_scaled {
-                state.counter = 0;
-                true
-            } else {
-                state.counter = state
-                    .counter
-                    .checked_add(1)
-                    .ok_or(ExecutionError::InvalidSchedulerState(node))?;
-                let left = BigUint::from(state.counter)
-                    * BigUint::from(state.max_probability_numerator)
-                    * BigUint::from(state.average_scaled - min_scaled);
-                let right = BigUint::from(state.max_probability_denominator)
-                    * BigUint::from(state.max_threshold - state.min_threshold)
-                    * BigUint::from(RED_AVERAGE_SCALE);
-                if left >= right {
-                    state.counter = 0;
-                    true
-                } else {
-                    false
-                }
-            };
-            Ok(if signal {
-                if state.mark_ecn {
-                    QueueAdmissionAction::Mark
-                } else {
-                    QueueAdmissionAction::Drop
-                }
-            } else {
-                QueueAdmissionAction::Enqueue
-            })
-        }
-    }
+    Ok(
+        if queued_bytes.checked_add(packet_size_bytes).is_none()
+            || capacity_packets != 0 && post_packets > capacity_packets
+        {
+            QueueAdmissionAction::Drop
+        } else {
+            QueueAdmissionAction::Enqueue
+        },
+    )
 }
 
 fn tcp_receive_range(receiver: &mut crate::TcpReceiverState, start: u64, end: u64) {
@@ -6750,6 +7654,49 @@ fn add_summary(total: &mut u128, value: u64, node: NodeId) -> Result<(), Executi
     Ok(())
 }
 
+/// P16 ruling D2: a transition of a DCQCN flow or queue pair at exclusive bound `bound` first
+/// applies its controller's due rate-increase and rate-decrease instants. Returns the controller
+/// before and what was applied, or `None` when nothing was due (the common case: one comparison)
+/// or the flow is complete and its controller frozen (ruling D11).
+#[inline(always)]
+fn dcqcn_materialize(
+    controller: &mut crate::DcqcnController,
+    frozen: bool,
+    bound: u64,
+) -> Option<(crate::DcqcnController, crate::DcqcnAdvance)> {
+    if frozen || controller.due_ns() >= bound {
+        return None;
+    }
+    let before = *controller;
+    Some((before, controller.materialize(bound)))
+}
+
+/// A DCQCN controller transition record (schema `days-gpu/plans/briefs/p16/dcqcn-schema.md`).
+#[allow(clippy::too_many_arguments)]
+const fn dcqcn_record(
+    key: EventKey,
+    node: NodeId,
+    flow: FlowId,
+    kind: crate::DcqcnTransitionKind,
+    bound_ns: u64,
+    advance: crate::DcqcnAdvance,
+    frozen: bool,
+    before: crate::DcqcnController,
+    after: crate::DcqcnController,
+) -> crate::DcqcnTransitionRecord {
+    crate::DcqcnTransitionRecord {
+        key,
+        node,
+        flow,
+        kind,
+        bound_ns,
+        advance,
+        frozen,
+        before,
+        after,
+    }
+}
+
 /// Routes an arriving feedback packet through the source-generator contract hook.
 ///
 /// Constant generators only record the arrival. TCP ACK processing calls this hook before its
@@ -6777,6 +7724,9 @@ fn restart_roce_pacer(
     now_ns: u64,
     stop_time_ns: u64,
 ) -> Result<Option<u64>, ExecutionError> {
+    // Every restart attempt ends a window park (ruling D7): it runs only for an ACK or NACK that
+    // moves `snd_una` and for a timeout, whatever it then finds.
+    roce.window_parked = false;
     if roce.pacer_armed
         || roce.next_psn >= roce.pacer.total_bytes
         || roce.snd_una >= roce.pacer.total_bytes
@@ -6860,11 +7810,11 @@ fn roce_sender_record(
     node: NodeId,
     flow: FlowId,
     kind: crate::RoceSenderKind,
-    class_paused: bool,
+    park: Option<crate::roce::TickPark>,
     data_class: u8,
     roce: &crate::RoceGenerator,
     rate_bps: Option<u64>,
-    input_acknowledgment: Option<u64>,
+    input: Option<crate::RoceAckHeader>,
     emitted: Option<crate::RoceEmission>,
     before: crate::RoceSenderView,
     after: crate::RoceSenderView,
@@ -6875,15 +7825,21 @@ fn roce_sender_record(
             node,
             flow,
             kind,
-            class_paused,
+            class_paused: park == Some(crate::roce::TickPark::ClassPaused),
+            window_blocked: park == Some(crate::roce::TickPark::WindowBlocked),
             data_class,
             mtu_bytes: roce.pacer.mtu_bytes,
             total_bytes: roce.pacer.total_bytes,
             pacing_interval_ns: roce.pacer.pacing_interval_ns,
             first_pacing_time_ns: roce.pacer.first_pacing_time_ns,
             rto_ns: roce.rto_ns,
+            window_bytes: roce.window_bytes,
+            variable_window: roce.variable_window,
+            maximum_rate_bps: roce.controller.config.maximum_rate_bps,
+            initial_rate_bps: roce.controller.config.initial_rate_bps,
             rate_bps,
-            input_acknowledgment,
+            input_acknowledgment: input.map(|header| header.acknowledgment),
+            input_ce_echo: input.map(|header| header.ce_echo),
             emitted,
             before,
             after,
@@ -6943,11 +7899,23 @@ mod tests {
         );
     }
 
+    /// See `switch_pfc_remote_arrival`: the PFC frame handler stays out of `dispatch`.
+    #[test]
+    fn switch_pfc_remote_arrival_stays_out_of_line() {
+        let source = include_str!("scalar.rs");
+        assert!(
+            source.contains("    #[inline(never)]\n    fn switch_pfc_remote_arrival("),
+            "`switch_pfc_remote_arrival` must be #[inline(never)]"
+        );
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn transition_state_keeps_main_size() {
         const MAIN_TRANSITION_STATE_BYTES: usize = 512;
-        let bound = MAIN_TRANSITION_STATE_BYTES + std::mem::size_of::<StageScanProbe>();
+        let bound = MAIN_TRANSITION_STATE_BYTES
+            + std::mem::size_of::<StageScanProbe>()
+            + std::mem::size_of::<super::PfcServiceProbe>();
         let size = std::mem::size_of::<TransitionState<'static>>();
         assert!(
             size <= bound,

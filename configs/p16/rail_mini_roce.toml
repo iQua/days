@@ -1,0 +1,82 @@
+# P16 H2 fixture: a miniature Spectrum-X rail fabric (tests/p16_rail_lowering.rs).
+#
+# 8 GPUs, 2 per server (servers {0,1}, {2,3}, ...), 2 NICs per ASW: a segment is 4 GPUs, so 2
+# segments x 2 rails = 4 ASWs of 2 GPUs each, and 2 PSWs. NIC links 100 Gb/s, ASW-PSW uplinks
+# 400 Gb/s, 500 ns; NVLink 2,400 Gb/s, 25 ns (delay-only). One RoCE ring all-reduce over all 8
+# GPUs in GPU order, lossless class 3 with switch and host-link PFC, routed by SimAI's ECMP.
+#
+# The switch parameters follow SimAI.conf as the SimAI-identical arms set them (P16 H2, ruling
+# H2-7; ecnbytes, ecnramp): SimAI.conf's ECN ramps by egress rate in bytes (100G 400,000 to
+# 1,600,000 B, 400G 800,000 to 3,200,000 B, Pmax 0.2) over a 32 MiB byte capacity; PFC XOFF per tier at an empty shared pool, shift 3,
+# (32 MiB - sum(3 rate delay / 8) - ports x 4096) >> 3 (ASW: 2 x 100G + 2 x 400G ports, 4,168,818;
+# PSW: 4 x 400G ports, 4,154,756), XON 3,072 lower; headroom by controlled-link rate (400G
+# 75,000 B; 100G 30,574 B, the Days minimum above SimAI's 18,750).
+seed = 7
+duration = 0.01
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 8
+gpus_per_server = 2
+nics_per_asw = 2
+psws = 2
+gpu_type = "H100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[routing]
+policy = "SimAiEcmp"
+
+[switch]
+capacity = 3729
+discipline = "FIFO"
+drop = "TailDrop"
+ecn_capacity_bytes = 33_554_432
+ecn_by_rate = [
+    { rate_bps = 100000000000, kmin_bytes = 400_000, kmax_bytes = 1_600_000, pmax = 0.2 },
+    { rate_bps = 400000000000, kmin_bytes = 800_000, kmax_bytes = 3_200_000, pmax = 0.2 },
+]
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+host_links = true
+by_tier = [
+    { tier = "asw", xoff = [0, 0, 0, 4168818, 0, 0, 0, 0], xon = [0, 0, 0, 4165746, 0, 0, 0, 0] },
+    { tier = "psw", xoff = [0, 0, 0, 4154756, 0, 0, 0, 0], xon = [0, 0, 0, 4151684, 0, 0, 0, 0] },
+]
+headroom_by_rate = [
+    { rate_bps = 100000000000, bytes = 30574 },
+    { rate_bps = 400000000000, bytes = 75000 },
+]
+
+[[collective]]
+collective_type = "RingAllReduce"
+flow_type = "RoCE"
+priority = 3
+flow_count = 8
+sources = [0, 1, 2, 3, 4, 5, 6, 7]
+sinks = [1, 2, 3, 4, 5, 6, 7, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 640000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 9000, high = 9000 }
+
+[collective.traffic.dcqcn]
+max_rate_gbps = 100.0
+pacing_interval_ns = 720
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 0
+feedback_priority = 3
+ack_size_bytes = 60
+window_bytes = 72500
+variable_window = true

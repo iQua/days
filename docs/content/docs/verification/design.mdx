@@ -31,7 +31,7 @@ the complete canonical `EventKey`:
 (time_ns, event_phase, event_origin_node, event_origin_sequence)
 ```
 
-The TCP, Static Priority, AQM, rate, PFC, DRR, WRR, and collective checkers canonicalize by this key
+The TCP, Static Priority, AQM, rate, PFC, DRR, WRR, WFQ, and collective checkers canonicalize by this key
 (the collective schema adds an activation ordinal where one executor event produces multiple
 rows). The Days AGO DCQCN checker, `p10c_dcqcn_check`, instead requires the input to already be in strictly increasing
 `EventKey` order. Duplicate keys are rejected in both cases.
@@ -63,16 +63,27 @@ reference transition.
 | `pfc_check` | legacy PFC |
 | `cubic_check` | legacy CUBIC micro-events |
 | `drr_check` | legacy DRR |
-| `wfq_check` | legacy WFQ |
+| `wfq_check` | legacy WFQ (Days AGO WFQ: `p10c_mechanisms_check wfq`) |
 | `aqm_check` | legacy AQM |
 | `aqm_dcqcn_check` | legacy cross-layer AQM to DCQCN causality |
 | `tcp_check` | Days AGO TCP (Reno and CUBIC) |
 | `sp_check` | Days AGO Static Priority |
-| `p10c_mechanisms_check` | Days AGO rate, PFC, DRR, or WRR transitions |
+| `p10c_mechanisms_check` | Days AGO rate, PFC, DRR, WRR, or WFQ transitions |
 | `p10c_aqm_check` | Days AGO AQM |
 | `p10c_dcqcn_check` | Days AGO DCQCN |
 | `p10c_collective_check` | Days AGO collective progress |
 | `p10c_roce_check` | Days AGO RoCE queue pairs (receiver, sender joined with DCQCN, cross-role) |
+| `p10c_collective_diff` | test only: the collective checker against its retained list-scan reference |
+| `p10c_aqm_diff` | test only: the Days AGO AQM checker against its retained list-scan reference |
+
+## Checker cost
+
+A Days AGO trace can run to tens of thousands of rows, so the P10c checkers keep their replay
+state in hash maps keyed by flow, queue or stage and never search earlier rows per row: the RoCE,
+DCQCN, collective and AQM checkers are linear in the row count, except the collective checker's
+TCP replay, which keeps a per-flow frontier in an ordered map and is n log n. Where P16 replaced a scan, the old functions
+stayed in a test-only module and a differential harness runs both on every fixture and on
+generated mutants in CI; see [Continuous integration](/docs/verification/leanguard#continuous-integration).
 
 ## Executor proof surface
 
@@ -88,7 +99,7 @@ executor model, while a certificate checker validates one concrete observed tran
 
 1. Define a stable row schema and its canonical key.
 2. State whether the checker sorts rows or requires canonical input order.
-3. Implement parsing, domain checks, continuity, and the executable transition rule.
+3. Implement parsing, domain checks, continuity, and the executable transition rule, with replay state keyed by entity rather than searched per row.
 4. Project the required record from the matching Rust transition point.
 5. Add positive, mutation-rejection, duplicate-key, and numeric-boundary fixtures.
 6. Register the executable in `lean/lakefile.lean`.

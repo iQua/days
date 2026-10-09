@@ -31,20 +31,30 @@ fn cuda_source() -> String {
     format!("{CUDA}\n{}", cuda_round_body())
 }
 
-/// The functions P14 Lane B and P15 lane R4 (queue pairs, host-link PFC) added to both kernels.
-const LANE_B_FUNCTIONS: [&str; 39] = [
-    "dcqcn_apply_increase",
-    "dcqcn_average_with_target",
-    "dcqcn_checked_weighted_div",
+/// The functions P14 Lane B, P15 lane R4 (queue pairs, host-link PFC), P16 D1 (the Mellanox-form
+/// DCQCN controller), P16 G1 (collective and compute stages), P16 H2 (the stage notify) and P16 H4
+/// (the parked bitsets) added to both kernels.
+const LANE_B_FUNCTIONS: [&str; 50] = [
+    "compute_timer",
+    "dcqcn_alpha_through",
     "dcqcn_cnp_arrival",
-    "dcqcn_control_timer",
     "dcqcn_data_arrival",
-    "dcqcn_on_bytes_emitted",
-    "dcqcn_on_cnp",
-    "dcqcn_on_control_timer",
+    "dcqcn_decrease_check",
+    "dcqcn_decrease_due",
+    "dcqcn_due",
+    "dcqcn_first_decrease_at_or_after",
+    "dcqcn_increase_due",
+    "dcqcn_increase_fire",
+    "dcqcn_materialize",
+    "dcqcn_materialize_if_due",
+    "dcqcn_mul_shr63",
+    "dcqcn_on_feedback",
     "dcqcn_pacing_timer",
+    "dcqcn_settle",
     "emit_pfc_frame",
     "flow_route_mechanisms",
+    // P16 H2: a stage notify's sender timer.
+    "notify_timer",
     "packet_egress_mechanisms",
     "packet_incoming_link",
     "packet_remote_target_mechanisms",
@@ -53,12 +63,12 @@ const LANE_B_FUNCTIONS: [&str; 39] = [
     "pfc_first_eligible",
     "pfc_flow_data_class",
     "pfc_frame_arrival",
+    "pfc_mark_parked",
     "pfc_packet_priority",
+    "pfc_parked_bitset",
     "pfc_paused_mask",
     "pfc_priority_paused",
     "pfc_queue_row",
-    "roce_cnp_arrival",
-    "roce_control_tick",
     "roce_data_arrival",
     "roce_emit_timers",
     "roce_feedback_arrival",
@@ -71,11 +81,20 @@ const LANE_B_FUNCTIONS: [&str; 39] = [
     "roce_settle",
     "roce_timeout",
     "roce_token_packet",
+    "stage_after_event",
+    "stage_prerequisites",
+    "stage_release",
+    "stage_unreleased",
     "wfq_remove_at",
 ];
 
-/// Plane reads that exist only for Lane B: the PFC region offset and the DCQCN receiver marker.
-const LANE_B_READS: [&str; 2] = ["params[P_PFC_OFFSET]", "DCQCN_RECEIVER_NO_CNP"];
+/// Plane reads that exist only for Lane B: the PFC region offset, the DCQCN receiver marker and the
+/// stage region offset (P16 G1).
+const LANE_B_READS: [&str; 3] = [
+    "params[P_PFC_OFFSET]",
+    "DCQCN_RECEIVER_NO_CNP",
+    "params[P_STAGE_OFFSET]",
+];
 
 fn kernels() -> [(&'static str, String, &'static str); 2] {
     [

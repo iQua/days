@@ -494,8 +494,11 @@ const PARAM_LEDGER_META_OFFSET: usize = 29;
 /// Params word holding the PFC region offset in `scheduler_state`, or `NONE` without PFC state.
 const PARAM_PFC_OFFSET: usize = 32;
 /// Params word holding the RoCE receiver region offset in `tcp_state`, or `NONE` without queue-pair
-/// receivers (P15). The test-hook high-water words follow it.
+/// receivers (P15).
 const PARAM_ROCE_OFFSET: usize = 33;
+/// Params word holding the stage region offset in `tcp_state`, or `NONE` without stages (P16 G1).
+/// The test-hook high-water words follow it.
+const PARAM_STAGE_OFFSET: usize = 34;
 const PARAM_ROUND_THREADS: usize = 30;
 
 const CONTROL_ERROR: usize = 0;
@@ -598,6 +601,15 @@ pub enum MetalError {
         code: u64,
         node: Option<NodeId>,
     },
+    /// P16 D2: the plan needs more device memory than the run may use, so nothing was allocated.
+    /// The limit is the device's recommended working set, or [`MetalConfig::max_device_bytes`]
+    /// when that is lower. Above the working set Metal either fails a command buffer out of memory
+    /// or, past physical memory, completes command buffers whose writes do not land, so a run
+    /// would spin until its round bound ran out.
+    DeviceMemoryExceeded {
+        planned_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 impl fmt::Display for MetalError {
@@ -670,6 +682,15 @@ impl fmt::Display for MetalError {
                     "; the image requires the mechanisms round kernel"
                 )
             }
+            Self::DeviceMemoryExceeded {
+                planned_bytes,
+                limit_bytes,
+            } => write!(
+                formatter,
+                "Metal plan needs {planned_bytes} bytes of device memory, over its limit of \
+                 {limit_bytes} bytes; cut the run earlier, use Summary observation, or cap the \
+                 arenas"
+            ),
             Self::DeviceExecution { code, node } => {
                 write!(
                     formatter,
@@ -749,6 +770,10 @@ pub struct MetalConfig {
     pub rounds_per_command_buffer: usize,
     /// Optional hard cap overriding the conservative encoded round bound.
     pub max_rounds: Option<usize>,
+    /// Optional limit on the bytes one plan may place on the device, below the device's own
+    /// recommended working set (which always applies). A plan over the limit is refused with
+    /// [`MetalError::DeviceMemoryExceeded`] before any buffer is allocated.
+    pub max_device_bytes: Option<usize>,
     /// Test-only: dispatch this round kernel build instead of the one the image selects. Forcing
     /// [`RoundKernel::Plain`] onto an image with DCQCN or PFC state must fail closed.
     #[doc(hidden)]
@@ -772,6 +797,7 @@ impl Default for MetalConfig {
             round_threads_per_threadgroup: DEFAULT_ROUND_THREADS_PER_THREADGROUP,
             rounds_per_command_buffer: DEFAULT_ROUNDS_PER_COMMAND_BUFFER,
             max_rounds: None,
+            max_device_bytes: None,
             #[cfg(feature = "metal-test-hooks")]
             round_kernel_override: None,
         }
@@ -1257,7 +1283,10 @@ impl MetalExecutor {
         warm_start: &CapacityWarmStart,
     ) -> Result<MetalRun, MetalError> {
         #[cfg(feature = "metal-test-hooks")]
-        reset_dominant_arena_high_water();
+        {
+            reset_dominant_arena_high_water();
+            crate::device_pfc::take_resume_scan_counts_for_testing();
+        }
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         validate_config(config)?;
@@ -1290,6 +1319,18 @@ impl MetalExecutor {
                 // any plan holding state a mechanism transition would act on.
                 if round_kernel == RoundKernel::Plain {
                     plan.refuse_plain_round_kernel()?;
+                }
+                // P16 D2: refuse, before allocating, a plan the device cannot hold.
+                let limit_bytes = self
+                    .direct
+                    .device_memory_limit(attempt_config.max_device_bytes);
+                let planned_bytes = plan.device_bytes();
+                if planned_bytes > limit_bytes {
+                    return Err(MetalError::DeviceMemoryExceeded {
+                        planned_bytes,
+                        limit_bytes,
+                    }
+                    .into());
                 }
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
                 let _execution_guard = metal_device_execution_guard();
@@ -1539,36 +1580,7 @@ pub fn size_metal_plan_for_testing(
     validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
-    let words = [
-        plan.control.len(),
-        plan.params.len(),
-        plan.node_state.len(),
-        plan.generators.len(),
-        plan.flows.len(),
-        plan.routes.len(),
-        plan.links.len(),
-        plan.fel_meta.len(),
-        plan.fel_records.len(),
-        plan.queue_meta.len(),
-        plan.queue_records.len(),
-        plan.in_service.len(),
-        plan.outbox.len(),
-        plan.worklist.len(),
-        plan.summary.len(),
-        plan.observed.len(),
-        plan.departures.len(),
-        plan.arrivals.len(),
-        plan.lp_state.len(),
-        plan.remote_meta.len(),
-        plan.remote_staging.len(),
-        plan.observation_meta.len(),
-        plan.inbound_meta.len(),
-        plan.inbound_producers.len(),
-        plan.merge_cursors.len(),
-        plan.stream_state.len(),
-        plan.stream_records.len(),
-        plan.scheduler_state.len(),
-    ];
+    let words = plan.plane_words();
     crate::device_sizing::exact_plan_report(
         words,
         plan.tcp_state.len(),
@@ -1616,6 +1628,51 @@ fn encoding_limits(rounds_per_command_buffer: usize) -> (usize, usize) {
 }
 
 impl MetalPlan {
+    /// Words of the 28 established planes, in plane order.
+    fn plane_words(&self) -> [usize; 28] {
+        [
+            self.control.len(),
+            self.params.len(),
+            self.node_state.len(),
+            self.generators.len(),
+            self.flows.len(),
+            self.routes.len(),
+            self.links.len(),
+            self.fel_meta.len(),
+            self.fel_records.len(),
+            self.queue_meta.len(),
+            self.queue_records.len(),
+            self.in_service.len(),
+            self.outbox.len(),
+            self.worklist.len(),
+            self.summary.len(),
+            self.observed.len(),
+            self.departures.len(),
+            self.arrivals.len(),
+            self.lp_state.len(),
+            self.remote_meta.len(),
+            self.remote_staging.len(),
+            self.observation_meta.len(),
+            self.inbound_meta.len(),
+            self.inbound_producers.len(),
+            self.merge_cursors.len(),
+            self.stream_state.len(),
+            self.stream_records.len(),
+            self.scheduler_state.len(),
+        ]
+    }
+
+    /// Bytes the plan places on the device: every plane and `tcp_state`, as
+    /// `size_metal_plan_for_testing` reports them (P16 D2).
+    fn device_bytes(&self) -> usize {
+        self.plane_words()
+            .into_iter()
+            .chain([self.tcp_state.len()])
+            .fold(0_usize, |total, words| {
+                total.saturating_add(words.saturating_mul(std::mem::size_of::<u64>()))
+            })
+    }
+
     /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
     /// state a `MECHANISMS`-guarded kernel branch would act on
     /// ([`crate::device_mechanism::plain_round_kernel_refusal`]).
@@ -1623,6 +1680,7 @@ impl MetalPlan {
         let plan = crate::device_mechanism::UploadedPlan {
             pfc_offset: self.params[PARAM_PFC_OFFSET],
             roce_offset: self.params[PARAM_ROCE_OFFSET],
+            stage_offset: self.params[PARAM_STAGE_OFFSET],
             receiver_offset: self.params[PARAM_RECEIVER_OFFSET],
             // `P_NODE_COUNT` and `P_FLOW_COUNT`.
             node_count: self.params[0] as usize,
@@ -1728,6 +1786,8 @@ struct TcpStateLayout {
     ledger_meta_offset: usize,
     /// The RoCE receiver region, a tail of `tcp_state`; `None` without queue-pair receivers.
     roce_offset: Option<usize>,
+    /// The stage region (P16 G1), just before the RoCE region; `None` without stages.
+    stage_offset: Option<usize>,
 }
 
 struct PreparedTcpState {
@@ -1824,6 +1884,9 @@ impl MetalPlan {
             TcpMinimumPacketSize::One,
             capacity_mode,
         );
+        // P16 G2: which flows share a concurrency bound (ruling G7: a host's unfinished stages),
+        // decided once. `None`, with nothing allocated, without stages or windowed queue pairs.
+        let concurrency = crate::stage_sizing::SizingConcurrency::for_image(image);
         let initial_by_payload = image
             .initial_packets
             .iter()
@@ -1843,6 +1906,8 @@ impl MetalPlan {
         let mut minimum_queue_packet_bytes = vec![u64::MAX; node_count];
         let mut legacy_fel_caps = vec![8_usize; node_count];
         let mut initial_fel_counts = vec![0_usize; node_count];
+        let mut queue_charges = crate::stage_sizing::ConcurrentCharges::default();
+        let mut fel_charges = crate::stage_sizing::ConcurrentCharges::default();
         for event in &image.initial_events {
             let target = event.target.0 as usize;
             legacy_fel_caps[target] = legacy_fel_caps[target].saturating_add(1);
@@ -1853,18 +1918,47 @@ impl MetalPlan {
             let feedback_count = flow_feedback_counts[flow_index];
             let data_count = packet_count.saturating_sub(feedback_count);
             let source_slot = flow.source.0 as usize;
-            queue_caps[source_slot] = queue_caps[source_slot].saturating_add(
-                capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+            let group = concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.group(flow_index));
+            // Ruling G8: a windowed queue pair holds at most a window of its data in its source
+            // host's queue and a window of its feedback in its receiver's, however long a pause.
+            let window = concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.window_packets(flow_index));
+            crate::stage_sizing::charge(
+                &mut queue_caps,
+                &mut queue_charges,
+                concurrency
+                    .as_ref()
+                    .and_then(|concurrency| concurrency.host_queue_group(flow_index)),
+                source_slot,
+                crate::stage_sizing::CLASS_DATA,
+                window.map_or_else(
+                    || capacity_context.source_queue_packet_bound(image, flow_index, data_count),
+                    |window| data_count.min(window),
+                ),
             );
+            if let Some(window) = window {
+                crate::stage_sizing::charge(
+                    &mut queue_caps,
+                    &mut queue_charges,
+                    group,
+                    flow.target.0 as usize,
+                    crate::stage_sizing::CLASS_FEEDBACK,
+                    feedback_count.min(window),
+                );
+            }
             legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(4);
             if capacity_context.dcqcn_generator(image, flow_index) {
-                // A DCQCN source owns two live timer chains, pacing and control.
-                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
+                // A DCQCN source owns one live timer chain, pacing (the Mellanox-form controller
+                // has no timer event, P16).
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(1);
             }
             if capacity_context.roce_generator(image, flow_index) {
-                // A queue-pair source owns three live timers: pacing, control and the
-                // retransmission timeout (one live record under the live-state contract).
-                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(3);
+                // A queue-pair source owns two live timers: pacing and the retransmission
+                // timeout (one live record under the live-state contract).
+                legacy_fel_caps[source_slot] = legacy_fel_caps[source_slot].saturating_add(2);
             }
             if capacity_context.tcp_generator(image, flow_index).is_some() {
                 // TCP timers remain fallback-heap events. Under the live-state contract
@@ -1880,6 +1974,8 @@ impl MetalPlan {
 
             let mut route_capacities = FlowRouteCapacities {
                 lookahead: minimum_lookahead_ns,
+                group,
+                fel_charges: &mut fel_charges,
                 fel: &mut legacy_fel_caps,
                 queue: &mut queue_caps,
                 aggregate_queue_packets: &mut aggregate_queue_packets,
@@ -1901,6 +1997,19 @@ impl MetalPlan {
                 PacketKind::Feedback,
                 &mut route_capacities,
             );
+        }
+        if let Some(concurrency) = &concurrency {
+            queue_charges.apply(concurrency, &mut queue_caps);
+            fel_charges.apply(concurrency, &mut legacy_fel_caps);
+            concurrency.add_compute_timers(&mut legacy_fel_caps);
+        }
+        // P16 H2: an unfired stage notify holds a timer at its source and, without streams, its
+        // arrival in its target's heap; with streams the arrival rides its lane's stream.
+        let notify = crate::device_sizing::notify_capacities(image);
+        if let Some(notify) = &notify {
+            for &(node, count) in notify.sources.iter().chain(&notify.targets) {
+                legacy_fel_caps[node] = legacy_fel_caps[node].saturating_add(count);
+            }
         }
 
         for node in &image.nodes {
@@ -1932,7 +2041,7 @@ impl MetalPlan {
                                         .unwrap_or(usize::MAX),
                                 );
                             }
-                            crate::DropMarkPolicy::EcnThreshold(policy) => {
+                            crate::DropMarkPolicy::EcnRamp(policy) => {
                                 queue_caps[slot] = crate::device_sizing::ecn_queue_packet_bound(
                                     aggregate_queue_packets[slot],
                                     policy,
@@ -1941,7 +2050,7 @@ impl MetalPlan {
                                 .max(initial)
                                 .max(1);
                             }
-                            crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::Red(_) => {}
+                            crate::DropMarkPolicy::TailDrop => {}
                         }
                     }
                 }
@@ -2003,6 +2112,14 @@ impl MetalPlan {
                     );
                     let source = descriptor.source.0 as usize;
                     capacities[source] = capacities[source].saturating_add(attempts);
+                }
+            }
+            if let Some(concurrency) = &concurrency {
+                concurrency.add_compute_timers(&mut capacities);
+            }
+            if let Some(notify) = &notify {
+                for &(node, count) in &notify.sources {
+                    capacities[node] = capacities[node].saturating_add(count);
                 }
             }
             capacities
@@ -2230,13 +2347,24 @@ impl MetalPlan {
             links[offset + 3] = link.propagation_ns;
         }
 
-        let remote_bound = derived_remote_capacity(
+        let mut remote_capacities = derived_remote_capacities(
             image,
             &capacity_context,
+            concurrency.as_ref(),
             &flow_packet_counts,
             &flow_feedback_counts,
             minimum_lookahead_ns,
         );
+        if let Some(notify) = &notify {
+            for &(node, count) in &notify.sources {
+                remote_capacities[node] = remote_capacities[node].saturating_add(count);
+            }
+        }
+        // The derived outbox capacity is the whole-plan sum of the per-producer capacities (their
+        // seed of 2 per node included), before any cap or floor.
+        let remote_bound = remote_capacities
+            .iter()
+            .fold(0_usize, |total, capacity| total.saturating_add(*capacity));
         let outbox_capacity = config.max_outbox_events.map_or_else(
             || {
                 crate::device_capacity::bound_derived_capacity(
@@ -2257,13 +2385,6 @@ impl MetalPlan {
         } else {
             outbox_capacity
         };
-        let mut remote_capacities = derived_remote_capacities(
-            image,
-            &capacity_context,
-            &flow_packet_counts,
-            &flow_feedback_counts,
-            minimum_lookahead_ns,
-        );
         if let Some(capacity) = config.max_outbox_events {
             remote_capacities
                 .fill(capacity.max(config.capacity_floors.remote_staging_events_per_lp));
@@ -2292,6 +2413,7 @@ impl MetalPlan {
             &fel_records,
             remote_staging_slots,
             channel_capacity_floors,
+            notify.as_ref(),
         )?;
         let event_bound = derived_transition_bound(image, &flow_packet_counts)?;
         let observation_capacity = if observation_mode == ObservationMode::Full {
@@ -2303,7 +2425,17 @@ impl MetalPlan {
             0
         };
         let mut observation_capacities = if observation_mode == ObservationMode::Full {
-            derived_observation_capacities(image, &flow_packet_counts, &flow_feedback_counts)
+            let (counts, feedback_counts) = crate::planner_capacity::observation_packet_counts(
+                image,
+                &flow_packet_counts,
+                &flow_feedback_counts,
+                exclusive_horizon_ns,
+            );
+            crate::planner_capacity::derived_observation_capacities(
+                image,
+                &counts,
+                &feedback_counts,
+            )
         } else {
             vec![0; node_count]
         };
@@ -2324,6 +2456,9 @@ impl MetalPlan {
             assign_observation_offsets(&mut observation_meta, &observation_capacities)?;
         let mut tcp_state = prepare_tcp_state(
             image,
+            concurrency
+                .as_ref()
+                .is_some_and(|concurrency| concurrency.has_stages()),
             &capacity_context,
             &flow_packet_counts,
             &flow_feedback_counts,
@@ -2338,7 +2473,7 @@ impl MetalPlan {
             tcp_state.layout.ledger_meta_offset,
             &mut tcp_state.words,
         );
-        let (inbound_meta, inbound_producers) = remote_inbound_producers(image);
+        let (inbound_meta, inbound_producers) = remote_inbound_producers(image, notify.as_ref());
         let round_capacity = config
             .max_rounds
             .unwrap_or_else(|| derived_round_bound(image, exclusive_horizon_ns, event_bound))
@@ -2392,6 +2527,10 @@ impl MetalPlan {
             tcp_state
                 .layout
                 .roce_offset
+                .map_or(NONE, |offset| offset as u64),
+            tcp_state
+                .layout
+                .stage_offset
                 .map_or(NONE, |offset| offset as u64),
         ];
 
@@ -2461,12 +2600,7 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
-        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
-        // frame travels on its reverse control lane, never on its flow's route.
-        if matches!(
-            packet.kind,
-            PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer | PacketKind::Pfc(_)
-        ) {
+        if !crate::device_sizing::initial_packet_is_routed(packet) {
             continue;
         }
         let counts = if packet.kind.is_data() {
@@ -2575,10 +2709,11 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
     for state in &image.host_states {
         for generator in &state.generators {
             // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
-            // answers a data arrival with at most one ACK or NACK and one CNP.
+            // answers a data arrival with at most one ACK or NACK (P16: no CNP).
             let per_packet = match generator.kind {
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
-                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Tcp(_)
+                | FlowGeneratorKind::Dcqcn(_)
+                | FlowGeneratorKind::Roce(_) => 1,
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
             };
             if per_packet != 0 {
@@ -2598,6 +2733,9 @@ fn flow_packet_counts(image: &SimulationImage) -> Result<(Vec<usize>, Vec<usize>
 
 struct FlowRouteCapacities<'a> {
     lookahead: Option<u64>,
+    /// The flow's concurrency group if it is an unfinished stage (P16 G2, ruling G7).
+    group: Option<u32>,
+    fel_charges: &'a mut crate::stage_sizing::ConcurrentCharges,
     fel: &'a mut [usize],
     queue: &'a mut [usize],
     aggregate_queue_packets: &'a mut [usize],
@@ -2625,15 +2763,15 @@ fn add_flow_route_capacities(
             unreachable!("PFC frames travel on control lanes, never on a flow route")
         }
         PacketKind::DcqcnCnp(_) => (flow.reverse_route.as_slice(), flow.source),
-        PacketKind::DcqcnControlTimer => {
-            unreachable!("the zero-byte DCQCN control-timer token is never routed")
-        }
         PacketKind::RoceData(_) => (flow.route.as_slice(), flow.target),
         PacketKind::RoceAck(_) | PacketKind::RoceNack(_) => {
             (flow.reverse_route.as_slice(), flow.source)
         }
         PacketKind::RocePacingTimer => {
             unreachable!("the zero-byte RoCE pacing token is never routed")
+        }
+        PacketKind::StageNotify => {
+            unreachable!("a stage notify crosses its host pair's lane, never a flow route")
         }
     };
     for index in 0..route.len() {
@@ -2651,7 +2789,14 @@ fn add_flow_route_capacities(
             route[index],
             capacities.lookahead,
         );
-        capacities.fel[target_slot] = capacities.fel[target_slot].saturating_add(burst);
+        crate::stage_sizing::charge(
+            capacities.fel,
+            capacities.fel_charges,
+            capacities.group,
+            target_slot,
+            crate::stage_sizing::charge_class(packet_kind),
+            burst,
+        );
         if image.nodes[target_slot].kind == NodeKind::Switch {
             capacities.aggregate_queue_packets[target_slot] =
                 capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
@@ -2661,9 +2806,9 @@ fn add_flow_route_capacities(
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
                 .first();
-            let contribution = if queue.is_some_and(|queue| {
-                matches!(queue.drop_mark, crate::DropMarkPolicy::EcnThreshold(_))
-            }) {
+            let contribution = if queue
+                .is_some_and(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::EcnRamp(_)))
+            {
                 capacity_context.horizon_queue_packet_bound(
                     image,
                     flow_index,
@@ -2788,60 +2933,25 @@ fn flow_link_fel_bound(
     )
 }
 
-fn derived_remote_capacity(
-    image: &SimulationImage,
-    capacity_context: &PlannerCapacityContext,
-    counts: &[usize],
-    feedback_counts: &[usize],
-    lookahead: Option<u64>,
-) -> usize {
-    image
-        .flows
-        .iter()
-        .enumerate()
-        .map(|(index, flow)| {
-            let feedback_count = feedback_counts[index];
-            let data_count = counts[index].saturating_sub(feedback_count);
-            flow.route
-                .iter()
-                .map(|link| {
-                    flow_link_round_bound(
-                        image,
-                        capacity_context,
-                        index,
-                        data_count,
-                        PacketKind::Data,
-                        *link,
-                        lookahead,
-                    )
-                })
-                .chain(flow.reverse_route.iter().map(|link| {
-                    flow_link_round_bound(
-                        image,
-                        capacity_context,
-                        index,
-                        feedback_count,
-                        PacketKind::Feedback,
-                        *link,
-                        lookahead,
-                    )
-                }))
-                .fold(0, usize::saturating_add)
-        })
-        .fold(image.nodes.len().saturating_mul(2), usize::saturating_add)
-}
-
+/// Per-producer remote staging capacities: 2 per node, plus every flow's round bound on each link
+/// it crosses, the bounds of a host's unfinished stages charged together (P16 G2, ruling G7).
 fn derived_remote_capacities(
     image: &SimulationImage,
     capacity_context: &PlannerCapacityContext,
+    concurrency: Option<&crate::stage_sizing::SizingConcurrency>,
     counts: &[usize],
     feedback_counts: &[usize],
     lookahead: Option<u64>,
 ) -> Vec<usize> {
     let mut capacities = vec![2_usize; image.nodes.len()];
+    let mut charges = crate::stage_sizing::ConcurrentCharges::default();
     for (index, flow) in image.flows.iter().enumerate() {
         let feedback_count = feedback_counts[index];
         let data_count = counts[index].saturating_sub(feedback_count);
+        let group = concurrency.and_then(|concurrency| concurrency.group(index));
+        // A windowed pair with its timeout off has at most its window's packets, and as many
+        // feedback packets, in the network at once (ruling R11 (b)).
+        let window = concurrency.and_then(|concurrency| concurrency.window_packets(index));
         for (route, packet_count, packet_kind) in [
             (flow.route.as_slice(), data_count, PacketKind::Data),
             (
@@ -2852,7 +2962,7 @@ fn derived_remote_capacities(
         ] {
             for link_id in route {
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
-                capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
+                let bound = flow_link_round_bound(
                     image,
                     capacity_context,
                     index,
@@ -2860,9 +2970,20 @@ fn derived_remote_capacities(
                     packet_kind,
                     *link_id,
                     lookahead,
-                ));
+                );
+                crate::stage_sizing::charge(
+                    &mut capacities,
+                    &mut charges,
+                    group,
+                    producer,
+                    crate::stage_sizing::charge_class(packet_kind),
+                    window.map_or(bound, |window| bound.min(window)),
+                );
             }
         }
+    }
+    if let Some(concurrency) = concurrency {
+        charges.apply(concurrency, &mut capacities);
     }
     capacities
 }
@@ -2888,6 +3009,7 @@ fn prepare_streams(
     fel_records: &[u64],
     remote_staging_slots: usize,
     channel_capacity_floors: &mut crate::device_capacity::ChannelCapacityFloors,
+    notify: Option<&crate::device_sizing::NotifyCapacities>,
 ) -> Result<PreparedStreams, MetalError> {
     let legacy_heap_event_slots = checked_sum_usize(legacy_fel_caps, "legacy FEL slots")?;
     let fallback_heap_event_slots = checked_sum_usize(fallback_fel_caps, "fallback FEL slots")?;
@@ -2941,6 +3063,10 @@ fn prepare_streams(
         feedback_counts,
         lookahead,
     )?;
+    // P16 H2: each unfired stage notify puts one event on its host pair's lane.
+    for &(channel, count) in notify.map_or(&[][..], |notify| &notify.lanes) {
+        channel_caps[channel] = channel_caps[channel].saturating_add(count);
+    }
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity.max(config.capacity_floors.channel_events_per_stream));
     } else {
@@ -3272,60 +3398,10 @@ fn take_words(next: &mut usize, records: usize, words: usize) -> Result<usize, M
     Ok(start)
 }
 
-fn derived_observation_capacities(
+fn remote_inbound_producers(
     image: &SimulationImage,
-    counts: &[usize],
-    feedback_counts: &[usize],
-) -> Vec<usize> {
-    let mut capacities = vec![1_usize; image.nodes.len()];
-    for event in &image.initial_events {
-        let target = event.target.0 as usize;
-        capacities[target] = capacities[target].saturating_add(1);
-    }
-    for (index, flow) in image.flows.iter().enumerate() {
-        let feedback_count = feedback_counts[index];
-        let data_count = counts[index].saturating_sub(feedback_count);
-        capacities[flow.source.0 as usize] =
-            capacities[flow.source.0 as usize].saturating_add(data_count);
-        capacities[flow.target.0 as usize] =
-            capacities[flow.target.0 as usize].saturating_add(feedback_count);
-        add_route_observation_capacities(
-            image,
-            &flow.route,
-            flow.target,
-            data_count,
-            &mut capacities,
-        );
-        add_route_observation_capacities(
-            image,
-            &flow.reverse_route,
-            flow.source,
-            feedback_count,
-            &mut capacities,
-        );
-    }
-    capacities
-}
-
-fn add_route_observation_capacities(
-    image: &SimulationImage,
-    route: &[crate::LinkId],
-    terminal: NodeId,
-    packet_count: usize,
-    capacities: &mut [usize],
-) {
-    for (step, link_id) in route.iter().enumerate() {
-        let producer = image.links[link_id.0 as usize].source.0 as usize;
-        capacities[producer] = capacities[producer].saturating_add(packet_count.saturating_mul(2));
-        let target = route
-            .get(step + 1)
-            .map_or(terminal, |next| image.links[next.0 as usize].source)
-            .0 as usize;
-        capacities[target] = capacities[target].saturating_add(packet_count);
-    }
-}
-
-fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
+    notify: Option<&crate::device_sizing::NotifyCapacities>,
+) -> (Vec<u64>, Vec<u64>) {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -3343,6 +3419,10 @@ fn remote_inbound_producers(image: &SimulationImage) -> (Vec<u64>, Vec<u64>) {
         }
     }
     for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+        inbound[target].insert(producer);
+    }
+    // P16 H2: a stage notify's lane delivers from its source host to its target host.
+    for (producer, target) in crate::device_sizing::notify_lane_producers(image, notify) {
         inbound[target].insert(producer);
     }
     let mut meta = vec![0_u64; image.nodes.len() * INBOUND_META_WORDS];
@@ -3389,9 +3469,7 @@ fn derived_transition_bound(
             }
             FlowGeneratorKind::Dcqcn(dcqcn) => {
                 let work = crate::device_sizing::dcqcn_device_work(image, generator, dcqcn);
-                Ok(bound
-                    .saturating_add(work.pacing_ticks)
-                    .saturating_add(work.control_ticks))
+                Ok(bound.saturating_add(work.pacing_ticks))
             }
             FlowGeneratorKind::Roce(roce) => Ok(bound
                 .saturating_add(crate::device_mechanism::roce_transition_bound(
@@ -3566,8 +3644,10 @@ fn encode_tcp_control(control: TcpCongestionControl, words: &mut [u64]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // One prepare-time boundary owns the TCP-state sizing inputs.
 fn prepare_tcp_state(
     image: &SimulationImage,
+    has_stages: bool,
     capacity_context: &PlannerCapacityContext,
     packet_counts: &[usize],
     feedback_counts: &[usize],
@@ -3733,6 +3813,9 @@ fn prepare_tcp_state(
             }
         }
     }
+    // P16 G1: the stage region precedes the RoCE region, which stays the tail of `tcp_state`.
+    let stage_offset = crate::device_stage::append_stage_region(image, has_stages, &mut words)
+        .map_err(|error| MetalError::Validation(error.into()))?;
     let roce_offset =
         crate::device_mechanism::append_roce_region(image, receiver_offset, &mut words);
     Ok(PreparedTcpState {
@@ -3741,6 +3824,7 @@ fn prepare_tcp_state(
             receiver_offset,
             ledger_meta_offset,
             roce_offset,
+            stage_offset,
         },
     })
 }
@@ -3813,7 +3897,7 @@ fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
             words[2] = u64::from(header.pause);
         }
         PacketKind::DcqcnCnp(header) => words[0] = header.trigger_payload.0,
-        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => {}
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => {}
         PacketKind::RoceData(header) => {
             words[0] = header.psn;
             words[1] = header.sent_time_ns;
@@ -3822,7 +3906,7 @@ fn encode_packet_metadata(kind: PacketKind, words: &mut [u64]) {
         PacketKind::RoceAck(header) | PacketKind::RoceNack(header) => {
             words[0] = header.acknowledgment;
             words[1] = header.echoed_sent_time_ns;
-            words[2] = header.acknowledged_bytes;
+            words[2] = crate::device_mechanism::roce_ack_size_echo_word(header);
         }
     }
 }
@@ -4065,6 +4149,8 @@ struct DominantArenaDiagnosticLayout {
     remote_high_water_offset: usize,
     node_count: usize,
     queue_high_water_offset: usize,
+    /// P16 H4: the RESUME-scan counter rows in `scheduler_state`.
+    resume_scan_offset: usize,
 }
 
 impl MetalBuffers {
@@ -4107,12 +4193,27 @@ impl MetalBuffers {
                 remote_high_water_offset as u64,
                 queue_high_water_offset as u64,
             ]);
+            // P16 H4: the RESUME-scan counter rows (params word 38), one per LP, zeroed.
+            let resume_scan_offset = plan.scheduler_state.len();
+            plan.scheduler_state.resize(
+                resume_scan_offset
+                    + (plan.params[0] as usize)
+                        .saturating_mul(crate::device_pfc::RESUME_SCAN_COUNT_WORDS),
+                0,
+            );
+            assert_eq!(
+                plan.params.len(),
+                38,
+                "the RESUME-scan counters take params word 38"
+            );
+            plan.params.push(resume_scan_offset as u64);
             DominantArenaDiagnosticLayout {
                 stream_high_water_offset,
                 stream_count: plan.stream_layout.stream_count,
                 remote_high_water_offset,
                 node_count: plan.params[0] as usize,
                 queue_high_water_offset,
+                resume_scan_offset,
             }
         };
         let round_capacity = plan.round_capacity;
@@ -4286,7 +4387,18 @@ impl MetalBuffers {
             .into());
         }
         #[cfg(feature = "metal-test-hooks")]
-        self.record_dominant_arena_high_water();
+        {
+            self.record_dominant_arena_high_water();
+            let layout = &self.dominant_arena_diagnostics;
+            crate::device_pfc::record_resume_scan_counts(
+                &self.planes[27].read_range(
+                    layout.resume_scan_offset,
+                    layout
+                        .node_count
+                        .saturating_mul(crate::device_pfc::RESUME_SCAN_COUNT_WORDS),
+                ),
+            );
+        }
 
         // T20l fix 2: on a SUCCESSFUL attempt, copy the LIVE regions rather than the arena.
         //
@@ -4369,6 +4481,20 @@ impl MetalBuffers {
         let ledger_meta = self
             .tcp_state
             .read_range(ledger_meta_range.start, ledger_meta_range.len());
+        // P16 G1: the stage rows, read only when the plan holds a stage region (a stageless image
+        // issues the same reads as before).
+        let stage_rows = if params[PARAM_STAGE_OFFSET] != NONE {
+            let range = metadata_region(
+                self.tcp_state.words,
+                params[PARAM_STAGE_OFFSET] as usize,
+                crate::device_stage::stage_row_words(image),
+                "stage region rows",
+            )
+            .map_err(compaction_error)?;
+            Some(self.tcp_state.read_range(range.start, range.len()))
+        } else {
+            None
+        };
         // P15: the RoCE receiver region, read only when the plan holds one (a non-QP image issues
         // the same reads as before).
         let roce_region = if params[PARAM_ROCE_OFFSET] != NONE {
@@ -4535,6 +4661,16 @@ impl MetalBuffers {
             .expect("compaction returns one buffer per request");
 
         let mut host_states = image.host_states.clone();
+        // P16 G1: stage state first, so the queue-pair decoder knows which anchors a release moved
+        // and the parked-set recomputation sees the decoded releases (design note §1.5).
+        if let Some(rows) = &stage_rows {
+            crate::device_stage::decode_stage_rows(rows, image, &mut host_states).map_err(
+                |_| MetalError::DeviceExecution {
+                    code: 96,
+                    node: None,
+                },
+            )?;
+        }
         let mut switch_states = image.switch_states.clone();
         let mut resident = self
             .orphan_packets
@@ -4576,7 +4712,8 @@ impl MetalBuffers {
                     state.sourced_packets = node_state[base + 7];
                     state.departed_packets = node_state[base + 8];
                     state.received_packets = node_state[base + 9];
-                    for generator in &mut state.generators {
+                    let input = &image.host_states[node.state_slot as usize];
+                    for (position, generator) in state.generators.iter_mut().enumerate() {
                         let offset = generator.flow.0 as usize * GENERATOR_WORDS;
                         generator.packets_emitted = generators[offset + 2];
                         generator.bytes_emitted = generators[offset + 3];
@@ -4643,6 +4780,10 @@ impl MetalBuffers {
                                 crate::device_mechanism::decode_roce_generator(
                                     &generators[offset..offset + GENERATOR_WORDS],
                                     roce,
+                                    crate::device_stage::released_during_run(
+                                        input.stage(position),
+                                        state.stages.get(position).copied().flatten(),
+                                    ),
                                 )
                                 .map_err(|_| {
                                     MetalError::DeviceExecution {
@@ -4713,8 +4854,14 @@ impl MetalBuffers {
                         switch_queue.queue = queue.iter().map(|packet| packet.id).collect();
                         switch_queue.in_service = service.map(|packet| packet.id);
                         switch_queue.tx_ready_pending = node_state[base + 3] != 0;
-                        restore_device_scheduler(lp, &queue_meta, &scheduler_state, switch_queue)
-                            .map_err(MetalError::Validation)?;
+                        restore_device_scheduler(
+                            lp,
+                            image.seed,
+                            &queue_meta,
+                            &scheduler_state,
+                            switch_queue,
+                        )
+                        .map_err(MetalError::Validation)?;
                         if params[PARAM_PFC_OFFSET] != NONE {
                             crate::device_pfc::restore_pfc_queue(
                                 &scheduler_state,
@@ -5204,16 +5351,6 @@ fn decode_event_kind(value: u64) -> Result<EventKind, MetalError> {
     }
 }
 
-/// The RoCE ACK/NACK header in `encode_packet_metadata`'s word order.
-#[inline(always)]
-fn roce_ack_header(metadata: &[u64]) -> crate::RoceAckHeader {
-    crate::RoceAckHeader {
-        acknowledgment: metadata[0],
-        echoed_sent_time_ns: metadata[1],
-        acknowledged_bytes: metadata[2],
-    }
-}
-
 #[inline(always)]
 fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalError> {
     match value & PACKET_KIND_MASK {
@@ -5237,15 +5374,25 @@ fn decode_packet_kind(value: u64, metadata: &[u64]) -> Result<PacketKind, MetalE
         5 if metadata[1..] == [0, 0] => Ok(PacketKind::DcqcnCnp(crate::DcqcnCnpHeader {
             trigger_payload: PayloadId(metadata[0]),
         })),
-        6 if metadata == [0, 0, 0] => Ok(PacketKind::DcqcnControlTimer),
         7 if metadata[2] <= 1 => Ok(PacketKind::RoceData(crate::RoceDataHeader {
             psn: metadata[0],
             sent_time_ns: metadata[1],
             retransmission: metadata[2] != 0,
         })),
-        8 => Ok(PacketKind::RoceAck(roce_ack_header(metadata))),
-        9 => Ok(PacketKind::RoceNack(roce_ack_header(metadata))),
+        8 => crate::device_mechanism::roce_ack_header_of_words(metadata)
+            .map(PacketKind::RoceAck)
+            .ok_or(MetalError::DeviceExecution {
+                code: 93,
+                node: None,
+            }),
+        9 => crate::device_mechanism::roce_ack_header_of_words(metadata)
+            .map(PacketKind::RoceNack)
+            .ok_or(MetalError::DeviceExecution {
+                code: 93,
+                node: None,
+            }),
         10 if metadata == [0, 0, 0] => Ok(PacketKind::RocePacingTimer),
+        11 if metadata == [0, 0, 0] => Ok(PacketKind::StageNotify),
         _ => Err(MetalError::DeviceExecution {
             code: 93,
             node: None,
@@ -5393,6 +5540,14 @@ struct DirectMetal {
 }
 
 impl DirectMetal {
+    /// The most bytes one plan may place on the device: the device's recommended working set, or
+    /// `configured` when that is lower (P16 D2).
+    fn device_memory_limit(&self, configured: Option<usize>) -> usize {
+        let working_set =
+            usize::try_from(self.device.recommendedMaxWorkingSetSize()).unwrap_or(usize::MAX);
+        configured.map_or(working_set, |configured| configured.min(working_set))
+    }
+
     fn new() -> Result<Self, MetalError> {
         let initialization_started = Instant::now();
         let device = MTLCreateSystemDefaultDevice().ok_or_else(|| {
@@ -5405,7 +5560,7 @@ impl DirectMetal {
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
         #[cfg(feature = "metal-test-hooks")]
         let instrumented_source = format!(
-            "#define DAYS_DOMINANT_ARENA_HIGH_WATER 1\n{}",
+            "#define DAYS_DOMINANT_ARENA_HIGH_WATER 1\n#define DAYS_RESUME_SCAN_COUNT 1\n{}",
             include_str!("metal_kernels.metal")
         );
         #[cfg(feature = "metal-test-hooks")]

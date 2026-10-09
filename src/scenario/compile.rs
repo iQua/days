@@ -5,16 +5,15 @@ use std::path::Path;
 use days_executor::{
     Backend, CollectiveAlgorithm, CollectiveChannelPolicy, CollectiveChunkPolicy, CollectivePhase,
     CollectiveStage, CollectiveStageIdentity, ComputeStage, ConstantGenerator, DcqcnController,
-    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnThresholdPolicy,
+    DcqcnControllerConfig, DcqcnGenerator, DcqcnReceiverState, DropMarkPolicy, EcnRampPolicy,
     Event, EventKey, EventKind, FlowDescriptor, FlowGeneratorKind, FlowGeneratorState, FlowId,
     GeneratorFeedbackState, GeneratorStatus, GeneratorTermination, HostState, LinkDescriptor,
     LinkId, NodeDescriptor, NodeId, NodeKind, PacketDescriptor, PacketKind, PayloadId,
-    PfcIngressState, PfcQueueState, QueueDepthUnit, RateGenerator, RedPolicyState, RemoteChannel,
-    RoceGenerator, RocePacer, RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage,
-    StageDependencies, StageRole, SwitchQueueState, SwitchState, TcpCongestionControl,
+    PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RoceGenerator, RocePacer,
+    RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage, StageDependencies,
+    StagePredecessors, StageRole, SwitchQueueState, SwitchState, TcpCongestionControl,
     TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
 };
-use num_bigint::BigUint;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use rand::SeedableRng;
@@ -22,10 +21,13 @@ use rand::rngs::SmallRng;
 use serde::Deserialize;
 use thiserror::Error;
 
+use super::collective_shapes::{RoutingSkew, SeededAllToAll};
 use super::ids::{IdError, LinkKey, LpKey, PhysicalNodeKey, StableIds, dense_ids};
 use crate::topos::build::{
-    HostAttachments, PairingPolicy, TopologyError, TopologyProfile, build_graph_with_profile,
+    HostAttachments, PairingPolicy, TopologyError, TopologyProfile,
+    build_graph_with_profile_from_str,
 };
+use crate::topos::rail::{RailProfile, ServerLocality};
 use crate::topos::route::{
     EcmpFlow, RouteTableError, RouteWorkers, compute_fat_tree_ecmp_route_table,
     compute_shortest_path_route_table_with,
@@ -58,33 +60,123 @@ impl From<IdError> for CompileError {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct SourceConfig {
-    seed: Option<u64>,
-    duration: Option<ExactDecimal>,
-    switch: SourceSwitch,
-    link: Option<SourceLink>,
-    time_quantum_ns: Option<u64>,
-    routing: Option<SourceRouting>,
-    flow: Option<Vec<SourceFlow>>,
-    flow_set: Option<Vec<SourceFlowSet>>,
-    collective: Option<Vec<SourceCollective>>,
-    collective_set: Option<Vec<SourceCollectiveSet>>,
-    compute: Option<Vec<SourceCompute>>,
+/// Declares the scenario root ([`SourceConfig`]) together with [`LEGACY_ENGINE_ROOT_KEYS`], so
+/// the legacy-engine keys the root accepts are written once.
+macro_rules! scenario_root {
+    ($($legacy:ident),* $(,)?) => {
+        /// The legacy engine's root keys (`legacy/src/config.rs`, `LegacyConfig`) that Days AGO
+        /// does not read: the root accepts each by its exact name and ignores it, because the
+        /// two engines read one scenario file (user ruling, Oct 8, option 1). Any other unknown
+        /// key is refused. `legacy`'s `the_days_ago_root_names_exactly_the_legacy_only_keys`
+        /// test keeps the list equal to `LegacyConfig`'s keys that the Days AGO root does not
+        /// read itself.
+        pub const LEGACY_ENGINE_ROOT_KEYS: &[&str] = &[$(stringify!($legacy)),*];
+
+        /// The scenario root. Unknown keys are refused (`deny_unknown_fields`); `topology`,
+        /// `edges` and `hosts` are read by the topology builder, and the legacy-engine keys are
+        /// accepted and ignored.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SourceConfig {
+            /// A `[workload]` table: present only in an AICB scenario, which the adapter
+            /// rewrites before lowering, so the ordinary path refuses it.
+            workload: Option<serde::de::IgnoredAny>,
+            seed: Option<u64>,
+            duration: Option<ExactDecimal>,
+            switch: SourceSwitch,
+            link: Option<SourceLink>,
+            time_quantum_ns: Option<u64>,
+            routing: Option<SourceRouting>,
+            flow: Option<Vec<SourceFlow>>,
+            flow_set: Option<Vec<SourceFlowSet>>,
+            collective: Option<Vec<SourceCollective>>,
+            collective_set: Option<Vec<SourceCollectiveSet>>,
+            compute: Option<Vec<SourceCompute>>,
+            /// Read by the topology builder (`topos::build`).
+            #[allow(dead_code)]
+            topology: Option<serde::de::IgnoredAny>,
+            #[allow(dead_code)]
+            edges: Option<serde::de::IgnoredAny>,
+            #[allow(dead_code)]
+            hosts: Option<serde::de::IgnoredAny>,
+            $(
+                #[allow(dead_code)]
+                $legacy: Option<serde::de::IgnoredAny>,
+            )*
+        }
+    };
+}
+
+scenario_root!(
+    ui_interval,
+    threading,
+    num_threads,
+    hot_workers,
+    concurrency_level,
+    log_path,
+    csv_logging,
+    report_interval,
+    mailbox_capacity,
+    legacy_e5_metrics,
+    model_host_attachment,
+    app_source,
+);
+
+/// The keys the scenario root accepts: those Days AGO reads, `topology`, `edges` and `hosts`
+/// (read by the topology builder), and [`LEGACY_ENGINE_ROOT_KEYS`].
+pub fn scenario_root_keys() -> &'static [&'static str] {
+    crate::utils::serde_fields::struct_fields::<SourceConfig>()
+}
+
+/// A parse error, naming the table of an unknown key: the header line the key sits under, or
+/// the root table.
+fn parse_error(content: &str, error: toml::de::Error) -> CompileError {
+    match crate::utils::serde_fields::unknown_key_table(content, &error) {
+        Some(table) => CompileError::Invalid(format!("{error}(in {table})")),
+        None => CompileError::Parse(error),
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceSwitch {
     port_rate: Option<ExactDecimal>,
     capacity: u64,
     discipline: Option<String>,
     drop: Option<String>,
-    ecn_threshold: Option<ExactDecimal>,
+    /// P16 ecnramp: the ECN ramp of every switch queue (`kmin_bytes`, `kmax_bytes`, `pmax`), with
+    /// `ecn_capacity_bytes`; exclusive with `ecn_by_rate`.
+    ecn: Option<SourceEcn>,
+    /// P16 H2 and ecnramp: one ECN ramp per egress link rate (SimAI keys its ECN rows by the
+    /// port's rate), with `ecn_capacity_bytes`; exclusive with `ecn`.
+    ecn_by_rate: Option<Vec<SourceEcnRow>>,
+    /// The byte capacity an ECN queue tail-drops at (SimAI's `BUFFER_SIZE`); `capacity` stays the
+    /// TailDrop packet capacity, which on an ECN queue only the device planners read, as a
+    /// per-queue packet hint.
+    ecn_capacity_bytes: Option<u64>,
     weights: Option<Vec<u64>>,
     priorities: Option<Vec<u64>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceEcn {
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: ExactDecimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceEcnRow {
+    rate_bps: u64,
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: ExactDecimal,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceRouting {
     policy: String,
 }
@@ -98,9 +190,12 @@ enum RoutingPolicy {
     #[default]
     ShortestPath,
     FatTreeEcmp,
+    /// SimAI's per-flow Murmur3 choice of spine at the source leaf of the rail fabric (P16 H2).
+    SimAiEcmp,
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceLink {
     mode: Option<String>,
     pfc: Option<SourcePfc>,
@@ -109,6 +204,7 @@ struct SourceLink {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourcePropagationTiers {
     host_to_edge_ns: u64,
     edge_to_aggregation_ns: u64,
@@ -116,6 +212,7 @@ struct SourcePropagationTiers {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourcePfc {
     /// P15: also monitor host-to-switch links, so switches pause host NICs (default off).
     host_links: Option<bool>,
@@ -125,9 +222,31 @@ struct SourcePfc {
     pause_quanta: Option<Vec<u16>>,
     refresh_interval: Option<ExactDecimal>,
     drain_interval: Option<ExactDecimal>,
+    /// P16 H2, the rail fabric only: XOFF and XON per switch tier (SimAI's threshold is one per
+    /// switch, set by its port count); replaces `xoff` and `xon`.
+    by_tier: Option<Vec<SourcePfcTier>>,
+    /// P16 H2: each monitor's headroom by its controlled link's rate, so its buffer capacity is
+    /// XOFF plus that headroom on every enabled priority; replaces `buffer_capacity`.
+    headroom_by_rate: Option<Vec<SourceHeadroomRow>>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePfcTier {
+    tier: String,
+    xoff: Vec<u64>,
+    xon: Vec<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceHeadroomRow {
+    rate_bps: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceFlow {
     flow_id: Option<u64>,
     starts_before: Option<Vec<u64>>,
@@ -141,6 +260,7 @@ struct SourceFlow {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceFlowSet {
     first_flow_id: Option<u64>,
     starts_before: Option<Vec<u64>>,
@@ -154,11 +274,27 @@ struct SourceFlowSet {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCollective {
     /// Stage-group name that `after` fields may reference.
     name: Option<String>,
-    /// Compute stage group whose rank-r stage gates this collective's rank-r root stages.
-    after: Option<String>,
+    /// Stage groups whose rank-r stages gate this collective's rank-r root stages: one name, or a
+    /// list (at least one compute group, and possibly the previous collective of the stream).
+    #[serde(default)]
+    after: Option<AfterGroups>,
+    /// The issue stream (SimAI's queue) the collective runs on at each rank, 0 by default: the
+    /// stage-aware sizing charges each stream's widest operation once (ruling R11 (a)). A
+    /// collective on another stream needs a `name`.
+    stream: Option<u32>,
+    /// Ring channels: each a ring order of the `sources` hosts (instead of `sinks`).
+    channels: Option<Vec<Vec<u64>>>,
+    /// The collective's position in its workload's issue order (ruling C2): it orders the
+    /// collective's flows, and so SimAI's ECMP port ordinals, before key content.
+    issue_ordinal: Option<u64>,
+    /// `EqualRemainderLast` (the default for rings) or `UniformFloor`.
+    chunk: Option<String>,
+    /// An all-to-all's seeded per-pair sizes (`[collective.alltoall]`); uniform without it.
+    alltoall: Option<Box<SourceAllToAll>>,
     collective_type: String,
     first_flow_id: Option<u64>,
     flow_type: Option<String>,
@@ -172,17 +308,60 @@ struct SourceCollective {
     traffic: SourceTraffic,
 }
 
+/// The seeded routing matrix of an imbalanced all-to-all (`collective_shapes::SeededAllToAll`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceAllToAll {
+    seed: u64,
+    #[serde(default)]
+    matrix: u64,
+    #[serde(default)]
+    group: u64,
+    #[serde(default)]
+    transpose: bool,
+    experts: u64,
+    topk: u64,
+    tokens: u64,
+    bytes_per_copy: u64,
+    /// `Zipf1` (the default) or `Uniform`.
+    skew: Option<String>,
+}
+
 /// A delay-only compute stage group: one timer-only stage per listed host.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCompute {
     name: String,
     hosts: Vec<u64>,
     duration_ns: u64,
-    /// Stage group (compute or TCP collective) that each host's stage waits for.
-    after: Option<String>,
+    /// Stage groups (compute groups or collectives) that each host's stage waits for: one name,
+    /// or a list of names whose stages it joins.
+    #[serde(default)]
+    after: Option<AfterGroups>,
+    /// The issue stream the group runs on, 0 by default (see `SourceCollective::stream`).
+    stream: Option<u32>,
+}
+
+/// One stage-group name, or several. One name is held without a list, so a group with a single
+/// predecessor allocates nothing for it.
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
+#[serde(untagged)]
+enum AfterGroups {
+    One(String),
+    Many(Box<[String]>),
+}
+
+/// The names `after` lists, in order.
+fn after_names(after: Option<&AfterGroups>) -> &[String] {
+    match after {
+        None => &[],
+        Some(AfterGroups::One(name)) => std::slice::from_ref(name),
+        Some(AfterGroups::Many(names)) => names,
+    }
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCollectiveSet {
     collective_type: String,
     collective_count: u64,
@@ -197,6 +376,7 @@ struct SourceCollectiveSet {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceTraffic {
     initial_delay: Option<ExactDecimal>,
     duration: Option<ExactDecimal>,
@@ -221,6 +401,10 @@ struct SourceRoce {
     feedback_priority: Option<u8>,
     duplicate_ack: Option<bool>,
     ack_size_bytes: Option<u64>,
+    /// P16 ruling D7: the window in bytes (SimAI `m_win`); 0 (the default) is no window.
+    window_bytes: Option<u64>,
+    /// P16 ruling D7: scale the window with the controller's rate (SimAI `m_var_win`).
+    variable_window: Option<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -253,23 +437,34 @@ impl<'de> Deserialize<'de> for SourceDistributionInfo {
     }
 }
 
+/// `[flow.traffic.dcqcn]`: the Mellanox-form DCQCN reaction point (P16) and its pacer. Every key
+/// but `max_rate_gbps` defaults to SimAI's and HPCC's shipped block (ruling D8). The paper-form
+/// keys `mi_factor`, `rtt_ns` and `increase_byte_threshold` are rejected by name (ruling D9), and
+/// any other unknown key by `deny_unknown_fields`.
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceDcqcn {
-    rate_gbps: ExactDecimal,
-    min_rate_gbps: ExactDecimal,
     max_rate_gbps: ExactDecimal,
-    g: ExactDecimal,
-    ai_rate_gbps: ExactDecimal,
-    hai_rate_gbps: ExactDecimal,
-    mi_factor: ExactDecimal,
-    rtt_ns: Option<ExactDecimal>,
+    rate_gbps: Option<ExactDecimal>,
+    min_rate_gbps: Option<ExactDecimal>,
+    g: Option<ExactDecimal>,
+    ai_rate_gbps: Option<ExactDecimal>,
+    hai_rate_gbps: Option<ExactDecimal>,
+    alpha_resume_interval_ns: Option<ExactDecimal>,
+    rate_decrease_interval_ns: Option<ExactDecimal>,
+    rp_timer_ns: Option<ExactDecimal>,
+    fast_recovery_times: Option<u32>,
+    clamp_target_rate: Option<bool>,
     cnp_interval_ns: Option<ExactDecimal>,
     pacing_interval_ns: Option<ExactDecimal>,
     cnp_priority: Option<u8>,
-    increase_byte_threshold: Option<u64>,
+    mi_factor: Option<serde::de::IgnoredAny>,
+    rtt_ns: Option<serde::de::IgnoredAny>,
+    increase_byte_threshold: Option<serde::de::IgnoredAny>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceTcp {
     cc_algorithm: String,
     #[serde(default)]
@@ -278,6 +473,7 @@ struct SourceTcp {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SourceCubic {
     beta: Option<ExactDecimal>,
     c: Option<ExactDecimal>,
@@ -313,6 +509,8 @@ struct RoceTrafficKey {
     nack_interval_ns: u64,
     duplicate_ack: bool,
     ack_size_bytes: u64,
+    window_bytes: u64,
+    variable_window: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -322,13 +520,16 @@ struct DcqcnTrafficKey {
     maximum_rate_bps: u64,
     additive_rate_bps: u64,
     hyper_rate_bps: u64,
-    g_ppb: u64,
-    decrease_ppb: u64,
+    g_q63: u64,
+    alpha_interval_ns: u64,
+    decrease_interval_ns: u64,
+    increase_interval_ns: u64,
+    fast_recovery_steps: u32,
+    clamp_target_rate: bool,
+    /// The notification point's CNP spacing of an unreliable DCQCN flow; zero for a queue pair.
     cnp_interval_ns: u64,
-    control_interval_ns: u64,
     pacing_interval_ns: u64,
     cnp_priority: u8,
-    increase_byte_threshold: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -445,7 +646,7 @@ pub fn fat_tree_ecmp_explicit_flow_hash(
         },
         duplicate_ordinal,
     };
-    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[])
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[], &[])
 }
 
 /// Selects the compiler-identical fat-tree ECMP hash for one flow-set member.
@@ -473,7 +674,7 @@ pub fn fat_tree_ecmp_flow_set_member_hash(
         source,
         target,
     };
-    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[])
+    generator_seed(seed ^ 0x4543_4d50_5f48_4153, &key, &[], &[], &[])
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -499,6 +700,12 @@ struct FlowSetKey {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CollectiveKey {
+    /// The collective's position in its workload's realized issue order (P16 ruling C2): the
+    /// leading field, so canonical flow order, and with it SimAI's per-pair ECMP port ordinals
+    /// (`simai_ecmp_route_tables`), follow issue order. `None` for every collective that does not
+    /// set it, which sort first and keep their order. Held as `ordinal + 1` in a `NonZeroU32`, which
+    /// fits the key's padding (`stage_group_keys_keep_their_size`); `Some` orders as the ordinal.
+    issue_ordinal: Option<std::num::NonZeroU32>,
     algorithm: CollectiveAlgorithm,
     flow_count: u64,
     sources: Vec<u64>,
@@ -507,7 +714,34 @@ struct CollectiveKey {
     traffic: TrafficKey,
     /// Stage-group identity; `None` for every unnamed collective, which keeps their order.
     name: Option<String>,
-    after: Option<String>,
+    after: Option<AfterGroups>,
+    /// Channel rings or seeded sizes (P16 H1); `None`, holding nothing, for one ring in `sinks`
+    /// order and a uniform all-to-all or send/recv, so an ordinary key stays the size it was.
+    shape: Option<Box<CollectiveShapeKey>>,
+    chunk: CollectiveChunkPolicy,
+}
+
+/// The parts of a collective key only channel rings and seeded all-to-alls have. Field order
+/// keeps the keys' order as when they were inline (channels, then the chunk, then the sizes):
+/// a seeded key is the only one with sizes and has the largest chunk policy.
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+struct CollectiveShapeKey {
+    /// Ring channels as rank-index orders (`rank` is a position in `sources`).
+    channels: Vec<Vec<u32>>,
+    /// An all-to-all's seeded per-pair sizes.
+    seeded: Option<SeededAllToAll>,
+}
+
+impl CollectiveKey {
+    /// The ring channels; empty for one ring in `sinks` order, an all-to-all and a send/recv.
+    fn channels(&self) -> &[Vec<u32>] {
+        self.shape.as_ref().map_or(&[], |shape| &shape.channels)
+    }
+
+    /// An all-to-all's seeded per-pair sizes.
+    fn seeded(&self) -> Option<&SeededAllToAll> {
+        self.shape.as_ref().and_then(|shape| shape.seeded.as_ref())
+    }
 }
 
 /// One delay-only compute stage group.
@@ -516,12 +750,15 @@ struct ComputeKey {
     name: String,
     hosts: Vec<u64>,
     duration_ns: u64,
-    after: Option<String>,
+    /// The stage groups each host's stage waits for, in the order the scenario names them.
+    after: Option<AfterGroups>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CollectiveStagePosition {
     phase: CollectivePhase,
+    /// The ring channel; 0 for one ring, an all-to-all and a send/recv.
+    channel: u32,
     rank: u32,
     step: u32,
 }
@@ -548,10 +785,10 @@ enum FlowKey {
         duplicate_ordinal: u64,
         stage: CollectiveStagePosition,
     },
-    ComputeStage {
-        semantic: ComputeKey,
-        rank: u32,
-    },
+    /// `compute` is the ordinal of the stage's [`ComputeKey`] among the scenario's sorted compute
+    /// keys, which [`CanonicalFlows::computes`] holds; names are unique, so the mapping is
+    /// order-isomorphic, as for collectives.
+    ComputeStage { compute: u64, rank: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -561,13 +798,98 @@ struct CollectiveStageInput {
     group_size: u32,
     declared_total_bytes: u64,
     position: CollectiveStagePosition,
+    chunk_policy: CollectiveChunkPolicy,
+    channel_policy: CollectiveChannelPolicy,
     chunk_offset_bytes: u64,
     chunk_bytes: u64,
-    local_predecessor: Option<FlowKey>,
-    inbound_predecessor: Option<FlowKey>,
+    local: PredecessorKeys,
+    inbound: PredecessorKeys,
     inbound_predecessor_bytes: u64,
-    local_predecessor_complete: bool,
-    inbound_predecessor_complete: bool,
+    /// P16 H2: the NVLink message delay when the two ranks share a server on the rail fabric, so
+    /// the stage lowers to a stage notify; set by `NotifyLowering::plan`, `None` otherwise. Held
+    /// in the boxed sidecar, so a flow without a stage pays nothing to ask.
+    notify_delay_ns: Option<u64>,
+}
+
+impl FlowInput {
+    /// The stage notify's message delay of this flow, if it lowers to one (P16 H2).
+    fn notify_delay_ns(&self) -> Option<u64> {
+        self.collective.as_deref()?.notify_delay_ns
+    }
+}
+
+/// The predecessors of one kind of a stage, by flow key: inline when there is at most one, so a
+/// stage that is not a join allocates nothing for them.
+#[derive(Clone, Debug, Default)]
+enum PredecessorKeys {
+    #[default]
+    None,
+    One(FlowKey),
+    Many(Vec<FlowKey>),
+}
+
+impl PredecessorKeys {
+    fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+
+    /// Appends `key`; under `dedup` only when it is not already listed. Returns whether it was
+    /// appended. Only a zero-send all-to-all rank's release (`collective_completion`) dedups: the
+    /// ordinary paths name each group once, so their keys are distinct and they pay nothing.
+    fn insert(&mut self, key: FlowKey, dedup: bool) -> bool {
+        let listed = dedup
+            && match self {
+                Self::None => false,
+                Self::One(first) => *first == key,
+                Self::Many(keys) => keys.contains(&key),
+            };
+        if !listed {
+            self.push(key);
+        }
+        !listed
+    }
+
+    fn push(&mut self, key: FlowKey) {
+        *self = match std::mem::take(self) {
+            Self::None => Self::One(key),
+            Self::One(first) => Self::Many(vec![first, key]),
+            Self::Many(mut keys) => {
+                keys.push(key);
+                Self::Many(keys)
+            }
+        };
+    }
+
+    /// The image form: a join's flows are sorted and appended to `joins` as one run.
+    fn resolve(
+        &self,
+        flow_ids: &BTreeMap<FlowKey, u64>,
+        joins: &mut Vec<FlowId>,
+    ) -> Result<StagePredecessors, CompileError> {
+        Ok(match self {
+            Self::None => StagePredecessors::None,
+            Self::One(key) => StagePredecessors::One(FlowId(flow_ids[key])),
+            Self::Many(keys) => {
+                let mut flows = keys
+                    .iter()
+                    .map(|key| FlowId(flow_ids[key]))
+                    .collect::<Vec<_>>();
+                flows.sort_unstable();
+                flows.dedup();
+                let first = u32::try_from(joins.len()).map_err(|_| {
+                    CompileError::Invalid("stage join table exceeds u32".to_owned())
+                })?;
+                let count = u32::try_from(flows.len())
+                    .map_err(|_| CompileError::Invalid("stage join exceeds u32".to_owned()))?;
+                if count == 1 {
+                    StagePredecessors::One(flows[0])
+                } else {
+                    joins.extend(flows);
+                    StagePredecessors::Join { first, count }
+                }
+            }
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -576,8 +898,8 @@ struct ComputeStageInput {
     group_size: u32,
     rank: u32,
     duration_ns: u64,
-    local_predecessor: Option<FlowKey>,
-    inbound_predecessor: Option<FlowKey>,
+    local: PredecessorKeys,
+    inbound: PredecessorKeys,
     inbound_predecessor_bytes: u64,
 }
 
@@ -639,19 +961,94 @@ pub fn compile_config_with_route_workers(
     path: impl AsRef<Path>,
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
+    compile_scenario(path.as_ref(), route_workers, None)
+}
+
+/// Lowers a TOML scenario's topology, switch and link configuration (and any stage groups it
+/// declares) together with a typed workload's operations (`super::workload`, ruling R12).
+pub fn compile_config_with_workload(
+    path: impl AsRef<Path>,
+    workload: &super::workload::Workload,
+    route_workers: RouteWorkers,
+) -> Result<SimulationImage, CompileError> {
+    compile_scenario(path.as_ref(), route_workers, Some(workload))
+}
+
+/// [`compile_config_with_route_workers`], with the run manifest of an AICB scenario
+/// (`[workload.aicb]`, P16 H3): `None` for every other scenario. The manifest is host metadata
+/// and never enters the image.
+pub fn compile_config_with_manifest(
+    path: impl AsRef<Path>,
+    route_workers: RouteWorkers,
+) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
     let path = path.as_ref();
+    let content = read_scenario(path)?;
+    match compile_text(&content, route_workers, None) {
+        Err(CompileError::Parse(_)) if crate::workload::aicb::is_aicb_scenario(&content) => {
+            compile_aicb(path, &content, route_workers)
+        }
+        other => other.map(|image| (image, None)),
+    }
+}
+
+fn read_scenario(path: &Path) -> Result<String, CompileError> {
     let content = fs::read_to_string(path).map_err(|source| CompileError::Read {
         path: path.display().to_string(),
         source,
     })?;
-    let path_str = path
-        .to_str()
+    path.to_str()
         .ok_or_else(|| CompileError::Invalid("configuration path is not valid UTF-8".to_owned()))?;
-    crate::validate_config(path_str).map_err(CompileError::Unsupported)?;
+    Ok(content)
+}
 
-    let source: SourceConfig = toml::from_str(&content)?;
-    let model = SupportedModel::from_source(source, &content)?;
-    let (graph, hosts, profile) = build_graph_with_profile(path_str)?;
+fn compile_scenario(
+    path: &Path,
+    route_workers: RouteWorkers,
+    workload: Option<&super::workload::Workload>,
+) -> Result<SimulationImage, CompileError> {
+    let content = read_scenario(path)?;
+    match compile_text(&content, route_workers, workload) {
+        // An AICB scenario has no `[switch]` of its own, so it does not parse as an ordinary one.
+        Err(CompileError::Parse(_))
+            if workload.is_none() && crate::workload::aicb::is_aicb_scenario(&content) =>
+        {
+            compile_aicb(path, &content, route_workers).map(|(image, _)| image)
+        }
+        other => other,
+    }
+}
+
+/// Lowers an AICB scenario: the adapter reads the trace and `SimAI.conf` it names and returns the
+/// scenario text with the derived fabric tables and the workload IR (`crate::workload::aicb`).
+fn compile_aicb(
+    path: &Path,
+    content: &str,
+    route_workers: RouteWorkers,
+) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    let prepared = crate::workload::aicb::prepare(path, content)
+        .map_err(|error| CompileError::Invalid(format!("AICB scenario: {error}")))?;
+    let image = compile_text(&prepared.text, route_workers, Some(&prepared.workload))?;
+    Ok((image, Some(prepared.manifest)))
+}
+
+fn compile_text(
+    content: &str,
+    route_workers: RouteWorkers,
+    workload: Option<&super::workload::Workload>,
+) -> Result<SimulationImage, CompileError> {
+    crate::validate_config_text(content).map_err(CompileError::Unsupported)?;
+
+    let source: SourceConfig =
+        toml::from_str(content).map_err(|error| parse_error(content, error))?;
+    if source.workload.is_some() {
+        return Err(CompileError::Unsupported(
+            "a `[workload.aicb]` scenario takes its `[switch]`, `[link]` and `[routing]` tables \
+             from SimAI.conf; remove them"
+                .to_owned(),
+        ));
+    }
+    let model = SupportedModel::from_source(source, content, workload)?;
+    let (graph, hosts, profile) = build_graph_with_profile_from_str(content)?;
 
     let image = lower(model, &graph, hosts, profile, route_workers)?;
     validate(&image, Backend::Scalar).map_err(|error| {
@@ -663,10 +1060,15 @@ pub fn compile_config_with_route_workers(
 struct SupportedModel {
     seed: u64,
     stop_time_ns: u64,
-    rate_bps: u64,
+    /// `switch.port_rate`, the one link rate of every topology but the rail fabric, whose
+    /// per-class rates come from its topology table (`None` there; required elsewhere).
+    rate_bps: Option<u64>,
     queue_capacity_packets: u64,
     scheduler: SchedulerKind,
     drop_mark: DropMarkPolicy,
+    /// P16 H2 and ecnramp: the ECN ramp of each egress LP by its link rate, overriding
+    /// `drop_mark`.
+    ecn_by_rate: Option<BTreeMap<u64, EcnRampPolicy>>,
     pfc: Option<PfcLowering>,
     routing: RoutingPolicy,
     propagation: PropagationModel,
@@ -674,6 +1076,8 @@ struct SupportedModel {
     flow_sets: Vec<FlowSetKey>,
     collectives: Vec<CollectiveKey>,
     computes: Vec<ComputeKey>,
+    /// The issue stream of each named stage group on a stream other than 0.
+    streams: BTreeMap<String, u32>,
     /// The scenario's distinct RoCE keys, sorted; `TrafficKind::Roce` holds an index into it.
     roce_keys: Vec<RoceTrafficKey>,
 }
@@ -727,9 +1131,18 @@ fn canonical_roce_keys(
 /// layer a link belongs to: host attachment, edge-to-aggregation, aggregation-to-core.
 #[derive(Clone, Copy, Debug)]
 enum PropagationModel {
+    /// No delay key: zero on every topology but the rail fabric, whose topology table names its
+    /// per-class delays.
+    Undeclared,
     Uniform(u64),
     FatTreeTiers(SourcePropagationTiers),
 }
+
+/// Per-priority byte thresholds of one PFC table: XOFF and XON.
+type PfcThresholds = ([u64; 8], [u64; 8]);
+
+/// XOFF, XON and buffer capacity of one ingress monitor.
+type PfcMonitorThresholds = ([u64; 8], [u64; 8], [u64; 8]);
 
 #[derive(Clone)]
 struct PfcLowering {
@@ -738,10 +1151,68 @@ struct PfcLowering {
     buffer_capacity: [u64; 8],
     /// Monitor host-to-switch links as well as switch-to-switch links.
     host_links: bool,
+    /// P16 H2: XOFF and XON of the ASW tier and the PSW tier, replacing `xoff` and `xon`.
+    tiers: Option<[PfcThresholds; 2]>,
+    /// P16 H2: headroom by controlled link rate, replacing `buffer_capacity`.
+    headroom_by_rate: Option<BTreeMap<u64, u64>>,
+}
+
+impl PfcLowering {
+    /// The thresholds of one monitor: its downstream switch's tier (on the rail fabric) and its
+    /// controlled link's rate pick XOFF, XON and the buffer capacity.
+    fn thresholds(
+        &self,
+        profile: TopologyProfile,
+        downstream_switch: u64,
+        controlled_rate_bps: u64,
+    ) -> Result<PfcMonitorThresholds, CompileError> {
+        let (xoff, xon) = match (&self.tiers, profile) {
+            (None, _) => (self.xoff, self.xon),
+            (Some(tiers), TopologyProfile::Rail(rail)) => {
+                let tier = u32::try_from(downstream_switch)
+                    .map(|switch| usize::from(!rail.is_asw(switch)))
+                    .map_err(|_| CompileError::Invalid("switch identity exceeds u32".to_owned()))?;
+                tiers[tier]
+            }
+            (Some(_), _) => {
+                return Err(CompileError::Unsupported(
+                    "unsupported `link.pfc.by_tier` off the SpectrumX rail fabric; switch tiers \
+                     are rail tiers"
+                        .to_owned(),
+                ));
+            }
+        };
+        let buffer_capacity = match &self.headroom_by_rate {
+            None => self.buffer_capacity,
+            Some(rows) => {
+                let headroom = *rows.get(&controlled_rate_bps).ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "`link.pfc.headroom_by_rate` has no row for a {controlled_rate_bps} b/s \
+                         controlled link"
+                    ))
+                })?;
+                let mut capacity = [0; 8];
+                for priority in 0..8 {
+                    if xoff[priority] != 0 {
+                        capacity[priority] =
+                            xoff[priority].checked_add(headroom).ok_or_else(|| {
+                                CompileError::Invalid("PFC buffer capacity exceeds u64".to_owned())
+                            })?;
+                    }
+                }
+                capacity
+            }
+        };
+        Ok((xoff, xon, buffer_capacity))
+    }
 }
 
 impl SupportedModel {
-    fn from_source(source: SourceConfig, scenario_text: &str) -> Result<Self, CompileError> {
+    fn from_source(
+        source: SourceConfig,
+        scenario_text: &str,
+        workload: Option<&super::workload::Workload>,
+    ) -> Result<Self, CompileError> {
         let seed = source
             .seed
             .ok_or_else(|| CompileError::Invalid("`seed` is missing".to_owned()))?;
@@ -752,7 +1223,12 @@ impl SupportedModel {
             1_000_000_000,
             "simulation duration",
         )?;
-        let rate_bps = parse_rate(scenario_text, source.switch.port_rate.as_ref())?;
+        let rate_bps = source
+            .switch
+            .port_rate
+            .as_ref()
+            .map(|rate| parse_rate(scenario_text, Some(rate)))
+            .transpose()?;
 
         let discipline = source
             .switch
@@ -823,64 +1299,58 @@ impl SupportedModel {
 
         let drop = source.switch.drop.as_deref().ok_or_else(|| {
             CompileError::Unsupported(
-                "unsupported drop policy: `switch.drop` is missing; Days executor supports TailDrop, RED, RED_ECN, and ECN_THRESHOLD"
+                "unsupported drop policy: `switch.drop` is missing; Days AGO's only drop rule is TailDrop"
                     .to_owned(),
             )
         })?;
-        let drop_mark = match drop {
-            "TailDrop" => DropMarkPolicy::TailDrop,
-            "RED" | "RED_ECN" => {
-                if source.switch.capacity < 10 {
-                    return Err(CompileError::Invalid(
-                        "RED packet capacity must be at least 10 to represent 70%/90% thresholds"
-                            .to_owned(),
-                    ));
-                }
-                let min_threshold = u64::try_from(u128::from(source.switch.capacity) * 7 / 10)
-                    .map_err(|_| {
-                        CompileError::Invalid(
-                            "RED 70% packet threshold exceeds the u64 state domain".to_owned(),
-                        )
-                    })?;
-                let max_threshold = u64::try_from(u128::from(source.switch.capacity) * 9 / 10)
-                    .map_err(|_| {
-                        CompileError::Invalid(
-                            "RED 90% packet threshold exceeds the u64 state domain".to_owned(),
-                        )
-                    })?;
-                DropMarkPolicy::Red(RedPolicyState {
-                    unit: QueueDepthUnit::Packets,
-                    capacity: source.switch.capacity,
-                    min_threshold,
-                    max_threshold,
-                    max_probability_numerator: 4,
-                    max_probability_denominator: 5,
-                    average_scaled: 0,
-                    counter: 0,
-                    mark_ecn: drop == "RED_ECN",
-                })
+        if drop != "TailDrop" {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported drop policy `{drop}`; Days AGO's only drop rule is TailDrop (RED, \
+                 RED_ECN and ECN_THRESHOLD were removed in P16): ECN marking is `switch.ecn` or \
+                 `switch.ecn_by_rate`, with `switch.ecn_capacity_bytes`"
+            )));
+        }
+        let (drop_mark, ecn_by_rate) = match (
+            &source.switch.ecn,
+            &source.switch.ecn_by_rate,
+            source.switch.ecn_capacity_bytes,
+        ) {
+            (None, None, None) => (DropMarkPolicy::TailDrop, None),
+            (None, None, Some(_)) => {
+                return Err(CompileError::Invalid(
+                    "`switch.ecn_capacity_bytes` needs `switch.ecn` or `switch.ecn_by_rate`"
+                        .to_owned(),
+                ));
             }
-            "ECN_THRESHOLD" => {
-                let threshold = exact_decimal_product_ceil(
+            (Some(_), Some(_), _) => {
+                return Err(CompileError::Invalid(
+                    "`switch.ecn` and `switch.ecn_by_rate` are exclusive".to_owned(),
+                ));
+            }
+            (_, _, None) => {
+                return Err(CompileError::Invalid(
+                    "ECN marking needs `switch.ecn_capacity_bytes`, the byte capacity an ECN \
+                     queue tail-drops at"
+                        .to_owned(),
+                ));
+            }
+            (Some(ecn), None, Some(capacity_bytes)) => (
+                DropMarkPolicy::EcnRamp(ecn_ramp_policy(
                     scenario_text,
-                    source.switch.ecn_threshold.as_ref(),
-                    "0.8",
-                    source.switch.capacity,
-                    "switch.ecn_threshold",
-                )?;
-                DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-                    unit: QueueDepthUnit::Packets,
-                    capacity: source.switch.capacity,
-                    threshold,
-                })
-            }
-            unsupported => {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported drop policy `{unsupported}`; Days executor supports TailDrop, RED, RED_ECN, and ECN_THRESHOLD"
-                )));
-            }
+                    capacity_bytes,
+                    ecn.kmin_bytes,
+                    ecn.kmax_bytes,
+                    &ecn.pmax,
+                    "switch.ecn",
+                )?),
+                None,
+            ),
+            (None, Some(rows), Some(capacity_bytes)) => (
+                // Each egress LP takes its link rate's row at lowering.
+                DropMarkPolicy::TailDrop,
+                Some(ecn_rows(scenario_text, rows, capacity_bytes)?),
+            ),
         };
-
         let link = source.link.unwrap_or_default();
         let mut pfc = None;
         if let Some(mode) = link.mode.as_deref() {
@@ -912,10 +1382,37 @@ impl SupportedModel {
                             .to_owned(),
                     ));
                 }
-                let mut xoff = exact_pfc_array(config.xoff.as_deref(), "xoff")?;
-                let mut xon = exact_pfc_array(config.xon.as_deref(), "xon")?;
-                let mut buffer_capacity =
-                    exact_pfc_array(config.buffer_capacity.as_deref(), "buffer_capacity")?;
+                let mut tiers = config.by_tier.as_deref().map(pfc_tiers).transpose()?;
+                let headroom_by_rate = config
+                    .headroom_by_rate
+                    .as_deref()
+                    .map(pfc_headroom_rows)
+                    .transpose()?;
+                if tiers.is_some() && (config.xoff.is_some() || config.xon.is_some()) {
+                    return Err(CompileError::Invalid(
+                        "`link.pfc.by_tier` replaces `link.pfc.xoff` and `link.pfc.xon`".to_owned(),
+                    ));
+                }
+                if headroom_by_rate.is_some() && config.buffer_capacity.is_some() {
+                    return Err(CompileError::Invalid(
+                        "`link.pfc.headroom_by_rate` replaces `link.pfc.buffer_capacity`"
+                            .to_owned(),
+                    ));
+                }
+                // With tiers, the ASW tier stands for the enabled priorities (both tiers enable
+                // the same ones); with headroom rows, XOFF stands for the per-monitor capacity.
+                let (mut xoff, mut xon) = match &tiers {
+                    Some(tiers) => tiers[0],
+                    None => (
+                        exact_pfc_array(config.xoff.as_deref(), "xoff")?,
+                        exact_pfc_array(config.xon.as_deref(), "xon")?,
+                    ),
+                };
+                let mut buffer_capacity = if headroom_by_rate.is_some() {
+                    xoff
+                } else {
+                    exact_pfc_array(config.buffer_capacity.as_deref(), "buffer_capacity")?
+                };
                 if let Some(quanta) = config.pause_quanta.as_deref() {
                     let quanta: [u16; 8] = quanta.try_into().map_err(|_| {
                         CompileError::Invalid(
@@ -927,6 +1424,10 @@ impl SupportedModel {
                             xoff[priority] = 0;
                             xon[priority] = 0;
                             buffer_capacity[priority] = 0;
+                            for (tier_xoff, tier_xon) in tiers.iter_mut().flatten() {
+                                tier_xoff[priority] = 0;
+                                tier_xon[priority] = 0;
+                            }
                         }
                     }
                 }
@@ -941,6 +1442,8 @@ impl SupportedModel {
                     xon,
                     buffer_capacity,
                     host_links: config.host_links.unwrap_or(false),
+                    tiers,
+                    headroom_by_rate,
                 });
             } else if mode != "None" {
                 return Err(CompileError::Unsupported(format!(
@@ -970,6 +1473,23 @@ impl SupportedModel {
             .into_iter()
             .map(|flow_set| validate_flow_set(flow_set, scenario_text, &mut roce_keys))
             .collect::<Result<Vec<_>, _>>()?;
+        // The streams are read first, so the groups still collect in place (no new table).
+        let mut streams = BTreeMap::new();
+        for collective in source.collective.iter().flatten() {
+            if let Some(stream) = collective.stream.filter(|&stream| stream != 0) {
+                let name = collective.name.clone().ok_or_else(|| {
+                    CompileError::Invalid(
+                        "a collective on a stream other than 0 needs a `name`".to_owned(),
+                    )
+                })?;
+                streams.insert(name, stream);
+            }
+        }
+        for compute in source.compute.iter().flatten() {
+            if let Some(stream) = compute.stream.filter(|&stream| stream != 0) {
+                streams.insert(compute.name.clone(), stream);
+            }
+        }
         let mut collectives = source
             .collective
             .unwrap_or_default()
@@ -983,6 +1503,18 @@ impl SupportedModel {
                 &mut roce_keys,
             )?);
         }
+        let mut computes = source
+            .compute
+            .unwrap_or_default()
+            .into_iter()
+            .map(validate_compute)
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(workload) = workload {
+            let (more_collectives, more_computes) =
+                workload_keys(workload, &mut roce_keys, &mut streams)?;
+            collectives.extend(more_collectives);
+            computes.extend(more_computes);
+        }
         // After the collectives, whose keys sort them in `canonical_flows`.
         let roce_keys = canonical_roce_keys(
             roce_keys,
@@ -990,12 +1522,6 @@ impl SupportedModel {
             &mut flow_sets,
             &mut collectives,
         );
-        let computes = source
-            .compute
-            .unwrap_or_default()
-            .into_iter()
-            .map(validate_compute)
-            .collect::<Result<Vec<_>, _>>()?;
 
         let routing = match source
             .routing
@@ -1004,10 +1530,11 @@ impl SupportedModel {
         {
             None | Some("ShortestPath") => RoutingPolicy::ShortestPath,
             Some("FatTreeEcmp") => RoutingPolicy::FatTreeEcmp,
+            Some("SimAiEcmp") => RoutingPolicy::SimAiEcmp,
             Some(unsupported) => {
                 return Err(CompileError::Unsupported(format!(
                     "unsupported `routing.policy` `{unsupported}`; Days lowering supports \
-                     ShortestPath and FatTreeEcmp"
+                     ShortestPath, FatTreeEcmp and SimAiEcmp"
                 )));
             }
         };
@@ -1021,7 +1548,8 @@ impl SupportedModel {
                 ));
             }
             (_, Some(tiers)) => PropagationModel::FatTreeTiers(tiers),
-            (propagation_ns, None) => PropagationModel::Uniform(propagation_ns.unwrap_or(0)),
+            (Some(propagation_ns), None) => PropagationModel::Uniform(propagation_ns),
+            (None, None) => PropagationModel::Undeclared,
         };
 
         Ok(Self {
@@ -1031,6 +1559,7 @@ impl SupportedModel {
             queue_capacity_packets: source.switch.capacity,
             scheduler,
             drop_mark,
+            ecn_by_rate,
             pfc,
             routing,
             propagation,
@@ -1038,9 +1567,145 @@ impl SupportedModel {
             flow_sets,
             collectives,
             computes,
+            streams,
             roce_keys,
         })
     }
+}
+
+/// `link.pfc.by_tier`: exactly the `asw` and `psw` tiers, each with eight XOFF and XON entries,
+/// enabling the same priorities, as `[(asw xoff, asw xon), (psw xoff, psw xon)]`.
+fn pfc_tiers(rows: &[SourcePfcTier]) -> Result<[PfcThresholds; 2], CompileError> {
+    let invalid = || {
+        CompileError::Invalid(
+            "`link.pfc.by_tier` must list the `asw` and `psw` tiers once each, with eight XOFF and \
+             XON entries enabling the same priorities"
+                .to_owned(),
+        )
+    };
+    let tier = |name: &str| -> Result<PfcThresholds, CompileError> {
+        let mut found = rows.iter().filter(|row| row.tier == name);
+        let row = found.next().ok_or_else(invalid)?;
+        if found.next().is_some() {
+            return Err(invalid());
+        }
+        let xoff: [u64; 8] = row.xoff.as_slice().try_into().map_err(|_| invalid())?;
+        let mut xon: [u64; 8] = row.xon.as_slice().try_into().map_err(|_| invalid())?;
+        for priority in 0..8 {
+            if xoff[priority] == 0 {
+                xon[priority] = 0;
+            }
+        }
+        Ok((xoff, xon))
+    };
+    if rows.len() != 2 {
+        return Err(invalid());
+    }
+    let tiers = [tier("asw")?, tier("psw")?];
+    if (0..8).any(|priority| (tiers[0].0[priority] == 0) != (tiers[1].0[priority] == 0)) {
+        return Err(invalid());
+    }
+    Ok(tiers)
+}
+
+/// `link.pfc.headroom_by_rate`: one positive headroom per distinct link rate.
+fn pfc_headroom_rows(rows: &[SourceHeadroomRow]) -> Result<BTreeMap<u64, u64>, CompileError> {
+    let mut headroom = BTreeMap::new();
+    for row in rows {
+        if row.rate_bps == 0 || row.bytes == 0 || headroom.insert(row.rate_bps, row.bytes).is_some()
+        {
+            return Err(CompileError::Invalid(
+                "`link.pfc.headroom_by_rate` needs one positive headroom per distinct positive rate"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(headroom)
+}
+
+/// `switch.ecn_by_rate`: one ECN ramp per distinct egress link rate, sharing the byte capacity.
+fn ecn_rows(
+    scenario_text: &str,
+    rows: &[SourceEcnRow],
+    capacity_bytes: u64,
+) -> Result<BTreeMap<u64, EcnRampPolicy>, CompileError> {
+    let mut policies = BTreeMap::new();
+    for row in rows {
+        let policy = ecn_ramp_policy(
+            scenario_text,
+            capacity_bytes,
+            row.kmin_bytes,
+            row.kmax_bytes,
+            &row.pmax,
+            "switch.ecn_by_rate",
+        )?;
+        if row.rate_bps == 0 || policies.insert(row.rate_bps, policy).is_some() {
+            return Err(CompileError::Invalid(
+                "`switch.ecn_by_rate` needs one row per distinct positive rate".to_owned(),
+            ));
+        }
+    }
+    Ok(policies)
+}
+
+/// One ECN ramp from its scenario keys: `pmax` is an exact decimal in `(0, 1]`, reduced to lowest
+/// terms, and the policy must pass the executor's own check (`ecn_ramp_policy_check`).
+fn ecn_ramp_policy(
+    scenario_text: &str,
+    capacity_bytes: u64,
+    kmin_bytes: u64,
+    kmax_bytes: u64,
+    pmax: &ExactDecimal,
+    label: &str,
+) -> Result<EcnRampPolicy, CompileError> {
+    let literal = exact_decimal_literal(scenario_text, pmax, label)?;
+    let (pmax_numerator, pmax_denominator) = decimal_probability(literal)
+        .map_err(|reason| CompileError::Invalid(format!("`{label}` {reason}")))?;
+    let policy = EcnRampPolicy {
+        capacity_bytes,
+        kmin_bytes,
+        kmax_bytes,
+        pmax_numerator,
+        pmax_denominator,
+    };
+    days_executor::ecn_ramp::ecn_ramp_policy_check(&policy)
+        .map_err(|reason| CompileError::Invalid(format!("`{label}` {reason}")))?;
+    Ok(policy)
+}
+
+/// A decimal literal in `(0, 1]` as an exact fraction in lowest terms (`0.2` is `1/5`), shared by
+/// the scenario's `pmax` and SimAI.conf's `PMAX_MAP`.
+pub(crate) fn decimal_probability(literal: &str) -> Result<(u64, u64), String> {
+    let invalid = || format!("pmax must be a decimal in (0, 1], got `{}`", literal.trim());
+    let parsed = parsed_decimal(literal, "pmax").map_err(|_| invalid())?;
+    if parsed.negative || parsed.digits.chars().all(|digit| digit == '0') {
+        return Err(invalid());
+    }
+    let digits = parsed.digits.parse::<u128>().map_err(|_| invalid())?;
+    let (numerator, denominator) = if parsed.power >= 0 {
+        let power = u32::try_from(parsed.power).map_err(|_| invalid())?;
+        let scale = 10_u128.checked_pow(power).ok_or_else(invalid)?;
+        (digits.checked_mul(scale).ok_or_else(invalid)?, 1)
+    } else {
+        let power = u32::try_from(parsed.power.unsigned_abs()).map_err(|_| invalid())?;
+        (digits, 10_u128.checked_pow(power).ok_or_else(invalid)?)
+    };
+    if numerator > denominator {
+        return Err(invalid());
+    }
+    let divisor = gcd_u128(numerator, denominator);
+    let reduced = (numerator / divisor, denominator / divisor);
+    Ok((
+        u64::try_from(reduced.0).map_err(|_| invalid())?,
+        u64::try_from(reduced.1).map_err(|_| invalid())?,
+    ))
+}
+
+const fn gcd_u128(mut left: u128, mut right: u128) -> u128 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
 }
 
 fn exact_pfc_array(values: Option<&[u64]>, field: &str) -> Result<[u64; 8], CompileError> {
@@ -1227,10 +1892,23 @@ fn collective_algorithm(name: &str) -> Result<CollectiveAlgorithm, CompileError>
     match name {
         "RingAllReduce" => Ok(CollectiveAlgorithm::RingAllReduce),
         "AllGather" => Ok(CollectiveAlgorithm::AllGather),
+        "ReduceScatter" => Ok(CollectiveAlgorithm::ReduceScatter),
+        "AllToAll" => Ok(CollectiveAlgorithm::AllToAll),
+        "SendRecv" => Ok(CollectiveAlgorithm::SendRecv),
         unsupported => Err(CompileError::Unsupported(format!(
-            "unsupported collective algorithm `{unsupported}`; T26 supports RingAllReduce and AllGather"
+            "unsupported collective algorithm `{unsupported}`; Days lowers RingAllReduce, AllGather, ReduceScatter, AllToAll and SendRecv"
         ))),
     }
+}
+
+/// Whether `algorithm` runs on rings (and so has channels and ring sinks).
+const fn is_ring_algorithm(algorithm: CollectiveAlgorithm) -> bool {
+    matches!(
+        algorithm,
+        CollectiveAlgorithm::RingAllReduce
+            | CollectiveAlgorithm::AllGather
+            | CollectiveAlgorithm::ReduceScatter
+    )
 }
 
 /// Collectives run over a reliable transport, TCP or RoCE queue pairs: a stage completes when its
@@ -1262,6 +1940,7 @@ fn collective_key(
     paths: Option<&[Vec<u64>]>,
     graph: Option<&[(u64, u64)]>,
     traffic: SourceTraffic,
+    has_channels: bool,
     scenario_text: &str,
     roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<CollectiveKey, CompileError> {
@@ -1290,28 +1969,59 @@ fn collective_key(
             "collective priority must be in IEEE 802.1Q range 0..=7".to_owned(),
         ));
     }
-    if flow_count == 0 || algorithm == CollectiveAlgorithm::RingAllReduce && flow_count < 2 {
+    if flow_count == 0
+        || algorithm == CollectiveAlgorithm::RingAllReduce && flow_count < 2
+        || algorithm == CollectiveAlgorithm::SendRecv && flow_count != 2
+    {
         return Err(CompileError::Invalid(match algorithm {
             CollectiveAlgorithm::RingAllReduce => {
                 "RingAllReduce flow_count must be at least 2".to_owned()
             }
-            CollectiveAlgorithm::AllGather => "AllGather flow_count must be at least 1".to_owned(),
+            CollectiveAlgorithm::SendRecv => {
+                "SendRecv flow_count must be 2: sources = [sender, receiver]".to_owned()
+            }
+            other => format!("{other:?} flow_count must be at least 1"),
         }));
     }
-    if sources.is_empty() != sinks.is_empty() {
+    if !is_ring_algorithm(algorithm) {
+        if !sinks.is_empty() {
+            return Err(CompileError::Invalid(format!(
+                "{algorithm:?} takes `sources` only: no `sinks`"
+            )));
+        }
+        if algorithm == CollectiveAlgorithm::SendRecv && sources.len() != 2 {
+            return Err(CompileError::Invalid(
+                "SendRecv requires sources = [sender, receiver]".to_owned(),
+            ));
+        }
+        if !sources.is_empty() && sources.len() != flow_count as usize {
+            return Err(CompileError::Invalid(format!(
+                "collective sources must contain flow_count={flow_count} entries"
+            )));
+        }
+    } else if has_channels {
+        // Ring channels replace `sinks`; `shape_collective` checks them against the sources.
+        if sources.len() != flow_count as usize || !sinks.is_empty() {
+            return Err(CompileError::Invalid(format!(
+                "ring channels take flow_count={flow_count} `sources` and no `sinks`"
+            )));
+        }
+    } else if sources.is_empty() != sinks.is_empty() {
         return Err(CompileError::Invalid(
             "collective sources and sinks must either both be provided or both be omitted"
                 .to_owned(),
         ));
     }
-    if !sources.is_empty()
+    if is_ring_algorithm(algorithm)
+        && !has_channels
+        && !sources.is_empty()
         && (sources.len() != flow_count as usize || sinks.len() != flow_count as usize)
     {
         return Err(CompileError::Invalid(format!(
             "collective sources and sinks must each contain flow_count={flow_count} entries"
         )));
     }
-    if !sources.is_empty() {
+    if is_ring_algorithm(algorithm) && !has_channels && !sources.is_empty() {
         for rank in 0..sources.len() {
             if sinks[rank] != sources[(rank + 1) % sources.len()] {
                 return Err(CompileError::Invalid(format!(
@@ -1342,7 +2052,7 @@ fn collective_key(
             "RingAllReduce byte size {total_bytes} must be at least flow_count {flow_count}"
         )));
     }
-    if total_bytes < flow_count {
+    if total_bytes < flow_count || algorithm == CollectiveAlgorithm::SendRecv && total_bytes == 0 {
         // EqualRemainderLast would leave an empty chunk, and a TCP flow or a RoCE queue pair must
         // carry bytes.
         let transport = if flow_kind == SourceFlowKind::Roce {
@@ -1355,6 +2065,7 @@ fn collective_key(
         )));
     }
     Ok(CollectiveKey {
+        issue_ordinal: None,
         algorithm,
         flow_count,
         sources,
@@ -1363,7 +2074,122 @@ fn collective_key(
         traffic,
         name: None,
         after: None,
+        shape: None,
+        chunk: CollectiveChunkPolicy::EqualRemainderLast,
     })
+}
+
+/// Attaches a collective's ring channels, chunk policy and seeded all-to-all sizes, and checks
+/// that every message carries a byte. The compiler checks nothing SimAI-specific: SimAI's size
+/// clamps and its skipping of empty rings belong to the AICB adapter (ruling R8).
+fn shape_collective(
+    key: &mut CollectiveKey,
+    channels: Option<Vec<Vec<u64>>>,
+    chunk: Option<&str>,
+    seeded: Option<SeededAllToAll>,
+) -> Result<(), CompileError> {
+    let algorithm = key.algorithm;
+    let n = key.flow_count;
+    let Termination::Bytes(total_bytes) = key.traffic.termination else {
+        unreachable!("collective validation requires byte termination")
+    };
+    key.chunk = match chunk {
+        None => match algorithm {
+            CollectiveAlgorithm::AllToAll => CollectiveChunkPolicy::UniformFloor,
+            _ => CollectiveChunkPolicy::EqualRemainderLast,
+        },
+        Some("EqualRemainderLast") if is_ring_algorithm(algorithm) => {
+            CollectiveChunkPolicy::EqualRemainderLast
+        }
+        Some("UniformFloor") if algorithm != CollectiveAlgorithm::SendRecv => {
+            CollectiveChunkPolicy::UniformFloor
+        }
+        Some(other) => {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported {algorithm:?} chunk policy `{other}`; rings take EqualRemainderLast or UniformFloor, an all-to-all UniformFloor"
+            )));
+        }
+    };
+    if let Some(channels) = channels {
+        if !is_ring_algorithm(algorithm) {
+            return Err(CompileError::Invalid(format!(
+                "{algorithm:?} has no ring channels"
+            )));
+        }
+        if !key.sinks.is_empty() || key.sources.is_empty() {
+            return Err(CompileError::Invalid(
+                "ring channels take `sources` (the ranks in order) and no `sinks`".to_owned(),
+            ));
+        }
+        if channels.is_empty() {
+            return Err(CompileError::Invalid("`channels` lists no ring".to_owned()));
+        }
+        let mut sorted = key.sources.clone();
+        sorted.sort_unstable();
+        let mut rings = Vec::with_capacity(channels.len());
+        for ring in &channels {
+            let mut members = ring.clone();
+            members.sort_unstable();
+            if members != sorted {
+                return Err(CompileError::Invalid(
+                    "every ring channel must order exactly the collective's sources".to_owned(),
+                ));
+            }
+            rings.push(
+                ring.iter()
+                    .map(|host| {
+                        let rank = key
+                            .sources
+                            .iter()
+                            .position(|source| source == host)
+                            .expect("a channel member is a source");
+                        u32::try_from(rank).expect("the group size fits u32")
+                    })
+                    .collect(),
+            );
+        }
+        if rings.len() > 1 && key.chunk != CollectiveChunkPolicy::UniformFloor {
+            return Err(CompileError::Invalid(
+                "a collective of several ring channels requires chunk = \"UniformFloor\""
+                    .to_owned(),
+            ));
+        }
+        key.shape.get_or_insert_with(Box::default).channels = rings;
+    }
+    if let Some(seeded) = seeded {
+        if algorithm != CollectiveAlgorithm::AllToAll {
+            return Err(CompileError::Invalid(
+                "`[collective.alltoall]` sizes apply to an AllToAll only".to_owned(),
+            ));
+        }
+        if seeded.experts == 0 || seeded.experts % n != 0 {
+            return Err(CompileError::Invalid(format!(
+                "all-to-all experts {} must be a positive multiple of the {n} ranks",
+                seeded.experts
+            )));
+        }
+        if seeded.routed_bytes_per_source() != Some(total_bytes) {
+            return Err(CompileError::Invalid(format!(
+                "a seeded all-to-all's size {total_bytes} must equal tokens x topk x bytes_per_copy"
+            )));
+        }
+        key.chunk = CollectiveChunkPolicy::Seeded;
+        key.shape.get_or_insert_with(Box::default).seeded = Some(seeded);
+    }
+    let channel_count = key.channels().len().max(1) as u64;
+    let message = match algorithm {
+        CollectiveAlgorithm::SendRecv => total_bytes,
+        _ if key.chunk == CollectiveChunkPolicy::Seeded => 1,
+        CollectiveAlgorithm::AllToAll => total_bytes / n,
+        _ if key.chunk == CollectiveChunkPolicy::UniformFloor => total_bytes / n / channel_count,
+        _ => total_bytes / n,
+    };
+    if message == 0 && n > 1 {
+        return Err(CompileError::Invalid(format!(
+            "{algorithm:?} of {total_bytes} bytes over {n} ranks and {channel_count} channels sends empty messages; every message must carry a byte"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_compute(source: SourceCompute) -> Result<ComputeKey, CompileError> {
@@ -1402,6 +2228,8 @@ fn validate_collective(
     roce_keys: &mut Vec<RoceTrafficKey>,
 ) -> Result<CollectiveKey, CompileError> {
     let (name, after) = (source.name, source.after);
+    let (channels, chunk, alltoall) = (source.channels, source.chunk, source.alltoall);
+    let issue_ordinal = source.issue_ordinal;
     let mut key = collective_key(
         &source.collective_type,
         source.flow_type.as_deref(),
@@ -1414,12 +2242,179 @@ fn validate_collective(
         source.paths.as_deref(),
         source.graph.as_deref(),
         source.traffic,
+        channels.is_some(),
         scenario_text,
         roce_keys,
     )?;
     key.name = name;
     key.after = after;
+    key.issue_ordinal = issue_ordinal_key(issue_ordinal)?;
+    let seeded = alltoall
+        .map(|table| seeded_all_to_all(*table))
+        .transpose()?;
+    shape_collective(&mut key, channels, chunk.as_deref(), seeded)?;
     Ok(key)
+}
+
+/// A collective's issue ordinal as its key holds it (`ordinal + 1`), refusing one that does not
+/// fit.
+fn issue_ordinal_key(ordinal: Option<u64>) -> Result<Option<std::num::NonZeroU32>, CompileError> {
+    ordinal
+        .map(|ordinal| {
+            ordinal
+                .checked_add(1)
+                .and_then(|value| u32::try_from(value).ok())
+                .and_then(std::num::NonZeroU32::new)
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "collective issue_ordinal {ordinal} is above {}",
+                        u32::MAX - 1
+                    ))
+                })
+        })
+        .transpose()
+}
+
+/// A `[collective.alltoall]` table's seeded matrix.
+fn seeded_all_to_all(source: SourceAllToAll) -> Result<SeededAllToAll, CompileError> {
+    let skew = match source.skew.as_deref() {
+        None | Some("Zipf1") => RoutingSkew::Zipf1,
+        Some("Uniform") => RoutingSkew::Uniform,
+        Some(other) => {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported all-to-all routing skew `{other}`; Days draws Zipf1 or Uniform"
+            )));
+        }
+    };
+    Ok(SeededAllToAll {
+        seed: source.seed,
+        matrix: source.matrix,
+        group: source.group,
+        transpose: source.transpose,
+        experts: source.experts,
+        topk: source.topk,
+        tokens: source.tokens,
+        bytes_per_copy: source.bytes_per_copy,
+        skew,
+    })
+}
+
+/// The collectives and compute groups of a typed workload, validated as their TOML rendering
+/// would be: operation `i` is the stage group `@i`.
+fn workload_keys(
+    workload: &super::workload::Workload,
+    roce_keys: &mut Vec<RoceTrafficKey>,
+    streams: &mut BTreeMap<String, u32>,
+) -> Result<(Vec<CollectiveKey>, Vec<ComputeKey>), CompileError> {
+    use super::workload::OperationKind;
+    let transports = workload
+        .transports
+        .iter()
+        .map(|transport| {
+            toml::from_str::<SourceTraffic>(&transport.traffic)
+                .map(|traffic| (transport, traffic))
+                .map_err(CompileError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let name = |index: usize| format!("@{index}");
+    let mut collectives = Vec::new();
+    let mut computes = Vec::new();
+    for (index, operation) in workload.operations.iter().enumerate() {
+        let hosts = workload.groups.get(operation.group).ok_or_else(|| {
+            CompileError::Invalid(format!("workload operation {index} names an unknown group"))
+        })?;
+        if let Some(&after) = operation
+            .after
+            .iter()
+            .find(|&&after| after >= workload.operations.len())
+        {
+            return Err(CompileError::Invalid(format!(
+                "workload operation {index} follows unknown operation {after}"
+            )));
+        }
+        if operation.stream != 0 {
+            streams.insert(name(index), operation.stream);
+        }
+        let after = match operation.after.as_slice() {
+            [] => None,
+            [one] => Some(AfterGroups::One(name(*one))),
+            many => Some(AfterGroups::Many(
+                many.iter().map(|&after| name(after)).collect(),
+            )),
+        };
+        match &operation.kind {
+            OperationKind::Compute { duration_ns } => {
+                computes.push(validate_compute(SourceCompute {
+                    name: name(index),
+                    hosts: hosts.clone(),
+                    duration_ns: *duration_ns,
+                    after,
+                    stream: None,
+                })?)
+            }
+            OperationKind::Collective(collective) => {
+                let (transport, template) =
+                    transports.get(collective.transport).ok_or_else(|| {
+                        CompileError::Invalid(format!(
+                            "workload operation {index} names an unknown transport"
+                        ))
+                    })?;
+                let mut traffic = template.clone();
+                traffic.size = Some(collective.bytes);
+                let ring = collective.channels.is_none()
+                    && !matches!(
+                        collective.algorithm,
+                        super::workload::Algorithm::AllToAll | super::workload::Algorithm::SendRecv
+                    );
+                let sinks = if ring {
+                    hosts
+                        .iter()
+                        .cycle()
+                        .skip(1)
+                        .take(hosts.len())
+                        .copied()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let mut key = collective_key(
+                    collective.algorithm.collective_type(),
+                    Some(transport.flow_type.as_str()),
+                    hosts.len() as u64,
+                    hosts.clone(),
+                    sinks,
+                    Some(transport.priority),
+                    None,
+                    None,
+                    None,
+                    None,
+                    traffic,
+                    collective.channels.is_some(),
+                    &transport.traffic,
+                    roce_keys,
+                )?;
+                key.name = Some(name(index));
+                key.after = after;
+                key.issue_ordinal = issue_ordinal_key(collective.issue_ordinal)?;
+                let chunk = if collective.uniform_floor {
+                    "UniformFloor"
+                } else {
+                    "EqualRemainderLast"
+                };
+                let chunk = (collective.algorithm != super::workload::Algorithm::SendRecv
+                    && collective.seeded.is_none())
+                .then_some(chunk);
+                shape_collective(
+                    &mut key,
+                    collective.channels.clone(),
+                    chunk,
+                    collective.seeded,
+                )?;
+                collectives.push(key);
+            }
+        }
+    }
+    Ok((collectives, computes))
 }
 
 fn validate_collective_set(
@@ -1442,7 +2437,7 @@ fn validate_collective_set(
     }
     let mut result = Vec::with_capacity(count);
     for (collective_sources, collective_sinks) in sources.into_iter().zip(sinks) {
-        result.push(collective_key(
+        let mut key = collective_key(
             &source.collective_type,
             source.flow_type.as_deref(),
             source.flow_count,
@@ -1454,9 +2449,15 @@ fn validate_collective_set(
             None,
             None,
             source.traffic.clone(),
+            false,
             scenario_text,
             roce_keys,
-        )?);
+        )?;
+        // Each member is shaped as the same `[[collective]]` block without `channels`, `chunk`
+        // or `[collective.alltoall]` is (an all-to-all's UniformFloor chunk, a ring's
+        // EqualRemainderLast), which a set cannot declare.
+        shape_collective(&mut key, None, None, None)?;
+        result.push(key);
     }
     Ok(result)
 }
@@ -1468,70 +2469,82 @@ fn dcqcn_traffic_key(
     priority: u8,
     scenario_text: &str,
 ) -> Result<DcqcnTrafficKey, CompileError> {
+    for (present, key, reason) in [
+        (
+            dcqcn.mi_factor.is_some(),
+            "mi_factor",
+            "the Mellanox-form cut is alpha / 2",
+        ),
+        (
+            dcqcn.rtt_ns.is_some(),
+            "rtt_ns",
+            "the rate-increase timer is `rp_timer_ns`",
+        ),
+        (
+            dcqcn.increase_byte_threshold.is_some(),
+            "increase_byte_threshold",
+            "the Mellanox form has no byte counter",
+        ),
+    ] {
+        if present {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported paper-form DCQCN key `{key}` (removed in P16: {reason}); see docs/content/docs/configuration/flows.mdx"
+            )));
+        }
+    }
+    let gbps = |value: Option<&ExactDecimal>, default: &str, label: &str| {
+        optional_scaled_decimal(scenario_text, value, default, 1_000_000_000, label)
+    };
+    let nanoseconds = |value: Option<&ExactDecimal>, default: &str, label: &str| {
+        optional_scaled_decimal(scenario_text, value, default, 1, label)
+    };
+    let maximum_rate_bps = scaled_decimal(
+        scenario_text,
+        &dcqcn.max_rate_gbps,
+        1_000_000_000,
+        "DCQCN maximum rate",
+    )?;
+    let g_literal = match dcqcn.g.as_ref() {
+        Some(value) => exact_decimal_literal(scenario_text, value, "DCQCN g")?,
+        None => "0.00390625",
+    };
     let key = DcqcnTrafficKey {
-        initial_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.rate_gbps,
-            1_000_000_000,
-            "DCQCN rate",
+        initial_rate_bps: match dcqcn.rate_gbps.as_ref() {
+            Some(value) => scaled_decimal(scenario_text, value, 1_000_000_000, "DCQCN rate")?,
+            None => maximum_rate_bps,
+        },
+        minimum_rate_bps: gbps(dcqcn.min_rate_gbps.as_ref(), "0.1", "DCQCN minimum rate")?,
+        maximum_rate_bps,
+        additive_rate_bps: gbps(dcqcn.ai_rate_gbps.as_ref(), "0.05", "DCQCN additive rate")?,
+        hyper_rate_bps: gbps(dcqcn.hai_rate_gbps.as_ref(), "0.1", "DCQCN hyper rate")?,
+        g_q63: q63_decimal_literal(g_literal, "DCQCN g")?,
+        alpha_interval_ns: nanoseconds(
+            dcqcn.alpha_resume_interval_ns.as_ref(),
+            "1000",
+            "DCQCN alpha resume interval ns",
         )?,
-        minimum_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.min_rate_gbps,
-            1_000_000_000,
-            "DCQCN minimum rate",
+        decrease_interval_ns: nanoseconds(
+            dcqcn.rate_decrease_interval_ns.as_ref(),
+            "4000",
+            "DCQCN rate decrease interval ns",
         )?,
-        maximum_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.max_rate_gbps,
-            1_000_000_000,
-            "DCQCN maximum rate",
+        increase_interval_ns: nanoseconds(
+            dcqcn.rp_timer_ns.as_ref(),
+            "900000",
+            "DCQCN rp timer ns",
         )?,
-        additive_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.ai_rate_gbps,
-            1_000_000_000,
-            "DCQCN additive rate",
-        )?,
-        hyper_rate_bps: scaled_decimal(
-            scenario_text,
-            &dcqcn.hai_rate_gbps,
-            1_000_000_000,
-            "DCQCN hyper rate",
-        )?,
-        g_ppb: scaled_decimal(scenario_text, &dcqcn.g, 1_000_000_000, "DCQCN g ppb")?,
-        decrease_ppb: scaled_decimal(
-            scenario_text,
-            &dcqcn.mi_factor,
-            1_000_000_000,
-            "DCQCN decrease ppb",
-        )?,
-        cnp_interval_ns: optional_scaled_decimal(
-            scenario_text,
-            dcqcn.cnp_interval_ns.as_ref(),
-            "50000",
-            1,
-            "DCQCN CNP interval ns",
-        )?,
-        control_interval_ns: optional_scaled_decimal(
-            scenario_text,
-            dcqcn.rtt_ns.as_ref(),
-            "100000",
-            1,
-            "DCQCN control interval ns",
-        )?,
-        pacing_interval_ns: optional_scaled_decimal(
-            scenario_text,
+        fast_recovery_steps: dcqcn.fast_recovery_times.unwrap_or(1),
+        clamp_target_rate: dcqcn.clamp_target_rate.unwrap_or(false),
+        cnp_interval_ns: nanoseconds(dcqcn.cnp_interval_ns.as_ref(), "0", "DCQCN CNP interval ns")?,
+        pacing_interval_ns: nanoseconds(
             dcqcn.pacing_interval_ns.as_ref(),
             "1000",
-            1,
             "DCQCN pacing interval ns",
         )?,
         // The flow's feedback priority (P15 ruling D6): CNPs ride the data class unless
         // the flow names another. Before P15 the default was 0 and any other value had to
         // equal the flow priority, so every config accepted then keeps its key.
         cnp_priority: dcqcn.cnp_priority.unwrap_or(priority),
-        increase_byte_threshold: dcqcn.increase_byte_threshold.unwrap_or(10_000_000),
     };
     if key.pacing_interval_ns == 0 {
         return Err(CompileError::Invalid(
@@ -1543,21 +2556,105 @@ fn dcqcn_traffic_key(
             "DCQCN CNP priority must be in IEEE 802.1Q range 0..=7".to_owned(),
         ));
     }
+    dcqcn_controller_config(key)
+        .validate()
+        .map_err(|error| CompileError::Invalid(error.to_string()))?;
+    Ok(key)
+}
+
+impl DcqcnTrafficKey {
+    /// The key's content, in declaration order, for the flow seed.
+    const fn seed_words(self) -> [u64; 14] {
+        [
+            self.initial_rate_bps,
+            self.minimum_rate_bps,
+            self.maximum_rate_bps,
+            self.additive_rate_bps,
+            self.hyper_rate_bps,
+            self.g_q63,
+            self.alpha_interval_ns,
+            self.decrease_interval_ns,
+            self.increase_interval_ns,
+            self.fast_recovery_steps as u64,
+            self.clamp_target_rate as u64,
+            self.cnp_interval_ns,
+            self.pacing_interval_ns,
+            self.cnp_priority as u64,
+        ]
+    }
+}
+
+/// The controller configuration a lowered DCQCN key names.
+const fn dcqcn_controller_config(key: DcqcnTrafficKey) -> DcqcnControllerConfig {
     DcqcnControllerConfig {
         initial_rate_bps: key.initial_rate_bps,
         minimum_rate_bps: key.minimum_rate_bps,
         maximum_rate_bps: key.maximum_rate_bps,
         additive_rate_bps: key.additive_rate_bps,
         hyper_rate_bps: key.hyper_rate_bps,
-        g_ppb: key.g_ppb,
-        decrease_ppb: key.decrease_ppb,
-        cnp_interval_ns: key.cnp_interval_ns,
-        control_interval_ns: key.control_interval_ns,
-        increase_byte_threshold: key.increase_byte_threshold,
+        g_q63: key.g_q63,
+        alpha_interval_ns: key.alpha_interval_ns,
+        decrease_interval_ns: key.decrease_interval_ns,
+        increase_interval_ns: key.increase_interval_ns,
+        fast_recovery_steps: key.fast_recovery_steps,
+        clamp_target_rate: key.clamp_target_rate,
     }
-    .validate()
-    .map_err(|error| CompileError::Invalid(error.to_string()))?;
-    Ok(key)
+}
+
+/// An exact decimal `0 <= g <= 1` in Q63 (`1` is `2^63`), rounded half to even: exact for every
+/// dyadic gain down to 2^-63 (1/16, 1/256, 1/1024, ...), and within 2^-64 otherwise (P16 design
+/// note §1.6). At most 19 significant digits and 38 fractional places are accepted; integer
+/// arithmetic only.
+fn q63_decimal_literal(literal: &str, label: &str) -> Result<u64, CompileError> {
+    let literal = literal.trim();
+    let parsed = parsed_decimal(literal, label)?;
+    let out_of_range = || CompileError::Invalid(format!("{label} must be in 0..=1, got {literal}"));
+    if parsed.negative && parsed.digits != "0" {
+        return Err(out_of_range());
+    }
+    if parsed.digits == "0" {
+        return Ok(0);
+    }
+    if parsed.digits.len() > 19 || parsed.power < -38 {
+        return Err(CompileError::Unsupported(format!(
+            "unsupported {label} `{literal}`; at most 19 significant digits and 38 decimal places"
+        )));
+    }
+    let digits = parsed.digits.parse::<u128>().map_err(|_| out_of_range())?;
+    let (numerator, denominator) = if parsed.power >= 0 {
+        let scale = 10_u128
+            .checked_pow(u32::try_from(parsed.power).map_err(|_| out_of_range())?)
+            .ok_or_else(out_of_range)?;
+        (digits.checked_mul(scale).ok_or_else(out_of_range)?, 1_u128)
+    } else {
+        (digits, 10_u128.pow(parsed.power.unsigned_abs() as u32))
+    };
+    if numerator > denominator {
+        return Err(out_of_range());
+    }
+    // numerator <= denominator <= 10^38 < 2^127: binary long division stays within u128.
+    long_q63(numerator, denominator).ok_or_else(out_of_range)
+}
+
+/// `round_half_even(numerator * 2^63 / denominator)` for `numerator <= denominator`, by binary long
+/// division (exact for any `denominator < 2^127`).
+fn long_q63(numerator: u128, denominator: u128) -> Option<u64> {
+    let mut quotient: u128 = numerator / denominator;
+    let mut rest = numerator % denominator;
+    for _ in 0..63 {
+        rest <<= 1;
+        quotient <<= 1;
+        if rest >= denominator {
+            rest -= denominator;
+            quotient |= 1;
+        }
+    }
+    // Round half to even on the remainder.
+    let twice = rest << 1;
+    if twice > denominator || twice == denominator && quotient & 1 == 1 {
+        quotient += 1;
+    }
+    u64::try_from(quotient).ok().filter(|&q| q <= 1 << 63)
 }
 
 /// Validates one flow's traffic options. `priority` is the flow's IEEE 802.1Q class, the default
@@ -1592,6 +2689,7 @@ fn validate_traffic(
             }
             let interval_ns = constant_distribution_scaled(
                 &traffic.arr_dist,
+                "arr_dist",
                 scenario_text,
                 1_000_000_000,
                 "packet arrival distribution",
@@ -1721,7 +2819,13 @@ fn validate_traffic(
             })?;
             if dcqcn.cnp_priority.is_some() {
                 return Err(CompileError::Unsupported(
-                    "unsupported `cnp_priority` on RoCE traffic; set the CNP, ACK and NACK class with `[flow.traffic.roce] feedback_priority`"
+                    "unsupported `cnp_priority` on RoCE traffic; set the ACK and NACK class with `[flow.traffic.roce] feedback_priority`"
+                        .to_owned(),
+                ));
+            }
+            if dcqcn.cnp_interval_ns.is_some() {
+                return Err(CompileError::Unsupported(
+                    "unsupported `cnp_interval_ns` on RoCE traffic: a queue pair's receiver echoes ECN on its ACKs and NACKs and sends no CNP (P16)"
                         .to_owned(),
                 ));
             }
@@ -1740,6 +2844,12 @@ fn validate_traffic(
             if size == 0 {
                 return Err(CompileError::Invalid(
                     "RoCE traffic `size` must be positive".to_owned(),
+                ));
+            }
+            // An ACK echoes the size of the packet it answers in 32 bits (P16 ruling D6).
+            if packet_size_bytes > u64::from(u32::MAX) {
+                return Err(CompileError::Unsupported(
+                    "unsupported RoCE packet size above 4294967295 bytes".to_owned(),
                 ));
             }
             let feedback_priority = roce.feedback_priority.unwrap_or(priority);
@@ -1775,6 +2885,14 @@ fn validate_traffic(
                         .to_owned(),
                 ));
             }
+            let window_bytes = roce.window_bytes.unwrap_or(0);
+            let variable_window = roce.variable_window.unwrap_or(false);
+            if variable_window && window_bytes == 0 {
+                return Err(CompileError::Invalid(
+                    "RoCE `variable_window = true` needs a window: set `window_bytes` above 0"
+                        .to_owned(),
+                ));
+            }
             let key = RoceTrafficKey {
                 dcqcn: controller,
                 retransmit_timeout_ns,
@@ -1782,6 +2900,8 @@ fn validate_traffic(
                 nack_interval_ns: roce.nack_interval_ns.unwrap_or(500_000),
                 duplicate_ack,
                 ack_size_bytes,
+                window_bytes,
+                variable_window,
             };
             let ordinal = roce_keys
                 .iter()
@@ -1810,6 +2930,11 @@ fn validate_traffic(
         packet_size_bytes,
         termination,
         kind,
+    })
+    .and_then(|key| {
+        check_distribution_keys(&traffic.arr_dist, "arr_dist", scenario_text)?;
+        check_distribution_keys(&traffic.pkt_size_dist, "pkt_size_dist", scenario_text)?;
+        Ok(key)
     })
 }
 
@@ -1842,10 +2967,18 @@ enum ParsedSourceDistribution<'a> {
     Uniform { low: &'a str, high: &'a str },
 }
 
-fn source_distribution<'a>(
+/// The text between the braces of the distribution `name` (`arr_dist` or `pkt_size_dist`).
+/// Executor distributions are inline tables only: one written as a sub-table or as dotted keys
+/// is refused, naming the key and the table (a2aset fix round 2, ruling option (a)). Its span is
+/// then its header or its key, never a `{ ... }` value. The table must also fit on one line,
+/// without comments or a trailing comma (fix round 3): TOML 1.1 allows all three, but the exact
+/// readers split the text on `,` and `=`, so a commented-out `low = ...` would override the live
+/// value.
+fn inline_distribution<'a>(
     distribution: &SourceDistributionInfo,
+    name: &str,
     scenario_text: &'a str,
-) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+) -> Result<&'a str, CompileError> {
     let literal = scenario_text
         .get(distribution.span.clone())
         .ok_or_else(|| {
@@ -1853,13 +2986,31 @@ fn source_distribution<'a>(
                 "distribution source span is outside the scenario text".to_owned(),
             )
         })?;
+    let refuse = |rule: &str| {
+        let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+        CompileError::Invalid(format!(
+            "executor distributions must use {rule} in `{name}` (in {table})"
+        ))
+    };
     let body = literal
         .trim()
         .strip_prefix('{')
         .and_then(|body| body.strip_suffix('}'))
-        .ok_or_else(|| {
-            CompileError::Invalid("executor distributions must use an inline TOML table".to_owned())
-        })?;
+        .ok_or_else(|| refuse("an inline TOML table"))?;
+    if body.contains(['#', '\n', '\r']) || body.trim_end().ends_with(',') {
+        return Err(refuse(
+            "a one-line inline TOML table without comments or a trailing comma",
+        ));
+    }
+    Ok(body)
+}
+
+fn source_distribution<'a>(
+    distribution: &SourceDistributionInfo,
+    name: &str,
+    scenario_text: &'a str,
+) -> Result<ParsedSourceDistribution<'a>, CompileError> {
+    let body = inline_distribution(distribution, name, scenario_text)?;
     let mut fields = BTreeMap::new();
     for field in body.split(',') {
         let (key, value) = field.split_once('=').ok_or_else(|| {
@@ -1907,6 +3058,100 @@ fn source_distribution<'a>(
     }
 }
 
+/// The fields of each distribution type and whether they are integers: those of
+/// [`super::DistributionInfo`], the shared strict schema (`distribution_fields_match_the_shared_schema`
+/// keeps the two equal). Only [`check_distribution_keys`]'s allocation-free fast path reads them.
+const DISTRIBUTION_FIELDS: [(&str, &[&str], bool); 3] = [
+    ("DiscreteUniform", &["low", "high"], true),
+    ("Exp", &["lambda"], false),
+    ("Uniform", &["low", "high"], false),
+];
+
+/// Whether `value`, a value of a document TOML already parsed, is a number the shared schema
+/// takes: a decimal integer, or (unless `integer`) any TOML float or integer. Hex, octal, and
+/// binary integers, and every non-number (string, table, array, boolean, date), say no and go
+/// to the schema.
+fn plain_number(value: &str, integer: bool) -> bool {
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    if integer {
+        return !unsigned.is_empty() && unsigned.bytes().all(|b| b.is_ascii_digit() || b == b'_');
+    }
+    if unsigned == "inf" || unsigned == "nan" {
+        return true;
+    }
+    let bytes = unsigned.as_bytes();
+    !bytes.is_empty()
+        && bytes[0].is_ascii_digit()
+        && bytes.iter().enumerate().all(|(index, &b)| match b {
+            b'0'..=b'9' | b'_' | b'.' | b'e' | b'E' => true,
+            b'+' | b'-' => matches!(bytes[index - 1], b'e' | b'E'),
+            _ => false,
+        })
+}
+
+/// Whether an inline distribution table's keys (`body`, the text between its braces) are exactly `type` and its type's fields, each
+/// once and each a plain number (a `key = value` list, as every scenario writes it): then the
+/// shared schema accepts it. Anything else goes to the schema, which also accepts what this scan
+/// cannot read.
+fn distribution_keys_are_exact(body: &str) -> bool {
+    let entries = || {
+        body.split(',').map(|field| {
+            field
+                .split_once('=')
+                .map(|(key, value)| (key.trim(), value.trim()))
+        })
+    };
+    let Some(kind) = entries().find_map(|entry| {
+        entry
+            .filter(|(key, _)| *key == "type")
+            .and_then(|(_, value)| value.strip_prefix('"')?.strip_suffix('"'))
+    }) else {
+        return false;
+    };
+    let Some((_, fields, integer)) = DISTRIBUTION_FIELDS.iter().find(|(name, ..)| *name == kind)
+    else {
+        return false;
+    };
+    let mut count = 0;
+    for entry in entries() {
+        let Some((key, value)) = entry else {
+            return false;
+        };
+        if key != "type" && !(fields.contains(&key) && plain_number(value, *integer)) {
+            return false;
+        }
+        count += 1;
+    }
+    count == fields.len() + 1
+}
+
+/// Refuses a distribution table whose keys are not exactly its type's: the shared, strict schema
+/// (`DistributionInfo`, also legacy's) refuses an unknown key or one of another type, which
+/// [`source_distribution`] (reading only the keys a type needs) and the traffic kinds that ignore
+/// a distribution would drop (a2aset fix round 1, review M1). `name` is the table's key.
+fn check_distribution_keys(
+    distribution: &SourceDistributionInfo,
+    name: &str,
+    scenario_text: &str,
+) -> Result<(), CompileError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Distribution {
+        #[allow(dead_code)]
+        distribution: super::DistributionInfo,
+    }
+    let body = inline_distribution(distribution, name, scenario_text)?;
+    // The common case, checked without allocating: exactly `type` and its type's fields.
+    if distribution_keys_are_exact(body) {
+        return Ok(());
+    }
+    toml::from_str::<Distribution>(&format!("distribution = {{{body}}}")).map_err(|error| {
+        let table = crate::utils::serde_fields::table_at(scenario_text, distribution.span.start);
+        CompileError::Invalid(format!("{} in `{name}` (in {table})", error.message()))
+    })?;
+    Ok(())
+}
+
 fn exact_i64_literal(literal: &str, label: &str) -> Result<i64, CompileError> {
     let normalized = literal.trim().replace('_', "");
     let (negative, unsigned) = if let Some(unsigned) = normalized.strip_prefix('-') {
@@ -1931,7 +3176,7 @@ fn constant_packet_size_bytes(
     distribution: &SourceDistributionInfo,
     scenario_text: &str,
 ) -> Result<u64, CompileError> {
-    match source_distribution(distribution, scenario_text)? {
+    match source_distribution(distribution, "pkt_size_dist", scenario_text)? {
         ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
             u64::try_from(low).map_err(|_| {
                 CompileError::Unsupported(format!(
@@ -1978,11 +3223,12 @@ fn constant_packet_size_bytes(
 
 fn constant_distribution_scaled(
     distribution: &SourceDistributionInfo,
+    name: &str,
     scenario_text: &str,
     scale: u64,
     label: &str,
 ) -> Result<u64, CompileError> {
-    match source_distribution(distribution, scenario_text)? {
+    match source_distribution(distribution, name, scenario_text)? {
         ParsedSourceDistribution::DiscreteUniform { low, high } if low == high => {
             let value = u64::try_from(low).map_err(|_| {
                 CompileError::Invalid(format!("{label} must be finite and nonnegative, got {low}"))
@@ -2184,48 +3430,6 @@ fn exact_decimal_is_zero(
     Ok(value.digits == "0")
 }
 
-fn exact_decimal_product_ceil(
-    scenario_text: &str,
-    value: Option<&ExactDecimal>,
-    default: &str,
-    capacity: u64,
-    label: &str,
-) -> Result<u64, CompileError> {
-    let literal = match value {
-        Some(value) => exact_decimal_literal(scenario_text, value, label)?,
-        None => default,
-    };
-    let parsed = parsed_decimal(literal, label)?;
-    let invalid = || {
-        CompileError::Invalid(
-            "ECN threshold requires finite 0 < switch.ecn_threshold <= 1 and positive capacity"
-                .to_owned(),
-        )
-    };
-    if capacity == 0 || parsed.negative || parsed.digits == "0" {
-        return Err(invalid());
-    }
-    if parsed.power >= 0 {
-        if parsed.digits == "1" && parsed.power == 0 {
-            return Ok(capacity);
-        }
-        return Err(invalid());
-    }
-    let denominator_power = usize::try_from(parsed.power.unsigned_abs()).map_err(|_| invalid())?;
-    if parsed.digits.len() > denominator_power {
-        return Err(invalid());
-    }
-    if denominator_power > parsed.digits.len().saturating_add(20) {
-        return Ok(1);
-    }
-    let denominator_power = u32::try_from(denominator_power).map_err(|_| invalid())?;
-    let numerator = parsed.digits.parse::<BigUint>().map_err(|_| invalid())?;
-    let denominator = BigUint::from(10_u8).pow(denominator_power);
-    let product = numerator * BigUint::from(capacity);
-    let threshold = (&product + &denominator - BigUint::from(1_u8)) / denominator;
-    u64::try_from(threshold).map_err(|_| invalid())
-}
-
 fn integer_radix(literal: &str) -> Option<(u32, &str)> {
     literal
         .strip_prefix("0x")
@@ -2339,7 +3543,21 @@ fn link_delay_model(
     propagation: PropagationModel,
     profile: TopologyProfile,
 ) -> Result<LinkDelay, CompileError> {
+    if let TopologyProfile::Rail(rail) = profile {
+        if !matches!(propagation, PropagationModel::Undeclared) {
+            return Err(CompileError::Unsupported(
+                "unsupported `link.propagation_ns` or `link.propagation_tiers` on a SpectrumX \
+                 topology; its link delays are `topology.spectrum_x.link_delay_ns`"
+                    .to_owned(),
+            ));
+        }
+        return Ok(LinkDelay::Rail {
+            link_delay_ns: rail.link_delay_ns,
+            nvlink_delay_ns: rail.nvlink_delay_ns,
+        });
+    }
     let tiers = match propagation {
+        PropagationModel::Undeclared => return Ok(LinkDelay::Uniform(0)),
         PropagationModel::Uniform(propagation_ns) => {
             return Ok(LinkDelay::Uniform(propagation_ns));
         }
@@ -2365,6 +3583,52 @@ fn link_delay_model(
     })
 }
 
+/// The link-rate model resolved against one built topology: `switch.port_rate` everywhere, or the
+/// rail fabric's per-class rates (NIC links and ASW–PSW uplinks, P16 H2).
+#[derive(Clone, Copy, Debug)]
+enum LinkRate {
+    Uniform(u64),
+    Rail {
+        nic_bps: u64,
+        uplink_bps: u64,
+        nvlink_bps: u64,
+    },
+}
+
+impl LinkRate {
+    fn resolve(rate_bps: Option<u64>, profile: TopologyProfile) -> Result<Self, CompileError> {
+        match (profile, rate_bps) {
+            (TopologyProfile::Rail(rail), None) => Ok(Self::Rail {
+                nic_bps: rail.nic_rate_bps,
+                uplink_bps: rail.uplink_rate_bps,
+                nvlink_bps: rail.nvlink_rate_bps,
+            }),
+            (TopologyProfile::Rail(_), Some(_)) => Err(CompileError::Unsupported(
+                "unsupported `switch.port_rate` on a SpectrumX topology; its link rates are \
+                 `topology.spectrum_x.nic_rate_bps` and `uplink_rate_bps`"
+                    .to_owned(),
+            )),
+            (_, Some(rate_bps)) => Ok(Self::Uniform(rate_bps)),
+            (_, None) => parse_rate("", None).map(Self::Uniform),
+        }
+    }
+
+    fn of(self, key: LinkKey) -> u64 {
+        match self {
+            Self::Uniform(rate_bps) => rate_bps,
+            Self::Rail {
+                nic_bps,
+                uplink_bps,
+                nvlink_bps,
+            } => match (key.source, key.target) {
+                (PhysicalNodeKey::Host(_), PhysicalNodeKey::Host(_)) => nvlink_bps,
+                (PhysicalNodeKey::Host(_), _) | (_, PhysicalNodeKey::Host(_)) => nic_bps,
+                (PhysicalNodeKey::Switch(_), PhysicalNodeKey::Switch(_)) => uplink_bps,
+            },
+        }
+    }
+}
+
 /// Propagation model resolved against one built topology.
 #[derive(Clone, Copy, Debug)]
 enum LinkDelay {
@@ -2374,12 +3638,25 @@ enum LinkDelay {
         /// First aggregation-to-core switch identity: `edge_switches + aggregation_switches`.
         core_boundary: u64,
     },
+    /// The rail fabric: NIC links and ASW–PSW links share SimAI's one `latency`; a same-server
+    /// notify lane is the two NVLink hops through the server's NVSwitch (P16 H2).
+    Rail {
+        link_delay_ns: u64,
+        nvlink_delay_ns: u64,
+    },
 }
 
 impl LinkDelay {
     fn of(self, key: LinkKey) -> u64 {
         match self {
             Self::Uniform(propagation_ns) => propagation_ns,
+            Self::Rail {
+                link_delay_ns,
+                nvlink_delay_ns,
+            } => match (key.source, key.target) {
+                (PhysicalNodeKey::Host(_), PhysicalNodeKey::Host(_)) => 2 * nvlink_delay_ns,
+                _ => link_delay_ns,
+            },
             Self::FatTreeTiers {
                 tiers,
                 core_boundary,
@@ -2407,6 +3684,7 @@ fn lower(
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
     let link_delay = link_delay_model(model.propagation, profile)?;
+    let link_rate = LinkRate::resolve(model.rate_bps, profile)?;
     let roce_keys = model.roce_keys.clone();
     let switch_topology_ids = graph
         .node_indices()
@@ -2501,25 +3779,44 @@ fn lower(
         .map(LpKey::Host)
         .chain(switch_port_keys.iter().copied())
         .collect::<Vec<_>>();
-    let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
     let CanonicalFlows {
-        flows,
+        mut flows,
         collectives: collective_table,
+        computes: compute_table,
+        seeded: seeded_all_to_alls,
+        streams: stage_streams,
     } = canonical_flows(
         model.explicit_flows,
         model.flow_sets,
-        model.collectives,
-        model.computes,
+        {
+            let (collectives, computes) =
+                single_server_delays(model.collectives, model.computes, profile)?;
+            (collectives, computes, &model.streams)
+        },
         &host_topology_ids,
         &hosts,
         model.seed,
     )?;
+    // Same-server collective messages on the rail fabric cross NVLink, which Days models
+    // delay-only: each lowers to a stage notify on a host-to-host lane (P16 H2, ruling H2-1).
+    let notify = NotifyLowering::plan(&mut flows, profile)?;
+    for &(source, target) in notify.lanes.keys() {
+        link_keys.insert(LinkKey {
+            source: PhysicalNodeKey::Host(source),
+            target: PhysicalNodeKey::Host(target),
+        });
+    }
+    let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
     let flow_ids = dense_ids(flows.iter().map(|flow| flow.key.clone()))?;
-    // Compute stages send nothing and have no route; every other flow is routed.
+    // Compute stages and stage notifies send nothing over the fabric and have no route; every
+    // other flow is routed.
     let routed_flows = flows
         .iter()
         .enumerate()
-        .filter(|(_, flow)| flow.compute.is_none());
+        .filter(|(_, flow)| flow.compute.is_none() && flow.notify_delay_ns().is_none());
+    // SimAI's ECMP picks the feedback path by its own hash, so its reverse routes are not the
+    // reversed forward routes; every other policy reverses the forward switch path.
+    let mut reverse_route_table = None;
     let route_table = match model.routing {
         RoutingPolicy::ShortestPath => compute_shortest_path_route_table_with(
             graph,
@@ -2532,6 +3829,21 @@ fn lower(
             }),
             route_workers,
         ),
+        RoutingPolicy::SimAiEcmp => {
+            let TopologyProfile::Rail(rail) = profile else {
+                return Err(CompileError::Unsupported(
+                    "unsupported `routing.policy = \"SimAiEcmp\"` on a topology that is not the \
+                     SpectrumX rail fabric"
+                        .to_owned(),
+                ));
+            };
+            let (forward, reverse) = simai_ecmp_route_tables(
+                rail,
+                routed_flows.map(|(index, flow)| (index, flow.source, flow.target)),
+            );
+            reverse_route_table = Some(reverse);
+            Ok(forward)
+        }
         RoutingPolicy::FatTreeEcmp => compute_fat_tree_ecmp_route_table(
             graph,
             routed_flows.map(|(index, flow)| EcmpFlow {
@@ -2544,6 +3856,7 @@ fn lower(
                     model.seed ^ 0x4543_4d50_5f48_4153,
                     &flow.key,
                     &collective_table,
+                    &compute_table,
                     &roce_keys,
                 ),
             }),
@@ -2570,7 +3883,7 @@ fn lower(
         .iter()
         .enumerate()
         .map(|(index, flow)| {
-            if flow.compute.is_some() {
+            if flow.compute.is_some() || flow.notify_delay_ns().is_some() {
                 return FlowDescriptor {
                     id: FlowId(flow_ids[&flow.key]),
                     source: ids.node(LpKey::Host(flow.source)),
@@ -2582,7 +3895,10 @@ fn lower(
                 };
             }
             let switch_path = &route_table[&index];
-            let reverse_switch_path = switch_path.iter().rev().copied().collect::<Vec<_>>();
+            let reverse_switch_path = match &reverse_route_table {
+                Some(reverse) => reverse[&index].clone(),
+                None => switch_path.iter().rev().copied().collect::<Vec<_>>(),
+            };
             FlowDescriptor {
                 id: FlowId(flow_ids[&flow.key]),
                 source: ids.node(LpKey::Host(flow.source)),
@@ -2622,10 +3938,116 @@ fn lower(
     let mut payload_sequences = BTreeMap::<LpKey, u64>::new();
     let mut initial_packets = Vec::with_capacity(flows.len());
     let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId, EventKind)>::new();
+    // The predecessor runs of join stages, in flow order.
+    let mut stage_joins = Vec::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
         let source = LpKey::Host(flow.source);
+        if let Some(delay_ns) = flow.notify_delay_ns() {
+            let stage = flow
+                .collective
+                .as_deref()
+                .expect("a stage notify carries a collective stage");
+            let lane_ns = notify.lanes[&(flow.source, flow.target)];
+            // The sender's timer runs `delay - lane`; its notify then crosses the lane in `lane`.
+            let lead_ns = delay_ns - lane_ns;
+            // A stage without predecessors starts with its collective (an ungated root).
+            let root = stage.local.is_none() && stage.inbound.is_none();
+            // A root message starts with its collective, at the traffic's initial delay, as the
+            // collective's fabric roots do (review F1); its timer fires the lead after that.
+            let root_timer_ns = flow
+                .traffic
+                .initial_delay_ns
+                .checked_add(lead_ns)
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "stage notify timer of flow {} -> {} exceeds u64",
+                        flow.source, flow.target
+                    ))
+                })?;
+            let next_emission = if !root {
+                ScheduledEmission {
+                    status: GeneratorStatus::Blocked,
+                    departure_time_ns: 0,
+                    payload: PayloadId(0),
+                }
+            } else if root_timer_ns > model.stop_time_ns {
+                ScheduledEmission {
+                    status: GeneratorStatus::Stopped,
+                    departure_time_ns: root_timer_ns,
+                    payload: PayloadId(0),
+                }
+            } else {
+                // Its notify names the sender's timer and then crosses to the target.
+                let sequence = payload_sequences.entry(source).or_default();
+                let payload = allocate_payload_id(
+                    ids.node(source),
+                    node_count,
+                    *sequence,
+                    "stage notify payload sequence",
+                )?;
+                *sequence = sequence.checked_add(1).ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "stage notify payload sequence overflow at {source:?}"
+                    ))
+                })?;
+                initial_packets.push(PacketDescriptor {
+                    id: payload,
+                    flow: descriptor.id,
+                    size_bytes: stage.chunk_bytes,
+                    ecn_marked: false,
+                    kind: PacketKind::StageNotify,
+                });
+                initial_event_inputs.push((
+                    source,
+                    root_timer_ns,
+                    descriptor.id,
+                    payload,
+                    EventKind::PacingTimer,
+                ));
+                ScheduledEmission {
+                    status: GeneratorStatus::Scheduled,
+                    departure_time_ns: root_timer_ns,
+                    payload,
+                }
+            };
+            let (identity, dependencies) =
+                collective_stage_record(stage, &flow_ids, &mut stage_joins)?;
+            generators_by_source.entry(source).or_default().push((
+                FlowGeneratorState {
+                    flow: descriptor.id,
+                    packets_emitted: 0,
+                    bytes_emitted: 0,
+                    next_emission,
+                    rng_state: generator_seed(
+                        model.seed,
+                        &flow.key,
+                        &collective_table,
+                        &compute_table,
+                        &roce_keys,
+                    ),
+                    feedback: GeneratorFeedbackState {
+                        arrivals: 0,
+                        outstanding_bytes: 0,
+                        unacknowledged_bytes: 0,
+                    },
+                    kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                        // A stage notify's lane latency (the image's one record of it per message).
+                        first_departure_ns: lane_ns,
+                        interval_ns: lead_ns,
+                        packet_size_bytes: stage.chunk_bytes,
+                        termination: GeneratorTermination::Bytes(stage.chunk_bytes),
+                    }),
+                },
+                Some(CollectiveStage {
+                    role: StageRole::Collective(identity),
+                    dependencies,
+                    activated: root,
+                }),
+            ));
+            continue;
+        }
         if let Some(compute) = &flow.compute {
-            let root = compute.local_predecessor.is_none() && compute.inbound_predecessor.is_none();
+            let root = compute.local.is_none() && compute.inbound.is_none();
             let next_emission = if !root {
                 ScheduledEmission {
                     status: GeneratorStatus::Blocked,
@@ -2673,14 +4095,21 @@ fn lower(
                     payload,
                 }
             };
-            let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
+            let local = compute.local.resolve(&flow_ids, &mut stage_joins)?;
+            let inbound = compute.inbound.resolve(&flow_ids, &mut stage_joins)?;
             generators_by_source.entry(source).or_default().push((
                 FlowGeneratorState {
                     flow: descriptor.id,
                     packets_emitted: 0,
                     bytes_emitted: 0,
                     next_emission,
-                    rng_state: generator_seed(model.seed, &flow.key, &collective_table, &roce_keys),
+                    rng_state: generator_seed(
+                        model.seed,
+                        &flow.key,
+                        &collective_table,
+                        &compute_table,
+                        &roce_keys,
+                    ),
                     feedback: GeneratorFeedbackState {
                         arrivals: 0,
                         outstanding_bytes: 0,
@@ -2701,12 +4130,11 @@ fn lower(
                         duration_ns: compute.duration_ns,
                     }),
                     dependencies: StageDependencies {
-                        local_predecessor: compute.local_predecessor.as_ref().map(stage_flow),
-                        inbound_predecessor: compute.inbound_predecessor.as_ref().map(stage_flow),
+                        local,
+                        inbound,
                         inbound_predecessor_bytes: compute.inbound_predecessor_bytes,
-                        local_predecessor_complete: compute.local_predecessor.is_none(),
-                        inbound_predecessor_complete: compute.inbound_predecessor.is_none(),
                         inbound_bytes_received: 0,
+                        local_completed: 0,
                     },
                     activated: root,
                 }),
@@ -2714,19 +4142,16 @@ fn lower(
             continue;
         }
         let emission_count = packet_count(&flow.traffic);
-        let mut dcqcn_control_payload = None;
-        // A RoCE queue pair's full key, and the DCQCN controller key of a DCQCN flow or pair.
+        // A RoCE queue pair's full key.
         let roce = match flow.traffic.kind {
             TrafficKind::Roce(ordinal) => Some(roce_key(&roce_keys, ordinal)),
             _ => None,
         };
-        let controller_key = match flow.traffic.kind {
-            TrafficKind::Dcqcn(config) => Some(config),
-            _ => roce.map(|roce| roce.dcqcn),
-        };
-        let collective_ready = flow.collective.as_ref().is_none_or(|stage| {
-            stage.local_predecessor_complete && stage.inbound_predecessor_complete
-        });
+        // Nothing has run at lowering, so a stage is ready exactly when it waits for nothing.
+        let collective_ready = flow
+            .collective
+            .as_ref()
+            .is_none_or(|stage| stage.local.is_none() && stage.inbound.is_none());
         // A RoCE stage that its prerequisites have not released holds its anchors at zero (ruling
         // C5); its release re-anchors the pacer and the controller at the release instant.
         let gated_roce = roce.is_some() && !collective_ready;
@@ -2742,39 +4167,32 @@ fn lower(
                 payload: PayloadId(0),
             }
         } else if gated_roce {
-            // Ruling C1: a gated RoCE stage's two timer tokens are allocated here, in the order a
-            // released pair's are (pacing, then control), and stay resident with no event, so the
-            // CPU executor imports and pins them like any queue pair's.
+            // Ruling C1: a gated RoCE stage's pacing token is allocated here, as a released
+            // pair's is, and stays resident with no event, so the CPU executor imports and pins
+            // it like any queue pair's. (The Mellanox-form controller owns no token, P16.)
             let sequence = payload_sequences.entry(source).or_default();
-            let mut tokens = [PayloadId(0); 2];
-            for (token, kind) in tokens
-                .iter_mut()
-                .zip([PacketKind::RocePacingTimer, PacketKind::DcqcnControlTimer])
-            {
-                *token = allocate_payload_id(
-                    ids.node(source),
-                    node_count,
-                    *sequence,
-                    "RoCE stage token payload sequence",
-                )?;
-                *sequence = sequence.checked_add(1).ok_or_else(|| {
-                    CompileError::Invalid(format!(
-                        "RoCE stage token payload sequence overflow at {source:?}"
-                    ))
-                })?;
-                initial_packets.push(PacketDescriptor {
-                    id: *token,
-                    flow: descriptor.id,
-                    size_bytes: 0,
-                    ecn_marked: false,
-                    kind,
-                });
-            }
-            dcqcn_control_payload = Some(tokens[1]);
+            let token = allocate_payload_id(
+                ids.node(source),
+                node_count,
+                *sequence,
+                "RoCE stage token payload sequence",
+            )?;
+            *sequence = sequence.checked_add(1).ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "RoCE stage token payload sequence overflow at {source:?}"
+                ))
+            })?;
+            initial_packets.push(PacketDescriptor {
+                id: token,
+                flow: descriptor.id,
+                size_bytes: 0,
+                ecn_marked: false,
+                kind: PacketKind::RocePacingTimer,
+            });
             ScheduledEmission {
                 status: GeneratorStatus::Blocked,
                 departure_time_ns: 0,
-                payload: tokens[0],
+                payload: token,
             }
         } else if !collective_ready {
             ScheduledEmission {
@@ -2833,54 +4251,18 @@ fn lower(
                     EventKind::PacketArrival
                 },
             ));
-            if let Some(config) = controller_key {
-                let control_time_ns = flow
-                    .traffic
-                    .initial_delay_ns
-                    .checked_add(config.control_interval_ns)
-                    .ok_or_else(|| {
-                        CompileError::Invalid(format!(
-                            "flow {:?} first DCQCN control deadline exceeds u64",
-                            descriptor.id
-                        ))
-                    })?;
-                let control_payload = allocate_payload_id(
-                    ids.node(source),
-                    node_count,
-                    *sequence,
-                    "DCQCN control payload sequence",
-                )?;
-                *sequence = sequence.checked_add(1).ok_or_else(|| {
-                    CompileError::Invalid(format!(
-                        "DCQCN control payload sequence overflow at {source:?}"
-                    ))
-                })?;
-                initial_packets.push(PacketDescriptor {
-                    id: control_payload,
-                    flow: descriptor.id,
-                    size_bytes: 0,
-                    ecn_marked: false,
-                    kind: PacketKind::DcqcnControlTimer,
-                });
-                if control_time_ns <= model.stop_time_ns {
-                    initial_event_inputs.push((
-                        source,
-                        control_time_ns,
-                        descriptor.id,
-                        control_payload,
-                        EventKind::PacingTimer,
-                    ));
-                }
-                dcqcn_control_payload = Some(control_payload);
-            }
+            // A DCQCN flow's or queue pair's status predicts its first tick: it sends iff one
+            // tick of credit covers the first packet (the validator's next-tick rule).
+            let paced_key = match flow.traffic.kind {
+                TrafficKind::Dcqcn(config) => Some(config),
+                _ => roce.map(|roce| roce.dcqcn),
+            };
             ScheduledEmission {
-                status: match (roce, &flow.traffic.termination) {
-                    // A queue pair's status predicts its first tick: it sends iff one tick of
-                    // credit covers the first packet.
-                    (Some(roce), Termination::Bytes(total_bytes)) => {
+                status: match (paced_key, &flow.traffic.termination) {
+                    (Some(key), Termination::Bytes(total_bytes)) => {
                         let first_packet = flow.traffic.packet_size_bytes.min(*total_bytes);
-                        let tick_credit = u128::from(roce.dcqcn.initial_rate_bps)
-                            * u128::from(roce.dcqcn.pacing_interval_ns);
+                        let tick_credit =
+                            u128::from(key.initial_rate_bps) * u128::from(key.pacing_interval_ns);
                         let cost = u128::from(first_packet) * 8 * 1_000_000_000;
                         if tick_credit >= cost {
                             GeneratorStatus::Scheduled
@@ -2894,34 +4276,11 @@ fn lower(
                 payload,
             }
         };
-        let collective_stage = flow.collective.as_ref().map(|stage| {
-            let stage_flow = |key: &FlowKey| FlowId(flow_ids[key]);
-            (
-                CollectiveStageIdentity {
-                    collective_id: stage.collective_id,
-                    algorithm: stage.algorithm,
-                    topology_level: 0,
-                    topology_group: 0,
-                    group_size: stage.group_size,
-                    declared_total_bytes: stage.declared_total_bytes,
-                    rank: stage.position.rank,
-                    phase: stage.position.phase,
-                    step: stage.position.step,
-                    chunk_policy: CollectiveChunkPolicy::EqualRemainderLast,
-                    channel_policy: CollectiveChannelPolicy::RingNext,
-                    chunk_offset_bytes: stage.chunk_offset_bytes,
-                    chunk_bytes: stage.chunk_bytes,
-                },
-                StageDependencies {
-                    local_predecessor: stage.local_predecessor.as_ref().map(stage_flow),
-                    inbound_predecessor: stage.inbound_predecessor.as_ref().map(stage_flow),
-                    inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
-                    local_predecessor_complete: stage.local_predecessor_complete,
-                    inbound_predecessor_complete: stage.inbound_predecessor_complete,
-                    inbound_bytes_received: 0,
-                },
-            )
-        });
+        let collective_stage = flow
+            .collective
+            .as_deref()
+            .map(|stage| collective_stage_record(stage, &flow_ids, &mut stage_joins))
+            .transpose()?;
         generators_by_source.entry(source).or_default().push((
             FlowGeneratorState {
                 // Every collective stage is a TCP or RoCE generator whose dependencies live in this record;
@@ -2930,7 +4289,13 @@ fn lower(
                 packets_emitted: 0,
                 bytes_emitted: 0,
                 next_emission,
-                rng_state: generator_seed(model.seed, &flow.key, &collective_table, &roce_keys),
+                rng_state: generator_seed(
+                    model.seed,
+                    &flow.key,
+                    &collective_table,
+                    &compute_table,
+                    &roce_keys,
+                ),
                 feedback: GeneratorFeedbackState {
                     arrivals: 0,
                     outstanding_bytes: 0,
@@ -2972,8 +4337,7 @@ fn lower(
                             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
                                 unreachable!("DCQCN validation requires byte termination")
                             };
-                            let controller =
-                                lowered_dcqcn_controller(config, flow.traffic.initial_delay_ns);
+                            let controller = lowered_dcqcn_controller(config);
                             FlowGeneratorKind::Dcqcn(DcqcnGenerator {
                                 rate: RateGenerator {
                                     first_pacing_time_ns: flow.traffic.initial_delay_ns,
@@ -2985,8 +4349,6 @@ fn lower(
                                     credit_quanta: 0,
                                 },
                                 controller,
-                                control_timer_payload: dcqcn_control_payload
-                                    .expect("nonempty DCQCN lowering allocates a control token"),
                                 cnp_size_bytes: 64,
                             })
                         }
@@ -3003,15 +4365,16 @@ fn lower(
                                     total_bytes,
                                     credit_quanta: 0,
                                 },
-                                controller: lowered_dcqcn_controller(roce.dcqcn, anchor_ns),
-                                control_timer_payload: dcqcn_control_payload
-                                    .expect("nonempty RoCE lowering allocates a control token"),
+                                controller: lowered_dcqcn_controller(roce.dcqcn),
                                 pacing_timer_payload: next_emission.payload,
                                 next_psn: 0,
                                 snd_una: 0,
                                 rto_deadline_ns: 0,
                                 rto_ns: roce.retransmit_timeout_ns,
                                 pacer_armed: !gated_roce,
+                                window_bytes: roce.window_bytes,
+                                variable_window: roce.variable_window,
+                                window_parked: false,
                             })
                         }
                     }
@@ -3061,6 +4424,10 @@ fn lower(
     // allocation per host that receives queue pairs.
     let mut roce_receivers = Vec::<(LpKey, RoceReceiverState)>::new();
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
+        if flow.notify_delay_ns().is_some() {
+            // A stage notify needs no receiver state: its one arrival carries the whole chunk.
+            continue;
+        }
         if let TrafficKind::Roce(ordinal) = flow.traffic.kind {
             let roce = roce_key(&roce_keys, ordinal);
             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
@@ -3069,12 +4436,7 @@ fn lower(
             roce_receivers.push((
                 LpKey::Host(flow.target),
                 RoceReceiverState {
-                    np: DcqcnReceiverState {
-                        flow: descriptor.id,
-                        cnp_interval_ns: roce.dcqcn.cnp_interval_ns,
-                        cnp_size_bytes: 64,
-                        last_cnp_time_ns: None,
-                    },
+                    flow: descriptor.id,
                     total_bytes,
                     expected_psn: 0,
                     ack_every_packets: roce.ack_every_packets,
@@ -3174,20 +4536,38 @@ fn lower(
             }
         })
         .collect();
+    // P16 H2: an ECN row per egress link rate, as SimAI keys its ECN rows by port rate, set in one
+    // pass over the ports only when the scenario has rows (review F2: deciding it inside the map
+    // made the map fallible, and a `Result` collect has no size hint, so the vector grew by doubling
+    // on every image).
+    if let Some(rows) = &model.ecn_by_rate {
+        for (port, state) in switch_port_keys.iter().zip(&mut switch_states) {
+            let LpKey::SwitchPort { egress, .. } = *port else {
+                unreachable!("switch-port key set contains only switch ports")
+            };
+            let rate_bps = link_rate.of(egress);
+            let policy = *rows.get(&rate_bps).ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "`switch.ecn_by_rate` has no row for a {rate_bps} b/s egress link"
+                ))
+            })?;
+            state.queues[0].drop_mark = DropMarkPolicy::EcnRamp(policy);
+        }
+    }
     let links = ids
         .links()
         .map(|(key, id)| LinkDescriptor {
             id,
             source: ids.node(LpKey::for_link_source(key)),
             target: ids.node(LpKey::for_link_target(key)),
-            rate_bps: model.rate_bps,
+            rate_bps: link_rate.of(key),
             propagation_ns: link_delay.of(key),
         })
         .collect::<Vec<_>>();
     let mut channel_keys = BTreeSet::<(LinkId, NodeId)>::new();
     let mut min_packet_size_by_link = BTreeMap::<LinkId, u64>::new();
     for (flow, input) in flow_descriptors.iter().zip(&flows) {
-        if packet_count(&input.traffic) == 0 {
+        if packet_count(&input.traffic) == 0 || input.notify_delay_ns().is_some() {
             continue;
         }
         let data_min_size = match input.traffic.kind {
@@ -3260,6 +4640,20 @@ fn lower(
                 })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
+    // One lane per ordered host pair with same-server messages (P16 H2): the notify crosses it in
+    // exactly its latency, out of band, as a PFC frame crosses its control lane.
+    for (&(source, target), &lane_ns) in &notify.lanes {
+        channels.push(RemoteChannel {
+            source: ids.node(LpKey::Host(source)),
+            target: ids.node(LpKey::Host(target)),
+            link: ids.link(LinkKey {
+                source: PhysicalNodeKey::Host(source),
+                target: PhysicalNodeKey::Host(target),
+            }),
+            event_kind: EventKind::RemoteArrival,
+            min_delay_ns: lane_ns,
+        });
+    }
 
     if let Some(pfc) = &model.pfc {
         let mut monitored_paths = BTreeSet::<(LinkId, NodeId)>::new();
@@ -3396,6 +4790,8 @@ fn lower(
                 }
             }
 
+            let (xoff_threshold_bytes, xon_threshold_bytes, buffer_capacity_bytes) =
+                pfc.thresholds(profile, downstream_physical, controlled.rate_bps)?;
             let downstream_slot = nodes[downstream.0 as usize].state_slot as usize;
             let downstream_queue = switch_states[downstream_slot]
                 .queues
@@ -3408,10 +4804,10 @@ fn lower(
                 .push(PfcIngressState {
                     controlled_link: controlled_id,
                     control_channel_index,
-                    buffer_capacity_bytes: pfc.buffer_capacity,
+                    buffer_capacity_bytes,
                     max_frame_bytes,
-                    xoff_threshold_bytes: pfc.xoff,
-                    xon_threshold_bytes: pfc.xon,
+                    xoff_threshold_bytes,
+                    xon_threshold_bytes,
                     occupancy_bytes: [0; 8],
                     pause_asserted: [false; 8],
                 });
@@ -3429,7 +4825,243 @@ fn lower(
         channels,
         initial_events,
         seed: model.seed,
+        stage_joins,
+        seeded_all_to_alls,
+        stage_streams,
     })
+}
+
+/// SimAI's ECMP on the rail fabric (P16 H2, ruling H2-6): each routed flow is one SimAI message.
+///
+/// Message `k` between an ordered host pair, in canonical flow order, takes source port
+/// `10000 + k` (SimAI's per-pair counter, wrapping at 2^16); the source ASW hashes the data tuple
+/// to pick its PSW, and the target ASW hashes the swapped tuple for the feedback path
+/// ([`RailProfile::data_psw`], [`RailProfile::feedback_psw`]). GPUs sharing an ASW cross no PSW.
+/// The ordinal stands in for SimAI's run-time issue order (statistically equivalent, ruled; the
+/// canonical order is the stage keys' order, which the collective lowering fixes).
+fn simai_ecmp_route_tables(
+    rail: RailProfile,
+    flows: impl Iterator<Item = (usize, u64, u64)>,
+) -> (
+    BTreeMap<usize, Vec<NodeIndex>>,
+    BTreeMap<usize, Vec<NodeIndex>>,
+) {
+    let mut ordinals = BTreeMap::<(u64, u64), u64>::new();
+    let mut forward = BTreeMap::new();
+    let mut reverse = BTreeMap::new();
+    for (index, source, target) in flows {
+        let ordinal = ordinals.entry((source, target)).or_default();
+        let sport = RailProfile::simai_sport(*ordinal);
+        *ordinal += 1;
+        // Rail host identities are GPU ids below `rail.gpus`, a `u32`.
+        let (source, target) = (source as u32, target as u32);
+        let (source_asw, target_asw) = (rail.asw_of(source), rail.asw_of(target));
+        let node = |index: u32| NodeIndex::new(index as usize);
+        let path = |from: u32, psw: Option<u32>, to: u32| match psw {
+            None => vec![node(from)],
+            Some(psw) => vec![node(from), node(rail.psw_index(psw)), node(to)],
+        };
+        forward.insert(
+            index,
+            path(source_asw, rail.data_psw(source, target, sport), target_asw),
+        );
+        reverse.insert(
+            index,
+            path(
+                target_asw,
+                rail.feedback_psw(source, target, sport),
+                source_asw,
+            ),
+        );
+    }
+    (forward, reverse)
+}
+
+/// The stage identity and pristine prerequisite state of one collective stage.
+fn collective_stage_record(
+    stage: &CollectiveStageInput,
+    flow_ids: &BTreeMap<FlowKey, u64>,
+    stage_joins: &mut Vec<FlowId>,
+) -> Result<(CollectiveStageIdentity, StageDependencies), CompileError> {
+    Ok((
+        CollectiveStageIdentity {
+            collective_id: stage.collective_id,
+            algorithm: stage.algorithm,
+            channel: stage.position.channel,
+            group_size: stage.group_size,
+            declared_total_bytes: stage.declared_total_bytes,
+            rank: stage.position.rank,
+            phase: stage.position.phase,
+            step: stage.position.step,
+            chunk_policy: stage.chunk_policy,
+            channel_policy: stage.channel_policy,
+            chunk_offset_bytes: stage.chunk_offset_bytes,
+            chunk_bytes: stage.chunk_bytes,
+        },
+        StageDependencies {
+            local: stage.local.resolve(flow_ids, stage_joins)?,
+            inbound: stage.inbound.resolve(flow_ids, stage_joins)?,
+            inbound_predecessor_bytes: stage.inbound_predecessor_bytes,
+            inbound_bytes_received: 0,
+            local_completed: 0,
+        },
+    ))
+}
+
+/// The same-server messages of a rail image and their host-to-host notify lanes (P16 H2).
+///
+/// A collective stage whose two ranks share a server crosses NVLink, which Days models delay-only
+/// (ruling H2-1): the stage lowers to a stage notify. Its delay `d` is
+/// [`ServerLocality::nvlink_message_delay_ns`] of its chunk. Every message on one ordered host pair
+/// shares that pair's lane, whose latency is `min d - 1` over the pair's messages: the sender's
+/// timer runs `d - lane >= 1` and the notify crosses in `lane`, so arrivals on a lane follow the
+/// sender's timer order and the lane bounds the safe horizon by its slowest-to-start message.
+struct NotifyLowering {
+    /// Lane latency per ordered (source, target) host pair.
+    lanes: BTreeMap<(u64, u64), u64>,
+}
+
+impl NotifyLowering {
+    /// Marks each same-server collective stage with its message delay (its sidecar's
+    /// `notify_delay_ns`) and collects the lanes. Off the rail fabric it touches nothing.
+    fn plan(flows: &mut [FlowInput], profile: TopologyProfile) -> Result<Self, CompileError> {
+        let TopologyProfile::Rail(rail) = profile else {
+            return Ok(Self {
+                lanes: BTreeMap::new(),
+            });
+        };
+        let locality = ServerLocality::new(rail);
+        // An all-to-all releases all of a rank's sends at once, so its same-server sends share the
+        // sender's NVLink port: their concurrency is how many there are (orchestrator ruling,
+        // from the N1 SimAI comparison).
+        let mut all_to_all_peers = BTreeMap::<(u64, u32), u64>::new();
+        for flow in flows.iter() {
+            if let Some(stage) = flow.collective.as_deref() {
+                if stage.algorithm == CollectiveAlgorithm::AllToAll
+                    && locality.same_server(flow.source, flow.target)
+                {
+                    *all_to_all_peers
+                        .entry((stage.collective_id, stage.position.rank))
+                        .or_default() += 1;
+                }
+            }
+        }
+        let mut lanes = BTreeMap::<(u64, u64), u64>::new();
+        for flow in flows.iter_mut() {
+            let (source, target, packet_size) =
+                (flow.source, flow.target, flow.traffic.packet_size_bytes);
+            let Some(stage) = flow.collective.as_deref_mut() else {
+                continue;
+            };
+            if !locality.same_server(source, target) {
+                continue;
+            }
+            // A ring hop inside a server of a ring that spans servers runs alone on the sender's
+            // port (concurrency 1: SimAI's channels desynchronise behind their own inter-server
+            // hops), as does a send/recv; an all-to-all's same-server sends share it, also when
+            // the whole all-to-all is inside one server. A ring collective inside one server never
+            // reaches here: it is one delay stage per rank (`single_server_delays`).
+            let concurrency = match stage.algorithm {
+                CollectiveAlgorithm::AllToAll => all_to_all_peers
+                    .get(&(stage.collective_id, stage.position.rank))
+                    .copied()
+                    .unwrap_or(1),
+                _ => 1,
+            };
+            let delay = locality
+                .nvlink_message_delay_ns(stage.chunk_bytes, concurrency, packet_size)
+                .ok_or_else(|| {
+                    CompileError::Invalid(format!(
+                        "NVLink delay of a {}-byte message from host {source} to host {target} \
+                         overflows",
+                        stage.chunk_bytes
+                    ))
+                })?;
+            stage.notify_delay_ns = Some(delay);
+            let lane = delay - 1;
+            lanes
+                .entry((source, target))
+                .and_modify(|current| *current = (*current).min(lane))
+                .or_insert(lane);
+        }
+        Ok(Self { lanes })
+    }
+}
+
+/// The ring collectives of a rail image whose ranks all share one server, as compute groups
+/// (ruling H2-2: one delay stage per rank). Such a collective never leaves the server, so each
+/// rank's part is a delay: `steps` ring steps, each sending one message on every one of `c`
+/// channels at once through the rank's NVLink port
+/// ([`ServerLocality::single_server_collective_delay_ns`] with concurrency `c`, the orchestrator's
+/// ruling): SimAI's ring inside a server has `c = n` channels (or the collective's own
+/// `channels`), `n - 1` steps for an AllGather or ReduceScatter and `2 (n - 1)` for an AllReduce,
+/// and messages of `floor(floor(S / n) / c)` bytes. The group keeps the collective's name, ranks
+/// and `after`, so what follows it waits for each rank's delay. Off the rail fabric it returns its
+/// inputs unchanged.
+fn single_server_delays(
+    collectives: Vec<CollectiveKey>,
+    mut computes: Vec<ComputeKey>,
+    profile: TopologyProfile,
+) -> Result<(Vec<CollectiveKey>, Vec<ComputeKey>), CompileError> {
+    let TopologyProfile::Rail(rail) = profile else {
+        return Ok((collectives, computes));
+    };
+    let locality = ServerLocality::new(rail);
+    let single_server = |key: &CollectiveKey| {
+        is_ring_algorithm(key.algorithm)
+            && key.flow_count > 1
+            && key.sources.iter().all(|&host| {
+                locality.server_of(host).is_some()
+                    && locality.server_of(host) == locality.server_of(key.sources[0])
+            })
+    };
+    if !collectives.iter().any(single_server) {
+        return Ok((collectives, computes));
+    }
+    let mut remaining = Vec::with_capacity(collectives.len());
+    for (index, key) in collectives.into_iter().enumerate() {
+        if !single_server(&key) {
+            remaining.push(key);
+            continue;
+        }
+        let n = key.flow_count;
+        let Termination::Bytes(total_bytes) = key.traffic.termination else {
+            unreachable!("collective validation requires byte termination")
+        };
+        let channels = match key.channels().len() {
+            0 => n,
+            declared => declared as u64,
+        };
+        let steps = match key.algorithm {
+            CollectiveAlgorithm::RingAllReduce => 2 * (n - 1),
+            _ => n - 1,
+        };
+        let message = total_bytes / n / channels;
+        let duration_ns = locality
+            .single_server_collective_delay_ns(
+                steps,
+                message,
+                channels,
+                key.traffic.packet_size_bytes,
+            )
+            .filter(|&delay| delay > 0)
+            .ok_or_else(|| {
+                CompileError::Invalid(format!(
+                    "single-server collective of {total_bytes} bytes over {n} ranks and {channels} \
+                     channels has no message delay (a message of {message} bytes)"
+                ))
+            })?;
+        computes.push(ComputeKey {
+            // An unnamed collective cannot be followed; it still runs its delay.
+            name: key
+                .name
+                .unwrap_or_else(|| format!("\u{0}single-server collective {index}")),
+            hosts: key.sources,
+            duration_ns,
+            after: key.after,
+        });
+    }
+    Ok((remaining, computes))
 }
 
 /// The canonically ordered flow inputs and the collective keys their stage keys index.
@@ -3438,6 +5070,20 @@ struct CanonicalFlows {
     /// The normalized collective keys, sorted and distinct: `FlowKey::CollectiveStage::collective`
     /// indexes this table.
     collectives: Vec<CollectiveKey>,
+    /// The compute keys, sorted: `FlowKey::ComputeStage::compute` indexes this table.
+    computes: Vec<ComputeKey>,
+    /// Each seeded all-to-all's matrix parameters, ascending by collective id.
+    seeded: Vec<days_executor::SeededCollective>,
+    /// The issue stream of each stage group on a stream other than 0, ascending.
+    streams: Vec<days_executor::StageStream>,
+}
+
+/// Ordinal of `compute` in the sorted `table`.
+fn compute_ordinal(table: &[ComputeKey], compute: &ComputeKey) -> u64 {
+    let index = table
+        .binary_search(compute)
+        .expect("every compute key is in the compute table");
+    u64::try_from(index).expect("the compute table length fits u64")
 }
 
 /// Ordinal of `semantic` in the sorted distinct `table`.
@@ -3451,8 +5097,11 @@ fn collective_ordinal(table: &[CollectiveKey], semantic: &CollectiveKey) -> u64 
 fn canonical_flows(
     mut explicit: Vec<ExplicitFlowKey>,
     mut flow_sets: Vec<FlowSetKey>,
-    mut collectives: Vec<CollectiveKey>,
-    mut computes: Vec<ComputeKey>,
+    (mut collectives, mut computes, streams): (
+        Vec<CollectiveKey>,
+        Vec<ComputeKey>,
+        &BTreeMap<String, u32>,
+    ),
     hosts: &BTreeSet<u64>,
     host_attachments: &HostAttachments,
     seed: u64,
@@ -3560,13 +5209,16 @@ fn canonical_flows(
                 )));
             }
             semantic.sources.clone_from(&participants);
-            semantic.sinks = participants
-                .iter()
-                .cycle()
-                .skip(1)
-                .take(participants.len())
-                .copied()
-                .collect();
+            // An all-to-all has no ring; every ring algorithm's ring is the host order.
+            if is_ring_algorithm(semantic.algorithm) {
+                semantic.sinks = participants
+                    .iter()
+                    .cycle()
+                    .skip(1)
+                    .take(participants.len())
+                    .copied()
+                    .collect();
+            }
         }
         for participant in semantic.sources.iter().chain(&semantic.sinks) {
             if !hosts.contains(participant) {
@@ -3603,8 +5255,25 @@ fn canonical_flows(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    // Rings in rank order (every TOML ring without `channels`) need no layout table.
+    let layouts = if collective_table.iter().any(CollectiveLayout::needed) {
+        collective_table
+            .iter()
+            .map(CollectiveLayout::of)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        Vec::new()
+    };
+    let plan = StagePlan {
+        groups: &groups,
+        collectives: &collective_table,
+        layouts: &layouts,
+        computes: &computes,
+    };
     let mut collective_duplicates = vec![0_u64; collective_table.len()];
     let mut next_collective_id = 0_u64;
+    let mut seeded = Vec::new();
+    let mut stage_streams = Vec::new();
     for semantic in &collectives {
         let collective = collective_ordinal(&collective_table, semantic);
         let duplicate = &mut collective_duplicates[collective as usize];
@@ -3616,35 +5285,48 @@ fn canonical_flows(
         next_collective_id = next_collective_id
             .checked_add(1)
             .ok_or_else(|| CompileError::Invalid("collective identity exceeds u64".to_owned()))?;
-        let entry = semantic.after.as_ref().map(|name| match groups[name] {
-            StageGroup::Compute(compute) => compute.clone(),
-            StageGroup::Collective(_) => {
-                unreachable!("group resolution admits compute entries only")
-            }
-        });
         expand_collective(
             &mut flows,
+            &plan,
             semantic,
             collective,
             duplicate_ordinal,
             collective_id,
-            entry.as_ref(),
         )?;
+        // The image names the matrix of every seeded collective that has stages (ids ascend).
+        if let Some(&matrix) = semantic.seeded() {
+            if collective_has_stages(semantic) {
+                seeded.push(days_executor::SeededCollective {
+                    collective_id,
+                    matrix,
+                });
+            }
+        }
+        let stream = semantic.name.as_ref().and_then(|name| streams.get(name));
+        if let Some(&stream) = stream.filter(|_| collective_has_stages(semantic)) {
+            stage_streams.push(days_executor::StageStream {
+                operation: days_executor::StageOperation::Collective(collective_id),
+                stream,
+            });
+        }
     }
     for (compute_id, compute) in computes.iter().enumerate() {
-        expand_compute(
-            &mut flows,
-            compute,
-            compute_id as u64,
-            &groups,
-            &collective_table,
-        )?;
+        expand_compute(&mut flows, &plan, compute, compute_id as u64)?;
+        if let Some(&stream) = streams.get(&compute.name) {
+            stage_streams.push(days_executor::StageStream {
+                operation: days_executor::StageOperation::Compute(compute_id as u64),
+                stream,
+            });
+        }
     }
 
     flows.sort_by(|left, right| left.key.cmp(&right.key));
     Ok(CanonicalFlows {
         flows,
         collectives: collective_table,
+        computes,
+        seeded,
+        streams: stage_streams,
     })
 }
 
@@ -3659,170 +5341,608 @@ fn collective_chunk_bounds(total: u64, group_size: u64, owner: u64) -> (u64, u64
     (offset, bytes)
 }
 
+/// The owner offset of the ring recurrence: in step `s` a rank forwards the chunk its ring
+/// position `s - offset` back owns.
+const fn owner_offset(algorithm: CollectiveAlgorithm, phase: CollectivePhase) -> u64 {
+    match (algorithm, phase) {
+        (CollectiveAlgorithm::RingAllReduce, CollectivePhase::AllGather) => 2,
+        _ => 1,
+    }
+}
+
+/// The rank whose chunk the stage at ring `position` sends in `step` of a ring of `n`, given the
+/// ring's `order` (`order[position]` is the rank there).
 fn collective_stage_owner(
     algorithm: CollectiveAlgorithm,
     phase: CollectivePhase,
-    group_size: u64,
-    rank: u64,
+    layout: &CollectiveLayout,
+    channel: usize,
+    (n, rank): (u64, u32),
     step: u64,
 ) -> u64 {
-    match (algorithm, phase) {
-        (CollectiveAlgorithm::RingAllReduce, CollectivePhase::AllGather) => {
-            (rank + group_size - step + 2) % group_size
+    let position = u64::from(layout.position(channel, rank));
+    let owner = (position + n - step + owner_offset(algorithm, phase)) % n;
+    u64::from(layout.rank_at(channel, owner as u32))
+}
+
+/// The phases of a ring algorithm, in order.
+fn ring_phases(algorithm: CollectiveAlgorithm) -> &'static [CollectivePhase] {
+    match algorithm {
+        CollectiveAlgorithm::RingAllReduce => {
+            &[CollectivePhase::ReduceScatter, CollectivePhase::AllGather]
         }
-        (CollectiveAlgorithm::RingAllReduce, CollectivePhase::ReduceScatter)
-        | (CollectiveAlgorithm::AllGather, CollectivePhase::AllGather) => {
-            (rank + group_size - step + 1) % group_size
+        CollectiveAlgorithm::ReduceScatter => &[CollectivePhase::ReduceScatter],
+        _ => &[CollectivePhase::AllGather],
+    }
+}
+
+/// Whether a collective expands to any stage.
+fn collective_has_stages(semantic: &CollectiveKey) -> bool {
+    semantic.flow_count > 1
+}
+
+/// The message structure of one collective key, computed once for its expansion and for the
+/// completion sets its successors wait for. One ring in rank order (every TOML ring without
+/// `channels`) is the empty layout, which allocates nothing.
+struct CollectiveLayout {
+    /// A ring algorithm's channels: each a rank order; empty for one ring in `sources` order.
+    rings: Vec<Vec<u32>>,
+    /// `positions[k][rank]`: the rank's position in channel `k`.
+    positions: Vec<Vec<u32>>,
+    /// An all-to-all's bytes per ordered pair, row-major; zero for a pair without a message.
+    pair_bytes: Vec<u64>,
+}
+
+impl CollectiveLayout {
+    fn of(semantic: &CollectiveKey) -> Result<Self, CompileError> {
+        let n = usize::try_from(semantic.flow_count)
+            .map_err(|_| CompileError::Invalid("collective group exceeds usize".to_owned()))?;
+        let mut layout = Self {
+            rings: Vec::new(),
+            positions: Vec::new(),
+            pair_bytes: Vec::new(),
+        };
+        let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+            unreachable!("collective validation requires byte termination")
+        };
+        match semantic.algorithm {
+            CollectiveAlgorithm::AllToAll => {
+                layout.pair_bytes = match semantic.seeded() {
+                    Some(seeded) => seeded.bytes(semantic.flow_count).ok_or_else(|| {
+                        CompileError::Invalid("seeded all-to-all sizes overflow u64".to_owned())
+                    })?,
+                    None => {
+                        let mut bytes = vec![total_bytes / semantic.flow_count; n * n];
+                        for rank in 0..n {
+                            bytes[rank * n + rank] = 0;
+                        }
+                        bytes
+                    }
+                };
+            }
+            CollectiveAlgorithm::SendRecv => {}
+            _ if semantic.channels().is_empty() => {}
+            _ => {
+                layout.rings = semantic.channels().to_vec();
+                layout.positions = layout
+                    .rings
+                    .iter()
+                    .map(|order| {
+                        let mut positions = vec![0_u32; n];
+                        for (position, &rank) in order.iter().enumerate() {
+                            positions[rank as usize] = position as u32;
+                        }
+                        positions
+                    })
+                    .collect();
+            }
         }
-        (CollectiveAlgorithm::AllGather, CollectivePhase::ReduceScatter) => {
-            unreachable!("AllGather has no ReduceScatter phase")
+        Ok(layout)
+    }
+
+    /// Whether `semantic` needs a layout of its own: channel rings, or an all-to-all's pairs.
+    fn needed(semantic: &CollectiveKey) -> bool {
+        !semantic.channels().is_empty() || semantic.algorithm == CollectiveAlgorithm::AllToAll
+    }
+
+    /// A ring algorithm's channel count.
+    fn channels(&self) -> usize {
+        self.rings.len().max(1)
+    }
+
+    /// `rank`'s position on channel `channel`.
+    fn position(&self, channel: usize, rank: u32) -> u32 {
+        self.positions
+            .get(channel)
+            .map_or(rank, |positions| positions[rank as usize])
+    }
+
+    /// The rank at `position` on channel `channel`.
+    fn rank_at(&self, channel: usize, position: u32) -> u32 {
+        self.rings
+            .get(channel)
+            .map_or(position, |order| order[position as usize])
+    }
+
+    /// The rank before `rank` on channel `channel` of an `n`-rank ring.
+    fn previous(&self, channel: usize, rank: u32, n: u32) -> u32 {
+        self.rank_at(channel, (self.position(channel, rank) + n - 1) % n)
+    }
+
+    /// The rank after `rank` on channel `channel` of an `n`-rank ring.
+    fn next(&self, channel: usize, rank: u32, n: u32) -> u32 {
+        self.rank_at(channel, (self.position(channel, rank) + 1) % n)
+    }
+}
+
+/// The tables the expansions read: the stage groups and the collectives' layouts.
+struct StagePlan<'a> {
+    groups: &'a BTreeMap<String, StageGroup<'a>>,
+    collectives: &'a [CollectiveKey],
+    /// One per collective, or empty when every collective has the identity layout.
+    layouts: &'a [CollectiveLayout],
+    computes: &'a [ComputeKey],
+}
+
+/// The layout of a ring in rank order and of a send/recv.
+static IDENTITY_LAYOUT: CollectiveLayout = CollectiveLayout {
+    rings: Vec::new(),
+    positions: Vec::new(),
+    pair_bytes: Vec::new(),
+};
+
+impl StagePlan<'_> {
+    fn layout(&self, ordinal: u64) -> &CollectiveLayout {
+        self.layouts
+            .get(ordinal as usize)
+            .unwrap_or(&IDENTITY_LAYOUT)
+    }
+}
+
+/// A ring stage's chunk: `(offset, bytes)`.
+fn ring_chunk(
+    semantic: &CollectiveKey,
+    layout: &CollectiveLayout,
+    phase: CollectivePhase,
+    channel: usize,
+    rank: u32,
+    step: u64,
+) -> (u64, u64) {
+    let n = semantic.flow_count;
+    let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+        unreachable!("collective validation requires byte termination")
+    };
+    let owner = collective_stage_owner(semantic.algorithm, phase, layout, channel, (n, rank), step);
+    match semantic.chunk {
+        CollectiveChunkPolicy::UniformFloor => {
+            let channels = layout.channels() as u64;
+            let bytes = total_bytes / n / channels;
+            ((owner * channels + channel as u64) * bytes, bytes)
+        }
+        _ => collective_chunk_bounds(total_bytes, n, owner),
+    }
+}
+
+/// The stages that complete collective `ordinal` at `rank`: the rank's own last sends (local,
+/// acknowledged) and the last messages delivered to it (inbound, with their bytes). A ring's are
+/// each channel's final step; an all-to-all's are every pair from and to the rank; a send/recv's
+/// is its one message, local at the sender and inbound at the receiver. A named collective is
+/// unique, so its only instance has duplicate ordinal 0.
+///
+/// An all-to-all rank that sends nothing (an all-zero row of a seeded matrix) has no own send to
+/// tie the collective's completion there to its release, so its completion also takes the
+/// all-to-all's release at the rank: its own gate stages there (the user's ruling, option 2). A
+/// gate group the dependent itself names (`direct`) is not taken twice, and every key the release
+/// adds is deduplicated (`dedup`), so a collective reached along several paths (a diamond of
+/// zero-send all-to-alls, or directly and through a chain) adds its stages and bytes once: the
+/// predecessor set is a union (review M1). An ungated all-to-all has no gate, so a rank of it that
+/// neither sends nor receives completes at no stage.
+fn collective_completion(
+    plan: &StagePlan<'_>,
+    ordinal: u64,
+    rank: u32,
+    (direct, dedup): (&[String], bool),
+    local: &mut PredecessorKeys,
+    inbound: &mut PredecessorKeys,
+) -> Result<u64, CompileError> {
+    let semantic = &plan.collectives[ordinal as usize];
+    let layout = plan.layout(ordinal);
+    let key = |phase, channel, rank, step| FlowKey::CollectiveStage {
+        collective: ordinal,
+        duplicate_ordinal: 0,
+        stage: CollectiveStagePosition {
+            phase,
+            channel,
+            rank,
+            step,
+        },
+    };
+    let n = u32::try_from(semantic.flow_count).expect("the group size fits u32");
+    let mut bytes = 0_u64;
+    let mut add = |more: u64| -> Result<(), CompileError> {
+        bytes = bytes
+            .checked_add(more)
+            .ok_or_else(|| CompileError::Invalid("inbound join bytes exceed u64".to_owned()))?;
+        Ok(())
+    };
+    match semantic.algorithm {
+        CollectiveAlgorithm::AllToAll => {
+            let size = n as usize;
+            let mut sends = false;
+            for step in 1..n {
+                let target = (rank + step) % n;
+                if layout.pair_bytes[rank as usize * size + target as usize] != 0 {
+                    sends = true;
+                    local.insert(key(CollectivePhase::AllToAll, 0, rank, step), dedup);
+                }
+            }
+            for step in 1..n {
+                let source = (rank + n - step) % n;
+                let pair = layout.pair_bytes[source as usize * size + rank as usize];
+                if pair != 0
+                    && inbound.insert(key(CollectivePhase::AllToAll, 0, source, step), dedup)
+                {
+                    add(pair)?;
+                }
+            }
+            if !sends {
+                let after = semantic.after.as_ref();
+                let ranks = AfterRanks::new(plan, after, &semantic.sources);
+                let host = semantic.sources[rank as usize];
+                add(follow_groups(
+                    plan,
+                    (after, &ranks, direct),
+                    (rank, host),
+                    (direct, true),
+                    local,
+                    inbound,
+                )?)?;
+            }
+        }
+        CollectiveAlgorithm::SendRecv => {
+            let message = key(CollectivePhase::SendRecv, 0, 0, 1);
+            if rank == 0 {
+                local.insert(message, dedup);
+            } else {
+                let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+                    unreachable!("collective validation requires byte termination")
+                };
+                if inbound.insert(message, dedup) {
+                    add(total_bytes)?;
+                }
+            }
+        }
+        _ => {
+            let phase = *ring_phases(semantic.algorithm)
+                .last()
+                .expect("a ring algorithm has a phase");
+            let step = n - 1;
+            for channel in 0..layout.channels() {
+                let previous = layout.previous(channel, rank, n);
+                let channel_u32 = channel as u32;
+                local.insert(key(phase, channel_u32, rank, step), dedup);
+                if inbound.insert(key(phase, channel_u32, previous, step), dedup) {
+                    add(ring_chunk(semantic, layout, phase, channel, previous, u64::from(step)).1)?;
+                }
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// How a dependent group's ranks map onto the ranks of the groups its `after` lists (host-matched
+/// `after`, the ruling on H3's C1): rank `r` of the dependent, at host `h`, waits for each listed
+/// group that runs on `h`, through that group's rank at `h`. A listed group on the same hosts in
+/// the same order (every group before the ruling) maps rank `r` to rank `r`; only a group on
+/// other hosts gets a `(host, rank)` table, sorted by host, so equal host lists allocate nothing.
+struct AfterRanks {
+    /// Per listed group, in `after` order: `None` when it runs on the dependent's hosts in order.
+    /// `None` overall when every listed group does.
+    tables: Option<Vec<Option<HostRanks>>>,
+}
+
+/// A group's `(host, rank)` pairs, sorted by host.
+type HostRanks = Vec<(u64, u32)>;
+
+impl AfterRanks {
+    fn new(plan: &StagePlan<'_>, after: Option<&AfterGroups>, hosts: &[u64]) -> Self {
+        let names = after_names(after);
+        let hosts_of = |name: &String| match plan.groups[name] {
+            StageGroup::Compute(compute) => compute.hosts.as_slice(),
+            StageGroup::Collective(collective) => collective.sources.as_slice(),
+        };
+        if names.iter().all(|name| hosts_of(name) == hosts) {
+            return Self { tables: None };
+        }
+        let tables = names
+            .iter()
+            .map(|name| {
+                let theirs = hosts_of(name);
+                (theirs != hosts).then(|| {
+                    let mut table = (0_u32..)
+                        .zip(theirs)
+                        .map(|(rank, &host)| (host, rank))
+                        .collect::<Vec<_>>();
+                    table.sort_unstable();
+                    table
+                })
+            })
+            .collect();
+        Self {
+            tables: Some(tables),
+        }
+    }
+
+    /// The rank at `host` of the `index`-th listed group, given the dependent's rank there.
+    fn rank(&self, index: usize, rank: u32, host: u64) -> Option<u32> {
+        match self
+            .tables
+            .as_ref()
+            .and_then(|tables| tables[index].as_ref())
+        {
+            None => Some(rank),
+            Some(table) => table
+                .binary_search_by_key(&host, |&(host, _)| host)
+                .ok()
+                .map(|position| table[position].1),
         }
     }
 }
 
+/// The predecessors a group's rank-`rank` stage, at `host`, takes from the groups it names in
+/// `after` that run on `host`: a compute group's stage there, and each collective's completion
+/// at its rank there.
+fn entry_predecessors(
+    plan: &StagePlan<'_>,
+    after: Option<&AfterGroups>,
+    ranks: &AfterRanks,
+    (rank, host): (u32, u64),
+) -> Result<(PredecessorKeys, PredecessorKeys, u64), CompileError> {
+    let mut local = PredecessorKeys::None;
+    let mut inbound = PredecessorKeys::None;
+    let bytes = follow_groups(
+        plan,
+        (after, ranks, &[]),
+        (rank, host),
+        (after_names(after), false),
+        &mut local,
+        &mut inbound,
+    )?;
+    Ok((local, inbound, bytes))
+}
+
+/// Appends to `local` and `inbound` what a stage at `host` (rank `rank` of its group) waits for
+/// from the groups `after` names there, skipping the groups in `skip`, and returns the inbound
+/// bytes added. `direct` is the dependent's own `after` list, which a zero-send all-to-all rank's
+/// release does not take twice, and `dedup` is set inside such a release, whose keys may repeat
+/// (`collective_completion`).
+fn follow_groups(
+    plan: &StagePlan<'_>,
+    (after, ranks, skip): (Option<&AfterGroups>, &AfterRanks, &[String]),
+    (rank, host): (u32, u64),
+    (direct, dedup): (&[String], bool),
+    local: &mut PredecessorKeys,
+    inbound: &mut PredecessorKeys,
+) -> Result<u64, CompileError> {
+    let mut bytes = 0_u64;
+    for (index, name) in after_names(after).iter().enumerate() {
+        if skip.contains(name) {
+            continue;
+        }
+        let Some(rank) = ranks.rank(index, rank, host) else {
+            continue;
+        };
+        match plan.groups[name] {
+            StageGroup::Compute(predecessor) => {
+                local.insert(
+                    FlowKey::ComputeStage {
+                        compute: compute_ordinal(plan.computes, predecessor),
+                        rank,
+                    },
+                    dedup,
+                );
+            }
+            StageGroup::Collective(collective) => {
+                let ordinal = collective_ordinal(plan.collectives, collective);
+                let more =
+                    collective_completion(plan, ordinal, rank, (direct, dedup), local, inbound)?;
+                bytes = bytes.checked_add(more).ok_or_else(|| {
+                    CompileError::Invalid("inbound join bytes exceed u64".to_owned())
+                })?;
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// Expands one collective into its stages: rings per channel and phase, an all-to-all's ordered
+/// pairs, or a send/recv's one message. Each stage waits for its rank's previous step (local) and
+/// for the previous rank's (inbound); a root (step one of the first phase, every all-to-all pair,
+/// the send) waits for the groups the collective follows.
 fn expand_collective(
     flows: &mut Vec<FlowInput>,
+    plan: &StagePlan<'_>,
     semantic: &CollectiveKey,
     collective: u64,
     duplicate_ordinal: u64,
     collective_id: u64,
-    entry: Option<&ComputeKey>,
 ) -> Result<(), CompileError> {
     let n = semantic.flow_count;
     let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
         unreachable!("collective validation requires byte termination")
     };
-    if semantic.algorithm == CollectiveAlgorithm::AllGather && (n == 1 || total_bytes == 0) {
+    if !collective_has_stages(semantic) || total_bytes == 0 {
         return Ok(());
     }
-    let stage_count = match semantic.algorithm {
-        CollectiveAlgorithm::RingAllReduce => {
-            n.checked_mul(n - 1).and_then(|count| count.checked_mul(2))
-        }
-        CollectiveAlgorithm::AllGather => n.checked_mul(n - 1),
-    }
-    .ok_or_else(|| CompileError::Invalid("collective stage count exceeds u64".to_owned()))?;
-    flows
-        .try_reserve_exact(usize::try_from(stage_count).map_err(|_| {
-            CompileError::Invalid(
-                "collective stage count exceeds the platform index domain".to_owned(),
-            )
-        })?)
-        .map_err(|error| {
-            CompileError::Invalid(format!("collective stage table is too large: {error}"))
-        })?;
+    let layout = plan.layout(collective);
+    let after_ranks = AfterRanks::new(plan, semantic.after.as_ref(), &semantic.sources);
     let group_size = u32::try_from(n)
         .map_err(|_| CompileError::Invalid("collective group size exceeds u32".to_owned()))?;
-    let phases: &[CollectivePhase] = match semantic.algorithm {
-        CollectiveAlgorithm::RingAllReduce => {
-            &[CollectivePhase::ReduceScatter, CollectivePhase::AllGather]
-        }
-        CollectiveAlgorithm::AllGather => &[CollectivePhase::AllGather],
+    let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
+        collective,
+        duplicate_ordinal,
+        stage,
     };
-    let final_step = u32::try_from(n - 1)
-        .map_err(|_| CompileError::Invalid("collective step exceeds u32".to_owned()))?;
-
-    for &phase in phases {
-        for rank_u64 in 0..n {
-            let rank = u32::try_from(rank_u64)
-                .map_err(|_| CompileError::Invalid("collective rank exceeds u32".to_owned()))?;
-            let previous_rank = u32::try_from((rank_u64 + n - 1) % n)
-                .expect("rank is below validated u32 group size");
-            for step_u64 in 1..n {
-                let step = u32::try_from(step_u64)
-                    .map_err(|_| CompileError::Invalid("collective step exceeds u32".to_owned()))?;
-                let owner =
-                    collective_stage_owner(semantic.algorithm, phase, n, rank_u64, step_u64);
-                let (chunk_offset_bytes, chunk_bytes) =
-                    collective_chunk_bounds(total_bytes, n, owner);
-                let position = CollectiveStagePosition { phase, rank, step };
-                let local_predecessor = if step > 1 {
-                    Some(CollectiveStagePosition {
-                        phase,
+    let channel_policy = match semantic.algorithm {
+        CollectiveAlgorithm::AllToAll => CollectiveChannelPolicy::AllPairs,
+        CollectiveAlgorithm::SendRecv => CollectiveChannelPolicy::Pair,
+        _ if semantic.channels().is_empty() => CollectiveChannelPolicy::RingNext,
+        _ => CollectiveChannelPolicy::Channels,
+    };
+    let push = |flows: &mut Vec<FlowInput>,
+                position: CollectiveStagePosition,
+                target: u64,
+                (chunk_offset_bytes, chunk_bytes): (u64, u64),
+                (local, inbound, inbound_predecessor_bytes): (
+        PredecessorKeys,
+        PredecessorKeys,
+        u64,
+    )| {
+        let mut traffic = semantic.traffic.clone();
+        traffic.termination = Termination::Bytes(chunk_bytes);
+        flows.push(FlowInput {
+            key: stage_key(position),
+            source: semantic.sources[position.rank as usize],
+            target,
+            priority: semantic.priority,
+            traffic,
+            collective: Some(Box::new(CollectiveStageInput {
+                collective_id,
+                algorithm: semantic.algorithm,
+                group_size,
+                declared_total_bytes: total_bytes,
+                position,
+                chunk_policy: semantic.chunk,
+                channel_policy,
+                chunk_offset_bytes,
+                chunk_bytes,
+                local,
+                inbound,
+                inbound_predecessor_bytes,
+                notify_delay_ns: None,
+            })),
+            compute: None,
+        });
+    };
+    match semantic.algorithm {
+        CollectiveAlgorithm::AllToAll => {
+            let size = usize::try_from(n).expect("the group size fits usize");
+            flows
+                .try_reserve(size * (size - 1))
+                .map_err(|error| CompileError::Invalid(format!("stage table: {error}")))?;
+            for rank in 0..group_size {
+                let entry = entry_predecessors(
+                    plan,
+                    semantic.after.as_ref(),
+                    &after_ranks,
+                    (rank, semantic.sources[rank as usize]),
+                )?;
+                for step in 1..group_size {
+                    let target = (rank + step) % group_size;
+                    let bytes = layout.pair_bytes[rank as usize * size + target as usize];
+                    if bytes == 0 {
+                        continue;
+                    }
+                    let position = CollectiveStagePosition {
+                        phase: CollectivePhase::AllToAll,
+                        channel: 0,
                         rank,
-                        step: step - 1,
-                    })
-                } else if semantic.algorithm == CollectiveAlgorithm::RingAllReduce
-                    && phase == CollectivePhase::AllGather
-                {
-                    Some(CollectiveStagePosition {
-                        phase: CollectivePhase::ReduceScatter,
-                        rank,
-                        step: final_step,
-                    })
-                } else {
-                    None
-                };
-                let inbound_predecessor = if step > 1 {
-                    Some(CollectiveStagePosition {
-                        phase,
-                        rank: previous_rank,
-                        step: step - 1,
-                    })
-                } else if semantic.algorithm == CollectiveAlgorithm::RingAllReduce
-                    && phase == CollectivePhase::AllGather
-                {
-                    Some(CollectiveStagePosition {
-                        phase: CollectivePhase::ReduceScatter,
-                        rank: previous_rank,
-                        step: final_step,
-                    })
-                } else {
-                    None
-                };
-                let local_predecessor_complete = local_predecessor.is_none_or(|predecessor| {
-                    let predecessor_owner = collective_stage_owner(
-                        semantic.algorithm,
-                        predecessor.phase,
-                        n,
-                        u64::from(predecessor.rank),
-                        u64::from(predecessor.step),
-                    );
-                    collective_chunk_bounds(total_bytes, n, predecessor_owner).1 == 0
-                });
-                let inbound_predecessor_complete =
-                    inbound_predecessor.is_none() || chunk_bytes == 0;
-                let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
-                    collective,
-                    duplicate_ordinal,
-                    stage,
-                };
-                // A collective that follows a compute group gates each rank's root stage on that
-                // rank's compute stage, the only predecessor a root can have.
-                let entry_predecessor = entry
-                    .filter(|_| local_predecessor.is_none() && inbound_predecessor.is_none())
-                    .map(|compute| FlowKey::ComputeStage {
-                        semantic: compute.clone(),
-                        rank,
-                    });
-                let local_predecessor_complete =
-                    local_predecessor_complete && entry_predecessor.is_none();
-                let local_predecessor = local_predecessor.map(stage_key).or(entry_predecessor);
-                let inbound_predecessor = inbound_predecessor.map(stage_key);
-                let mut traffic = semantic.traffic.clone();
-                traffic.termination = Termination::Bytes(chunk_bytes);
-                flows.push(FlowInput {
-                    key: stage_key(position),
-                    source: semantic.sources[rank_u64 as usize],
-                    target: semantic.sinks[rank_u64 as usize],
-                    priority: semantic.priority,
-                    traffic,
-                    collective: Some(Box::new(CollectiveStageInput {
-                        collective_id,
-                        algorithm: semantic.algorithm,
-                        group_size,
-                        declared_total_bytes: total_bytes,
+                        step,
+                    };
+                    push(
+                        flows,
                         position,
-                        chunk_offset_bytes,
-                        chunk_bytes,
-                        local_predecessor,
-                        inbound_predecessor,
-                        inbound_predecessor_bytes: chunk_bytes,
-                        local_predecessor_complete,
-                        inbound_predecessor_complete,
-                    })),
-                    compute: None,
-                });
+                        semantic.sources[target as usize],
+                        (0, bytes),
+                        entry.clone(),
+                    );
+                }
+            }
+        }
+        CollectiveAlgorithm::SendRecv => {
+            let position = CollectiveStagePosition {
+                phase: CollectivePhase::SendRecv,
+                channel: 0,
+                rank: 0,
+                step: 1,
+            };
+            let entry = entry_predecessors(
+                plan,
+                semantic.after.as_ref(),
+                &after_ranks,
+                (0, semantic.sources[0]),
+            )?;
+            push(
+                flows,
+                position,
+                semantic.sources[1],
+                (0, total_bytes),
+                entry,
+            );
+        }
+        _ => {
+            let phases = ring_phases(semantic.algorithm);
+            let channels = layout.channels();
+            let stage_count = (phases.len() as u64)
+                .checked_mul(channels as u64)
+                .and_then(|count| count.checked_mul(n))
+                .and_then(|count| count.checked_mul(n - 1))
+                .ok_or_else(|| {
+                    CompileError::Invalid("collective stage count exceeds u64".to_owned())
+                })?;
+            flows
+                .try_reserve_exact(usize::try_from(stage_count).map_err(|_| {
+                    CompileError::Invalid(
+                        "collective stage count exceeds the platform index domain".to_owned(),
+                    )
+                })?)
+                .map_err(|error| {
+                    CompileError::Invalid(format!("collective stage table is too large: {error}"))
+                })?;
+            let final_step = group_size - 1;
+            for (phase_index, &phase) in phases.iter().enumerate() {
+                for channel in 0..channels {
+                    let channel_u32 = channel as u32;
+                    for rank in 0..group_size {
+                        let previous = layout.previous(channel, rank, group_size);
+                        let target =
+                            semantic.sources[layout.next(channel, rank, group_size) as usize];
+                        for step in 1..group_size {
+                            let chunk =
+                                ring_chunk(semantic, layout, phase, channel, rank, u64::from(step));
+                            let at = |phase, rank, step| CollectiveStagePosition {
+                                phase,
+                                channel: channel_u32,
+                                rank,
+                                step,
+                            };
+                            let predecessors = if step > 1 {
+                                (
+                                    PredecessorKeys::One(stage_key(at(phase, rank, step - 1))),
+                                    PredecessorKeys::One(stage_key(at(phase, previous, step - 1))),
+                                    chunk.1,
+                                )
+                            } else if phase_index > 0 {
+                                let first = phases[phase_index - 1];
+                                (
+                                    PredecessorKeys::One(stage_key(at(first, rank, final_step))),
+                                    PredecessorKeys::One(stage_key(at(
+                                        first, previous, final_step,
+                                    ))),
+                                    chunk.1,
+                                )
+                            } else {
+                                entry_predecessors(
+                                    plan,
+                                    semantic.after.as_ref(),
+                                    &after_ranks,
+                                    (rank, semantic.sources[rank as usize]),
+                                )?
+                            };
+                            push(flows, at(phase, rank, step), target, chunk, predecessors);
+                        }
+                    }
+                }
             }
         }
     }
@@ -3836,8 +5956,11 @@ enum StageGroup<'a> {
     Compute(&'a ComputeKey),
 }
 
-/// Resolves the provisional stage-group dependencies: every `after` names exactly one group, the
-/// named group runs on the same hosts in the same rank order, and the dependencies are acyclic.
+/// Resolves the provisional stage-group dependencies: every `after` names known groups, each once;
+/// the dependencies are acyclic; and they match hosts (the ruling on H3's C1, design §4.2): rank
+/// `r` of a group waits, at its host, for each listed group that runs there. So every listed
+/// group runs on at least one host where the dependent starts (all its hosts, a Send/Recv's
+/// sender alone), and every host where it starts runs at least one listed group.
 fn resolve_stage_groups<'a>(
     collectives: &'a [CollectiveKey],
     computes: &'a [ComputeKey],
@@ -3863,74 +5986,165 @@ fn resolve_stage_groups<'a>(
             )));
         }
     }
-    for collective in collectives {
-        let Some(after) = &collective.after else {
-            continue;
-        };
-        let label = collective.name.as_deref().unwrap_or("<unnamed>");
-        match groups.get(after) {
-            None => {
+    // Every `after` names known groups, each once, that match the dependent's hosts; a
+    // collective follows at least one compute group (ruling R4).
+    let dependents = collectives
+        .iter()
+        .map(|collective| {
+            // A Send/Recv starts at its sender alone; every other collective at all its ranks.
+            let starts = if collective.algorithm == CollectiveAlgorithm::SendRecv {
+                &collective.sources[..1]
+            } else {
+                &collective.sources[..]
+            };
+            (
+                "collective",
+                collective.name.as_deref().unwrap_or("<unnamed>"),
+                &collective.sources[..],
+                starts,
+                collective.after.as_ref(),
+                true,
+            )
+        })
+        .chain(computes.iter().map(|compute| {
+            (
+                "compute",
+                compute.name.as_str(),
+                &compute.hosts[..],
+                &compute.hosts[..],
+                compute.after.as_ref(),
+                false,
+            )
+        }));
+    for (kind, label, hosts, starts, after, is_collective) in dependents {
+        let names = after_names(after);
+        let mut follows_compute = false;
+        // The sorted hosts of each listed group that does not run on exactly the dependent's
+        // hosts in order (none for equal lists, so they allocate nothing).
+        let mut other_hosts = Vec::<Vec<u64>>::new();
+        for (index, after) in names.iter().enumerate() {
+            if names[..index].contains(after) {
                 return Err(CompileError::Invalid(format!(
-                    "collective `{label}` depends on unknown stage group `{after}`"
+                    "{kind} `{label}` names stage group `{after}` more than once"
                 )));
             }
-            Some(StageGroup::Collective(_)) => {
-                return Err(CompileError::Unsupported(format!(
-                    "unsupported collective `{label}` dependency on collective `{after}`; a collective may follow only a compute group"
-                )));
-            }
-            Some(StageGroup::Compute(compute)) if compute.hosts != collective.sources => {
-                return Err(CompileError::Invalid(format!(
-                    "collective `{label}` ranks must equal the hosts of `{after}` in order"
-                )));
-            }
-            Some(StageGroup::Compute(_)) => {}
-        }
-    }
-    for compute in computes {
-        let Some(after) = &compute.after else {
-            continue;
-        };
-        let name = &compute.name;
-        let hosts = match groups.get(after) {
-            None => {
-                return Err(CompileError::Invalid(format!(
-                    "compute `{name}` depends on unknown stage group `{after}`"
-                )));
-            }
-            Some(StageGroup::Compute(predecessor)) => &predecessor.hosts,
-            Some(StageGroup::Collective(collective)) => {
-                if collective.flow_count < 2 {
+            let predecessor_hosts = match groups.get(after) {
+                None => {
                     return Err(CompileError::Invalid(format!(
-                        "compute `{name}` depends on collective `{after}`, which has no stages"
+                        "{kind} `{label}` depends on unknown stage group `{after}`"
                     )));
                 }
-                &collective.sources
+                Some(StageGroup::Compute(predecessor)) => {
+                    follows_compute = true;
+                    &predecessor.hosts
+                }
+                Some(StageGroup::Collective(collective)) => {
+                    if !collective_has_stages(collective) {
+                        return Err(CompileError::Invalid(format!(
+                            "{kind} `{label}` depends on collective `{after}`, which has no stages"
+                        )));
+                    }
+                    &collective.sources
+                }
+            };
+            if predecessor_hosts.as_slice() == hosts {
+                continue;
             }
-        };
-        if *hosts != compute.hosts {
-            return Err(CompileError::Invalid(format!(
-                "compute `{name}` hosts must equal the ranks of `{after}` in order"
+            let mut sorted = predecessor_hosts.clone();
+            sorted.sort_unstable();
+            if !starts.iter().any(|host| sorted.binary_search(host).is_ok()) {
+                return Err(CompileError::Invalid(if is_collective {
+                    format!(
+                        "collective `{label}` names stage group `{after}`, which runs on none of the hosts it starts at"
+                    )
+                } else {
+                    format!(
+                        "compute `{label}` names stage group `{after}`, which runs on none of its hosts"
+                    )
+                }));
+            }
+            other_hosts.push(sorted);
+        }
+        // Every host where the dependent starts runs a listed group (an equal list covers all).
+        if !other_hosts.is_empty() && other_hosts.len() == names.len() {
+            if let Some((rank, host)) = starts.iter().enumerate().find(|(_, host)| {
+                !other_hosts
+                    .iter()
+                    .any(|sorted| sorted.binary_search(host).is_ok())
+            }) {
+                return Err(CompileError::Invalid(format!(
+                    "{kind} `{label}` rank {rank} (host {host}) starts after no operation its `after` lists"
+                )));
+            }
+        }
+        if is_collective && !names.is_empty() && !follows_compute {
+            return Err(CompileError::Unsupported(format!(
+                "unsupported collective `{label}` dependency on collective `{}` alone; a collective follows at least one compute group",
+                names[0]
             )));
         }
     }
-    // Each group has at most one `after`, so a cycle is a revisited name on one chain.
-    for start in groups.keys() {
-        let mut seen = BTreeSet::new();
-        let mut current = start.as_str();
-        loop {
-            if !seen.insert(current) {
-                return Err(CompileError::Invalid(format!(
-                    "stage group dependencies form a cycle through `{current}`"
-                )));
+    fn afters_of<'a>(group: &StageGroup<'a>) -> &'a [String] {
+        match *group {
+            StageGroup::Collective(collective) => after_names(collective.after.as_ref()),
+            StageGroup::Compute(compute) => after_names(compute.after.as_ref()),
+        }
+    }
+    if groups.values().all(|group| afters_of(group).len() <= 1) {
+        // Each group has at most one `after`, so a cycle is a revisited name on one chain.
+        for start in groups.keys() {
+            let mut seen = BTreeSet::new();
+            let mut current = start.as_str();
+            loop {
+                if !seen.insert(current) {
+                    return Err(CompileError::Invalid(format!(
+                        "stage group dependencies form a cycle through `{current}`"
+                    )));
+                }
+                match afters_of(&groups[current]).first() {
+                    Some(next) => current = next,
+                    None => break,
+                }
             }
-            let after = match groups[current] {
-                StageGroup::Collective(collective) => collective.after.as_deref(),
-                StageGroup::Compute(compute) => compute.after.as_deref(),
-            };
-            match after {
-                Some(next) => current = next,
-                None => break,
+        }
+        return Ok(groups);
+    }
+    // A join: a depth-first walk over the `after` edges, in name order, finds any cycle; groups
+    // are indexed by their position in name order.
+    let names = groups.keys().map(String::as_str).collect::<Vec<_>>();
+    let afters = |index: usize| -> &[String] { afters_of(&groups[names[index]]) };
+    // 0: unvisited; 1: on the walk's path; 2: finished.
+    let mut state = vec![0_u8; names.len()];
+    let mut stack = Vec::<(usize, usize)>::new();
+    for start in 0..names.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        state[start] = 1;
+        stack.push((start, 0));
+        while let Some((current, cursor)) = stack.last_mut() {
+            let current = *current;
+            if let Some(next) = afters(current).get(*cursor) {
+                *cursor += 1;
+                let next = names
+                    .binary_search(&next.as_str())
+                    .expect("group resolution checked every name");
+                match state[next] {
+                    1 => {
+                        return Err(CompileError::Invalid(format!(
+                            "stage group dependencies form a cycle through `{}`",
+                            names[next]
+                        )));
+                    }
+                    0 => {
+                        state[next] = 1;
+                        stack.push((next, 0));
+                    }
+                    _ => {}
+                }
+            } else {
+                state[current] = 2;
+                stack.pop();
             }
         }
     }
@@ -3939,72 +6153,25 @@ fn resolve_stage_groups<'a>(
 
 /// Expands one compute group into one timer-only stage per host.
 ///
-/// After a compute group, rank r waits for that group's rank-r stage. After a collective, rank r
-/// waits for its own final stage (local, acknowledged) and the previous rank's final stage
-/// (inbound, delivered in order), which together complete the collective at rank r.
+/// Rank r waits for the rank-r stage of each compute group it follows and for each collective's
+/// completion at rank r (`collective_completion`): after one ring, its own final stage (local,
+/// acknowledged) and the previous rank's (inbound, delivered in order). After several groups, or
+/// after an all-to-all or a multi-channel ring, the stage is a join.
 fn expand_compute(
     flows: &mut Vec<FlowInput>,
+    plan: &StagePlan<'_>,
     compute: &ComputeKey,
     compute_id: u64,
-    groups: &BTreeMap<String, StageGroup<'_>>,
-    collective_table: &[CollectiveKey],
 ) -> Result<(), CompileError> {
     let group_size = u32::try_from(compute.hosts.len())
         .expect("compute validation bounded the group size by u32");
-    let after = compute.after.as_ref().map(|name| groups[name]);
-    let after_collective = match after {
-        Some(StageGroup::Collective(collective)) => {
-            Some(collective_ordinal(collective_table, collective))
-        }
-        Some(StageGroup::Compute(_)) | None => None,
-    };
+    let after_ranks = AfterRanks::new(plan, compute.after.as_ref(), &compute.hosts);
     for (rank, &host) in (0_u32..).zip(&compute.hosts) {
-        let (local_predecessor, inbound_predecessor, inbound_predecessor_bytes) = match after {
-            None => (None, None, 0),
-            Some(StageGroup::Compute(predecessor)) => (
-                Some(FlowKey::ComputeStage {
-                    semantic: predecessor.clone(),
-                    rank,
-                }),
-                None,
-                0,
-            ),
-            Some(StageGroup::Collective(collective)) => {
-                let n = collective.flow_count;
-                let Termination::Bytes(total_bytes) = collective.traffic.termination else {
-                    unreachable!("collective validation requires byte termination")
-                };
-                let final_step = u32::try_from(n - 1).expect("collective group fits u32");
-                let previous_rank = u32::try_from((u64::from(rank) + n - 1) % n)
-                    .expect("rank is below the u32 group size");
-                // A named collective is unique by name, so its only instance has ordinal 0.
-                let final_stage = |rank: u32| FlowKey::CollectiveStage {
-                    collective: after_collective
-                        .expect("a collective predecessor has a table ordinal"),
-                    duplicate_ordinal: 0,
-                    stage: CollectiveStagePosition {
-                        phase: CollectivePhase::AllGather,
-                        rank,
-                        step: final_step,
-                    },
-                };
-                let owner = collective_stage_owner(
-                    collective.algorithm,
-                    CollectivePhase::AllGather,
-                    n,
-                    u64::from(previous_rank),
-                    u64::from(final_step),
-                );
-                (
-                    Some(final_stage(rank)),
-                    Some(final_stage(previous_rank)),
-                    collective_chunk_bounds(total_bytes, n, owner).1,
-                )
-            }
-        };
+        let (local, inbound, inbound_predecessor_bytes) =
+            entry_predecessors(plan, compute.after.as_ref(), &after_ranks, (rank, host))?;
         flows.push(FlowInput {
             key: FlowKey::ComputeStage {
-                semantic: compute.clone(),
+                compute: compute_id,
                 rank,
             },
             source: host,
@@ -4023,8 +6190,8 @@ fn expand_compute(
                 group_size,
                 rank,
                 duration_ns: compute.duration_ns,
-                local_predecessor,
-                inbound_predecessor,
+                local,
+                inbound,
                 inbound_predecessor_bytes,
             })),
         });
@@ -4094,28 +6261,11 @@ fn validate_input_bounds(flows: &[FlowInput]) -> Result<(), CompileError> {
     Ok(())
 }
 
-/// The exact DCQCN reaction point of a DCQCN flow or RoCE queue pair whose pacing starts at
-/// `initial_delay_ns`; its first control tick is one control interval later.
-fn lowered_dcqcn_controller(config: DcqcnTrafficKey, initial_delay_ns: u64) -> DcqcnController {
-    let first_control_time_ns = initial_delay_ns
-        .checked_add(config.control_interval_ns)
-        .expect("DCQCN lowering checked first control deadline");
-    DcqcnController::new(
-        DcqcnControllerConfig {
-            initial_rate_bps: config.initial_rate_bps,
-            minimum_rate_bps: config.minimum_rate_bps,
-            maximum_rate_bps: config.maximum_rate_bps,
-            additive_rate_bps: config.additive_rate_bps,
-            hyper_rate_bps: config.hyper_rate_bps,
-            g_ppb: config.g_ppb,
-            decrease_ppb: config.decrease_ppb,
-            cnp_interval_ns: config.cnp_interval_ns,
-            control_interval_ns: config.control_interval_ns,
-            increase_byte_threshold: config.increase_byte_threshold,
-        },
-        first_control_time_ns,
-    )
-    .expect("validated DCQCN controller configuration")
+/// The exact Mellanox-form DCQCN reaction point of a DCQCN flow or RoCE queue pair: pristine, with
+/// no timer started (its timers start at its first feedback, P16).
+fn lowered_dcqcn_controller(config: DcqcnTrafficKey) -> DcqcnController {
+    DcqcnController::new(dcqcn_controller_config(config))
+        .expect("validated DCQCN controller configuration")
 }
 
 fn packet_count(traffic: &TrafficKey) -> u64 {
@@ -4156,6 +6306,7 @@ fn generator_seed(
     image_seed: u64,
     key: &FlowKey,
     collectives: &[CollectiveKey],
+    computes: &[ComputeKey],
     roce_keys: &[RoceTrafficKey],
 ) -> u64 {
     let mut state = mix_seed(image_seed ^ 0x6a09_e667_f3bc_c909);
@@ -4213,11 +6364,16 @@ fn generator_seed(
             state = mix_seed(state ^ semantic.flow_count);
             state = mix_seed(state ^ duplicate_ordinal);
             state = mix_seed(state ^ u64::from(stage.phase as u8));
+            // Channel 0 mixes nothing, so every single-ring stage keeps its seed.
+            if stage.channel != 0 {
+                state = mix_seed(state ^ (u64::from(stage.channel) << 32));
+            }
             state = mix_seed(state ^ u64::from(stage.rank));
             state = mix_seed(state ^ u64::from(stage.step));
             state = mix_traffic_seed(state, &semantic.traffic, roce_keys);
         }
-        FlowKey::ComputeStage { semantic, rank } => {
+        FlowKey::ComputeStage { compute, rank } => {
+            let semantic = &computes[*compute as usize];
             state = mix_seed(state ^ 0x434f_4d50_5554_4500);
             state = semantic
                 .name
@@ -4250,20 +6406,7 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey, roce_keys: &[RoceTraff
         TrafficKind::Tcp(TcpAlgorithm::Cubic) => mix_seed(state ^ 0x5450_435f_4355_4249),
         TrafficKind::Dcqcn(dcqcn) => {
             state = mix_seed(state ^ 0x4443_5143_4e00_0000);
-            for value in [
-                dcqcn.initial_rate_bps,
-                dcqcn.minimum_rate_bps,
-                dcqcn.maximum_rate_bps,
-                dcqcn.additive_rate_bps,
-                dcqcn.hyper_rate_bps,
-                dcqcn.g_ppb,
-                dcqcn.decrease_ppb,
-                dcqcn.cnp_interval_ns,
-                dcqcn.control_interval_ns,
-                dcqcn.pacing_interval_ns,
-                u64::from(dcqcn.cnp_priority),
-                dcqcn.increase_byte_threshold,
-            ] {
+            for value in dcqcn.seed_words() {
                 state = mix_seed(state ^ value);
             }
             state
@@ -4274,26 +6417,21 @@ fn mix_traffic_seed(mut state: u64, traffic: &TrafficKey, roce_keys: &[RoceTraff
             let roce = roce_key(roce_keys, ordinal);
             let dcqcn = roce.dcqcn;
             state = mix_seed(state ^ 0x524f_4345_5f51_5000);
-            for value in [
-                dcqcn.initial_rate_bps,
-                dcqcn.minimum_rate_bps,
-                dcqcn.maximum_rate_bps,
-                dcqcn.additive_rate_bps,
-                dcqcn.hyper_rate_bps,
-                dcqcn.g_ppb,
-                dcqcn.decrease_ppb,
-                dcqcn.cnp_interval_ns,
-                dcqcn.control_interval_ns,
-                dcqcn.pacing_interval_ns,
-                u64::from(dcqcn.cnp_priority),
-                dcqcn.increase_byte_threshold,
+            for value in dcqcn.seed_words().into_iter().chain([
                 roce.retransmit_timeout_ns,
                 roce.ack_every_packets,
                 roce.nack_interval_ns,
                 u64::from(roce.duplicate_ack),
                 roce.ack_size_bytes,
-            ] {
+            ]) {
                 state = mix_seed(state ^ value);
+            }
+            // A window joins the key's content only when it is on, so queue pairs without one
+            // keep the seeds and routes they had before windows existed (P16 ruling D7).
+            if roce.window_bytes != 0 {
+                for value in [roce.window_bytes, u64::from(roce.variable_window)] {
+                    state = mix_seed(state ^ value);
+                }
             }
             state
         }
@@ -4309,7 +6447,28 @@ fn mix_seed(mut value: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FlowInput, parsed_decimal};
+    use super::{AfterGroups, CollectiveKey, ComputeKey, FlowInput, parsed_decimal};
+
+    /// P16 H1 (ruling R1's gate): the operations' key fields must not grow the keys of ordinary
+    /// collectives and compute groups, which lowering holds and copies per group. `feat/p16`
+    /// (669e16b): `CollectiveKey` 248 B, `ComputeKey` 80 B. A channel ring's or a seeded
+    /// all-to-all's parts are one boxed pointer (8 B; the chunk policy fits in padding), and one
+    /// `after` name or several share the 24 B of the name they replaced.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn stage_group_keys_keep_their_size() {
+        for (name, size, bound) in [
+            ("CollectiveKey", std::mem::size_of::<CollectiveKey>(), 256),
+            ("ComputeKey", std::mem::size_of::<ComputeKey>(), 80),
+            (
+                "Option<AfterGroups>",
+                std::mem::size_of::<Option<AfterGroups>>(),
+                24,
+            ),
+        ] {
+            assert!(size <= bound, "{name} grew to {size} B, above {bound} B");
+        }
+    }
 
     /// `FlowInput` is held once per flow, sorted and moved through lowering, so its size is a
     /// per-flow memory and memory-movement cost: at the 262,144-flow frontier every 100 B is
@@ -4350,6 +6509,93 @@ mod tests {
         assert_eq!(
             negative,
             "unsupported probe `1e-9223372036854775809`; exact representation requires an integer scaled value"
+        );
+    }
+
+    /// `DISTRIBUTION_FIELDS` (the allocation-free fast path's table) equals the shared strict
+    /// schema `DistributionInfo`: each type takes exactly its listed fields, refuses every other
+    /// type's, and the schema has no type the table lacks.
+    #[test]
+    fn distribution_fields_match_the_shared_schema() {
+        // The fast path reads the text between an inline table's braces.
+        let exact = |table: &str| {
+            super::distribution_keys_are_exact(
+                table
+                    .strip_prefix('{')
+                    .and_then(|t| t.strip_suffix('}'))
+                    .expect("braces"),
+            )
+        };
+        let parse = |table: &str| {
+            #[derive(serde::Deserialize)]
+            struct Probe {
+                #[allow(dead_code)]
+                distribution: crate::scenario::DistributionInfo,
+            }
+            toml::from_str::<Probe>(&format!("distribution = {table}"))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let every_field = super::DISTRIBUTION_FIELDS
+            .iter()
+            .flat_map(|(_, fields, _)| fields.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        for (kind, fields, integer) in super::DISTRIBUTION_FIELDS {
+            // Values: the fast path says yes only where the schema does.
+            for value in [
+                "1",
+                "-2",
+                "+3",
+                "1_000",
+                "1.5",
+                "-0.25",
+                "1e3",
+                "2.5E-3",
+                "inf",
+                "-nan",
+                "0x10",
+                "0o7",
+                "true",
+                "\"1\"",
+                "[1]",
+                "{ a = 1 }",
+                "1979-05-27",
+                "07:32:00",
+            ] {
+                let table = fields
+                    .iter()
+                    .map(|field| format!(", {field} = {value}"))
+                    .collect::<String>();
+                let table = format!("{{ type = \"{kind}\"{table} }}");
+                if exact(&table) {
+                    parse(&table).unwrap_or_else(|error| panic!("{table}: {error}"));
+                }
+                assert_eq!(
+                    super::plain_number(value, integer),
+                    exact(&table),
+                    "{table}"
+                );
+            }
+            let own = fields
+                .iter()
+                .map(|field| format!(", {field} = 1"))
+                .collect::<String>();
+            parse(&format!("{{ type = \"{kind}\"{own} }}"))
+                .unwrap_or_else(|error| panic!("{kind} takes {fields:?}: {error}"));
+            assert!(exact(&format!("{{ type = \"{kind}\"{own} }}")));
+            for other in every_field.iter().filter(|field| !fields.contains(field)) {
+                let table = format!("{{ type = \"{kind}\"{own}, {other} = 1 }}");
+                assert!(parse(&table).is_err(), "{kind} refuses {other}");
+                assert!(!exact(&table));
+            }
+        }
+        let unknown = parse("{ type = \"Unknown\" }").expect_err("an unknown type");
+        for (kind, ..) in super::DISTRIBUTION_FIELDS {
+            assert!(unknown.contains(&format!("`{kind}`")), "{unknown}");
+        }
+        assert_eq!(
+            unknown.matches('`').count(),
+            2 * (super::DISTRIBUTION_FIELDS.len() + 1)
         );
     }
 }

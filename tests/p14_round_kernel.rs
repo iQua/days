@@ -193,7 +193,7 @@ fn image_has_pfc_state(image: &SimulationImage) -> bool {
 }
 
 /// Every `configs/p14/` fixture, and checkpoints of each taken across its run, down to the tail
-/// where every DCQCN generator has finished and only in-flight data and control timers remain.
+/// where every DCQCN generator has finished and only in-flight data and feedback remain.
 fn mechanism_images() -> Vec<(String, SimulationImage)> {
     let mut images = Vec::new();
     for (name, image) in fail_closed_fixtures() {
@@ -241,11 +241,11 @@ fn evaluation_cells_and_plain_scheduler_images_select_the_plain_round_kernel() {
 }
 
 /// The receiver-only gap (see `evidence/P14/spec.md`): on the plain build, only a DCQCN timer event
-/// (a pacing tick or a control timer) or a CNP arrival fails closed. Any run window that holds none
-/// of them, but in which CE-marked data reaches a notification point, runs to completion on the
-/// plain build and silently omits the CNPs. Such windows exist whenever the run's horizon falls
-/// inside one pacing interval of an active generator, or after the generator finishes and before
-/// the next control timer. Both were measured to diverge from Scalar on the bottleneck variants
+/// (a pacing tick; in P14 also a control timer, which P16 removed) or a CNP arrival fails closed.
+/// Any run window that holds none of them, but in which CE-marked data reaches a notification
+/// point, runs to completion on the plain build and silently omits the CNPs. Such windows exist
+/// whenever the run's horizon falls inside one pacing interval of an active generator, or after the
+/// generator finishes. Both were measured (P14) to diverge from Scalar on the bottleneck variants
 /// below. The only guard is static, image-level selection: every checkpoint of a DCQCN image keeps
 /// its notification points, so it selects the mechanisms build. These tests pin that for
 /// checkpoints taken while the generator is active and after it has finished.
@@ -293,7 +293,7 @@ fn active_dcqcn_generator_checkpoints_select_the_mechanisms_round_kernel() {
     }
 }
 
-/// `dcqcn_t26` behind a 1 Gbps bottleneck with a one-packet ECN threshold: CE-marked data keeps
+/// `dcqcn_t26` behind a 1 Gbps bottleneck with a one-packet (1,000 B) ECN step: CE-marked data keeps
 /// arriving at the notification point, between the 10 Gbps generator's ticks and after it
 /// finishes. `flow_size` replaces the flow's 20,000 B `size` line, to lengthen the active phase.
 fn dcqcn_t26_bottleneck(flow_size: Option<&str>) -> SimulationImage {
@@ -302,7 +302,10 @@ fn dcqcn_t26_bottleneck(flow_size: Option<&str>) -> SimulationImage {
     let mut variant = source
         .replace("port_rate = 100_000_000_000", "port_rate = 1_000_000_000")
         .replace("capacity = 1\n", "capacity = 100\n")
-        .replace("ecn_threshold = 1.0", "ecn_threshold = 0.01");
+        .replace(
+            "ecn_capacity_bytes = 1_000\n",
+            "ecn_capacity_bytes = 100_000\n",
+        );
     if let Some(size) = flow_size {
         assert!(variant.contains("size = 20_000"));
         variant = variant.replace("size = 20_000", size);
@@ -319,7 +322,7 @@ fn dcqcn_t26_bottleneck(flow_size: Option<&str>) -> SimulationImage {
 enum CheckpointPhase {
     /// A DCQCN generator is still `Scheduled`: windows between its pacing ticks.
     GeneratorActive,
-    /// No generator has a pacing timer left: windows before the next control timer.
+    /// No generator has a pacing timer left: windows after its last tick.
     GeneratorFinished,
 }
 
@@ -379,8 +382,12 @@ fn dcqcn_checkpoints(
 
 /// Every image the plain build must refuse before launch: each `configs/p14/` fixture and DCQCN-only
 /// variant with seven checkpoints of each, the finished-generator tails of `dcqcn_t26` and its
-/// bottleneck variant, and the 132 active-generator checkpoints of the lengthened bottleneck
-/// variant, 42 of which the plain build used to run to silently wrong bytes (review F2).
+/// bottleneck variant, and the 104 active-generator checkpoints of the lengthened bottleneck
+/// variant (132 under P14's paper-form controller). With the host refusal bypassed (a scratch
+/// patch), the plain build runs all 104 to silently wrong bytes on Metal, and the mechanisms build
+/// reproduces all 104 (`days-gpu/evidence/P16/dcqcn-impl/raw/f4-plain-forced-head.log`); P14's
+/// review F2 counted 42 of 132 when the plain build still had per-event stops, which the host
+/// refusal replaced. The refusal is the only guard.
 #[cfg(any(
     all(feature = "metal-test-hooks", target_vendor = "apple"),
     feature = "cuda-test-hooks"
@@ -399,8 +406,8 @@ fn refused_images() -> Vec<(String, SimulationImage)> {
     let active = dcqcn_checkpoints(&lengthened, CheckpointPhase::GeneratorActive);
     assert_eq!(
         active.len(),
-        132,
-        "the review's active-generator checkpoint set"
+        104,
+        "the active-generator checkpoint set (P16 Mellanox form)"
     );
     for (horizon, checkpoint) in active {
         images.push((format!("dcqcn_t26 lengthened active@{horizon}"), checkpoint));
@@ -481,7 +488,7 @@ mod cuda {
         run_cuda_with_observations,
     };
 
-    use super::{DISCIPLINES, fixture, refused_images, scalar, scheduler_image};
+    use super::{DISCIPLINES, fixture, lower, refused_images, scalar, scheduler_image};
 
     /// The kernels of one round module, in attempt-DAG order, then the readback gather.
     fn module_kernels(round: &'static str) -> Vec<&'static str> {
@@ -565,8 +572,11 @@ mod cuda {
             }
         }
 
-        // One-record channel and fallback-heap caps force capacity retries (a DCQCN host holds a
-        // pacing timer and a control timer); the record is the final attempt's.
+        // One-record channel and fallback-heap caps force capacity retries; the record is the
+        // final attempt's. The mechanisms case is a queue pair, whose host holds its pacing tick
+        // and its retransmission timeout at once: since P16 a DCQCN host holds only its pacing
+        // timer (the Mellanox-form controller has no events), so `dcqcn_t26` no longer overflows
+        // a one-record cap.
         let retrying = CudaConfig {
             max_channel_events_per_stream: Some(1),
             max_fel_events_per_lp: Some(1),
@@ -606,8 +616,8 @@ mod cuda {
                 true,
             ),
             (
-                "dcqcn_t26 after capacity retries",
-                fixture("dcqcn_t26.toml"),
+                "roce_timeout after capacity retries",
+                lower("configs/p15/roce_timeout.toml"),
                 RoundKernel::Mechanisms,
                 None,
                 retrying,
@@ -693,8 +703,8 @@ mod cuda {
                 true,
             ),
             (
-                "dcqcn_t26 after capacity retries",
-                fixture("dcqcn_t26.toml"),
+                "roce_timeout after capacity retries",
+                lower("configs/p15/roce_timeout.toml"),
                 RoundKernel::Mechanisms,
                 retrying,
                 true,
@@ -769,8 +779,8 @@ mod cuda {
                 retrying,
             ),
             (
-                "dcqcn_t26 after capacity retries",
-                fixture("dcqcn_t26.toml"),
+                "roce_timeout after capacity retries",
+                lower("configs/p15/roce_timeout.toml"),
                 retrying,
             ),
         ] {

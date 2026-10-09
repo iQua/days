@@ -15,11 +15,14 @@ drop = "TailDrop"
 
 | Field | Type | Requirement |
 | --- | --- | --- |
-| `port_rate` | number | Required. Bits per second. Exact lowering requires a positive integer bps value representable in `u64`. |
-| `capacity` | integer | Required. Packet capacity for configured switch queues. |
+| `port_rate` | number | Required, except on the Spectrum-X topology, which refuses it (its link rates are in `[topology.spectrum_x]`). Bits per second. Exact lowering requires a positive integer bps value representable in `u64`. |
+| `capacity` | integer | Required. Packet capacity of a TailDrop queue. In Days AGO an ECN queue tail-drops at `ecn_capacity_bytes` instead; there `capacity` only informs the device planners' per-queue packet sizing. |
 | `discipline` | string | Required. Selects the scheduler. |
-| `drop` | string | Required. Selects admission or ECN marking. |
-| `ecn_threshold` | fraction | Valid only with `drop = "ECN_THRESHOLD"`; must satisfy `0 < value <= 1`. |
+| `drop` | string | Required. Selects the drop rule. Days AGO accepts only `TailDrop`. |
+| `ecn` | table | Days AGO. The ECN ramp of every queue: `{ kmin_bytes, kmax_bytes, pmax }`. Exclusive with `ecn_by_rate`; needs `ecn_capacity_bytes`. |
+| `ecn_by_rate` | table array | Days AGO. One ramp per egress link rate: `{ rate_bps, kmin_bytes, kmax_bytes, pmax }`, one row per distinct rate, a row for every egress rate. Needs `ecn_capacity_bytes`. |
+| `ecn_capacity_bytes` | integer | Days AGO. The byte capacity an ECN queue tail-drops at. Valid only with `ecn` or `ecn_by_rate`. |
+| `ecn_threshold` | fraction | Legacy only. Valid with `drop = "ECN_THRESHOLD"`; must satisfy `0 < value <= 1`. |
 | `weights` | integer array | Used by WFQ, DRR, and WRR. |
 | `priorities` | integer array | Used by SP. |
 | `vticks` | number array | Used by legacy VirtualClock. |
@@ -51,24 +54,51 @@ unsupported scheduler `VirtualClock`; Days executor supports FIFO, SP, WFQ, DRR,
 
 ## Drop and ECN policies
 
-| Value | Legacy | Exact Scalar/CPU | Exact Metal/CUDA |
-| --- | --- | --- | --- |
-| `TailDrop` | yes | yes | yes |
-| `ECN_THRESHOLD` | yes | yes | yes |
-| `RED` | yes | yes | rejected |
-| `RED_ECN` | yes | yes | rejected |
+| Value | Legacy | Days AGO (all four backends) |
+| --- | --- | --- |
+| `TailDrop` | yes | yes |
+| `ECN_THRESHOLD` | yes | refused; use `ecn` or `ecn_by_rate` |
+| `RED` | yes | refused |
+| `RED_ECN` | yes | refused |
 
 TailDrop drops a packet when admitting it would exceed packet capacity. Capacity `0` means unlimited for TailDrop.
 
-`ECN_THRESHOLD` has a default fraction of `0.8`. Legacy marks an ECN-capable packet and drops a non-ECN-capable packet at the threshold; it marks when post-admission depth is greater than `floor(ecn_threshold * capacity)`. Exact packets carry a lowered `ecn_marked` bit, so the exact scheduler sets that bit at or above `ceil(ecn_threshold * capacity)`. Exact ECN threshold requires positive capacity. Physical capacity overflow drops packets in both runtimes.
+### Days AGO: the ECN ramp
 
-Legacy RED and RED_ECN use packet occupancy, thresholds at 70% and 90% of capacity, EWMA weight `2^-9`, and maximum probability `0.8`. RED drops on a congestion action. RED_ECN marks an ECN-capable packet on that action and still drops at physical overflow. Exact RED uses integer deterministic state for byte-identical execution and requires capacity of at least 10 packets.
+Days AGO has one drop rule, tail drop at the queue's capacity, and one marking policy, the ECN ramp. It follows the Kmin/Kmax/Pmax shape of RED-style ECN on RoCE and DCQCN switches, over the instantaneous queue in bytes:
 
-Metal and CUDA reject lowered RED state before execution:
-
-```text
-backend Cuda does not support RED admission; use Scalar or Cpu
+```toml
+[switch]
+port_rate = 100000000000
+capacity = 3729
+discipline = "FIFO"
+drop = "TailDrop"
+ecn_capacity_bytes = 33554432
+ecn = { kmin_bytes = 400000, kmax_bytes = 1600000, pmax = 0.2 }
 ```
+
+The decision is made once, when a packet arrives at a switch egress queue. Let `d` be the queue's bytes after admitting the packet (the packet in service is not counted):
+
+1. If `d` exceeds `ecn_capacity_bytes`, the packet is dropped.
+2. A packet that is not ECN-capable data is admitted unmarked, at any depth. ECN-capable data is plain, TCP and RoCE data; ACKs, NACKs, CNPs and PFC frames are never marked.
+3. Below `kmin_bytes` the packet is admitted unmarked; at or above `kmax_bytes` it is marked.
+4. In between, it is marked with probability `pmax * (d - kmin) / (kmax - kmin)`.
+
+The probability is decided by an exact integer test. With `span = pmax_den * (kmax - kmin)`, the packet is marked when `floor(u * span / 2^64) < pmax_num * (d - kmin)`, where `u` is a 64-bit draw. This equals `u / 2^64 < P(d)`, so the probability is never rounded; the draw has a resolution of `2^-64`. At `d = kmin` the probability is zero.
+
+The draw is stateless: `u = mix(queue_key ^ payload_id)`, where `queue_key = mix(mix(mix(seed ^ ECN_RAMP) ^ node) ^ queue)` and `mix` is SplitMix64's output function. Its inputs are the scenario `seed`, the switch egress port, and the packet's payload id (one per transmission attempt), so the draw does not depend on event order, worker count or backend, and no packet (an ACK included) can consume or reset another's draw. A retransmitted packet draws again.
+
+`pmax` is an exact decimal in `(0, 1]`, lowered to a fraction in lowest terms (`0.2` is `1/5`). The step is the special case `kmin_bytes = kmax_bytes` with `pmax = 1`: it marks every ECN-capable data packet at or above the threshold. Lowering refuses `kmin_bytes` of zero, `kmin_bytes > kmax_bytes`, `kmax_bytes > ecn_capacity_bytes`, a step with `pmax` below one, and a span beyond 64 bits.
+
+The ramp runs on Scalar, CPU, Metal and CUDA with byte-identical results. On Metal and CUDA it is part of the mechanisms build of the round kernel, so an image without ECN runs the plain build, which admits by tail drop alone. LeanGuard's `p10c_aqm_check` recomputes every decision and its draw from the AQM certificate (see [LeanGuard](/docs/verification/leanguard)).
+
+The SimAI fidelity lowers `SimAI.conf`'s `KMIN_MAP`, `KMAX_MAP` and `PMAX_MAP` rows into `ecn_by_rate` (KB times 1,000), and `BUFFER_SIZE` into `ecn_capacity_bytes`; see [Workloads](/docs/configuration/workloads#what-simaiconf-sets). Days AGO decides at enqueue, where SimAI marks at dequeue; both decision points exist in switch hardware.
+
+### Legacy
+
+`ECN_THRESHOLD` has a default fraction of `0.8`. Legacy marks an ECN-capable packet and drops a non-ECN-capable packet at the threshold; it marks when post-admission depth is greater than `floor(ecn_threshold * capacity)`. Physical capacity overflow drops packets.
+
+Legacy RED and RED_ECN use packet occupancy, thresholds at 70% and 90% of capacity, EWMA weight `2^-9`, and maximum probability `0.8`. RED drops on a congestion action. RED_ECN marks an ECN-capable packet on that action and still drops at physical overflow.
 
 ## ECN-capable transports
 
@@ -76,4 +106,4 @@ Legacy TCP emits `Ect0` only when `[flow.traffic.tcp] ecn = true`. DCQCN data is
 
 ## PFC interaction
 
-PFC monitors per-priority byte occupancy while the scheduler retains packet-capacity admission. Legacy schedulers expose shared queue state to their PFC ingress actors. Exact PFC runs on Scalar, CPU, Metal, and CUDA. See [L2 and PFC](/docs/configuration/l2).
+PFC monitors per-priority byte occupancy while the queue keeps its own admission rule (packet capacity for TailDrop, `ecn_capacity_bytes` for the ECN ramp). Legacy schedulers expose shared queue state to their PFC ingress actors. Exact PFC runs on Scalar, CPU, Metal, and CUDA. See [L2 and PFC](/docs/configuration/l2).

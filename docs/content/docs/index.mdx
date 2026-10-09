@@ -28,12 +28,13 @@ Every backend that accepts a scenario produces byte-identical complete state. A 
 
 ## What Days AGO models
 
-- **Topologies:** fat-tree, torus, dragonfly, and custom graphs.
-- **Transport:** deterministic packet-distribution sources, closed-loop TCP Reno and CUBIC, and DCQCN with CNP.
-- **Switches:** FIFO, strict-priority, DRR, WRR, and exact-rational WFQ scheduling; TailDrop, ECN-threshold, RED, and RED-with-ECN admission; PFC.
-- **Collectives:** ring all-reduce and all-gather over TCP, with delay-only compute stages.
+- **Topologies:** fat-tree, torus, dragonfly, custom graphs, and the Spectrum-X rail fabric of SimAI, with delay-only NVLink inside a server and SimAI's Murmur3 ECMP.
+- **Transport:** deterministic packet-distribution sources, closed-loop TCP Reno and CUBIC, Mellanox-form DCQCN (the controller of HPCC's ns-3 model and SimAI) on unreliable flows, and RoCE queue pairs with Go-back-N reliability and ECN echo.
+- **Switches:** FIFO, strict-priority, DRR, WRR, and exact-rational WFQ scheduling; TailDrop admission and ECN marking on a Kmin/Kmax/Pmax ramp; PFC.
+- **Collectives:** ring all-reduce, all-gather, reduce-scatter, all-to-all (uniform or seeded imbalanced), and send/receive over TCP or RoCE queue pairs, with delay-only compute stages and counted joins between them.
+- **Workloads:** AICB/SimAI training traces, lowered onto the Spectrum-X fabric with the fabric parameters taken from `SimAI.conf`.
 
-DCQCN and PFC run on all four backends. RED, collectives, and compute stages run on the Scalar and CPU backends; Metal and CUDA reject those scenarios at validation.
+DCQCN, RoCE queue pairs, PFC, the ECN ramp, collectives, compute stages, and stage notifies run on all four backends.
 
 ## What makes it exact
 

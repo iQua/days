@@ -194,8 +194,7 @@ fn ring_allreduce_and_allgather_lower_to_parametric_tcp_stages() {
                 panic!("every expanded flow uses the ordinary TCP generator")
             };
             let stage = identity(&stage);
-            assert_eq!(stage.topology_level, 0);
-            assert_eq!(stage.topology_group, 0);
+            assert_eq!(stage.channel, 0);
             assert_eq!(stage.group_size, 4);
             assert!(stage.rank < 4);
             assert!((1..4).contains(&stage.step));
@@ -331,12 +330,12 @@ fn collective_validator_rejects_inconsistent_dependency_state() {
     let (_, stage) = stages_mut(&mut inbound_mismatch)
         .find(blocked)
         .expect("all-gather has blocked descendants");
-    stage.dependencies.inbound_predecessor_complete = true;
+    stage.dependencies.inbound_bytes_received = stage.dependencies.inbound_predecessor_bytes;
     assert!(
         validate(&inbound_mismatch, Backend::Scalar)
             .expect_err("completion without inbound bytes must reject")
             .to_string()
-            .contains("inbound completion flag disagrees with received bytes")
+            .contains("disagree with the in-order frontiers")
     );
 
     let mut frontier_mismatch = image.clone();
@@ -348,19 +347,19 @@ fn collective_validator_rejects_inconsistent_dependency_state() {
         validate(&frontier_mismatch, Backend::Scalar)
             .expect_err("inbound bytes must equal the in-order TCP frontier")
             .to_string()
-            .contains("disagree with the in-order TCP frontier")
+            .contains("disagree with the in-order frontiers 0")
     );
 
     let mut local_mismatch = image.clone();
     let (_, stage) = stages_mut(&mut local_mismatch)
         .find(blocked)
         .expect("all-gather has blocked descendants");
-    stage.dependencies.local_predecessor_complete = true;
+    stage.dependencies.local_completed = 1;
     assert!(
         validate(&local_mismatch, Backend::Scalar)
             .expect_err("local completion before the predecessor is acknowledged must reject")
             .to_string()
-            .contains("local completion flag disagrees with predecessor state")
+            .contains("local completion count 1 disagrees with predecessor state")
     );
 
     let mut early_release = image;
@@ -416,7 +415,10 @@ fn collective_validator_rejects_overlapping_equal_remainder_last_partition() {
         if owner(stage) == 0 {
             stage.chunk_bytes = 3;
             set_identity(record, stage);
-            record.dependencies.inbound_predecessor_bytes = 3;
+            // A root waits for no inbound bytes.
+            if record.dependencies.inbound.one().is_some() {
+                record.dependencies.inbound_predecessor_bytes = 3;
+            }
             let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
                 unreachable!()
             };
@@ -451,7 +453,10 @@ fn collective_validator_binds_partition_to_the_declared_total() {
         stage.chunk_offset_bytes = owner(stage) * 3;
         stage.chunk_bytes = 3;
         set_identity(record, stage);
-        record.dependencies.inbound_predecessor_bytes = 3;
+        // A root waits for no inbound bytes.
+        if record.dependencies.inbound.one().is_some() {
+            record.dependencies.inbound_predecessor_bytes = 3;
+        }
         let FlowGeneratorKind::Tcp(mut tcp) = generator.kind else {
             unreachable!()
         };
@@ -581,8 +586,8 @@ fn collective_roots_beyond_the_stop_leave_every_descendant_unreleased() {
         .flat_map(HostState::generators_with_stages)
     {
         let stage = stage.expect("every expanded flow is a stage");
-        let root = stage.dependencies.local_predecessor.is_none()
-            && stage.dependencies.inbound_predecessor.is_none();
+        let root =
+            stage.dependencies.local.one().is_none() && stage.dependencies.inbound.one().is_none();
         assert_eq!(stage.activated, root);
         assert_eq!(generator.packets_emitted, 0);
         assert_eq!(
@@ -621,14 +626,13 @@ fn collective_maximum_group_width_rejects_without_validator_panic() {
     );
 }
 
+/// P16 G1: the device backends accept collective stages (identity in
+/// `tests/p16_device_collectives.rs`).
 #[test]
-fn collective_device_capability_rejection_is_precise() {
+fn collective_images_validate_on_devices() {
     let image = compile_collective("AllGather");
     for backend in [Backend::Metal, Backend::Cuda] {
-        assert_eq!(
-            validate(&image, backend).unwrap_err().to_string(),
-            format!("backend {backend} does not support collective generators; use Scalar or Cpu")
-        );
+        validate(&image, backend).expect("devices accept collective stages");
     }
 }
 

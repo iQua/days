@@ -1,0 +1,33 @@
+# P16 H3: the MoE smoke trace (Qwen3-30B-A3B-like, 12 layers, 128 GPUs, TP2, EP32, gbs 128) on
+# SimAI's 128g fabric, SimAI fidelity. Lowering it needs host-matched `after` (ruling C1).
+seed = 7
+duration = 1.0
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 128
+gpus_per_server = 8
+nics_per_asw = 64
+psws = 64
+gpu_type = "A100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[workload.aicb]
+trace = "smoke-moe-w128-tp2-ep32.txt"
+trace_sha256 = "94cc56eacb18cc7bca660e551859bc21d65fdeaaeec647f8578bc5d72f7ff1b7"
+fidelity = "simai"
+expert_routing = "uniform"
+
+[workload.aicb.simai]
+conf = "SimAI.conf"
+conf_sha256 = "1fe56bee9c2a0e0f27fdbe816c2c51c9254b5d5a6c5e05adaac347a758e77fcf"
+topology = "Spectrum-X_128g_8gps_100Gbps_A100"
+send_lat_us = 3
+nvls_enable = true
+pxn_enable = false

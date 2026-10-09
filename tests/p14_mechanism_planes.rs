@@ -102,10 +102,14 @@ fn p14_fixtures_plan_their_mechanism_state() {
     }
 }
 
-/// P15 lane R4: queue-pair images plan the RoCE region (13 words per receiver) and mark their
+/// P15 lane R4: queue-pair images plan the RoCE region (10 words per receiver since P16, whose
+/// receiver holds no notification point; 13 in P15) and mark their
 /// receiver rows; host-link PFC adds host rows; and the per-flow class word pins the feedback
 /// class (ruling D2): `hostpfc_multi_qp_tcp`'s queue pairs carry data on class 3 and feedback on
-/// class 0, so their word is `3 | (3 << 8)`, while its TCP flow (both classes 3) keeps `3`.
+/// class 0, so their word is `3 | (3 << 8)`, while its TCP flow (both classes 3) keeps `3`. P16 H4
+/// (ruling G9): a queue pair at a host with a PFC row also carries its slot in that host's
+/// queue-pair list in bits 16.. (the parked-bitset index): here slots 0, 1 and 2 at one host and
+/// slot 0 at two others.
 #[test]
 fn p15_fixtures_plan_their_queue_pair_and_host_pfc_state() {
     for (name, pairs) in [
@@ -116,21 +120,43 @@ fn p15_fixtures_plan_their_queue_pair_and_host_pfc_state() {
         let image = lower(&format!("configs/p15/{name}"));
         for (backend, words) in measure(&image) {
             assert_eq!(words.roce_receiver_rows, pairs, "{backend} {name}");
-            assert_eq!(words.roce_region_words, 13 * pairs, "{backend} {name}");
+            assert_eq!(words.roce_region_words, 10 * pairs, "{backend} {name}");
             assert_eq!(words.dcqcn_receiver_rows, 0, "{backend} {name}");
         }
     }
     let image = lower("configs/p15/hostpfc_multi_qp_tcp.toml");
+    let slots = image
+        .host_states
+        .iter()
+        .filter(|host| host.pfc.is_some())
+        .flat_map(|host| {
+            host.generators
+                .iter()
+                .filter(|generator| {
+                    matches!(generator.kind, days_executor::FlowGeneratorKind::Roce(_))
+                })
+                .enumerate()
+                .map(|(slot, generator)| (generator.flow, slot as u64))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        slots.values().copied().collect::<Vec<_>>(),
+        [0, 1, 2, 0, 0],
+        "five queue pairs at three host-PFC hosts"
+    );
     let expected = image
         .flows
         .iter()
-        .map(|flow| match (flow.priority, flow.feedback_priority) {
-            (3, 0) => 3 | (3 << 8),
-            (3, 3) => 3,
-            other => panic!("unexpected classes {other:?}"),
+        .map(|flow| {
+            let classes = match (flow.priority, flow.feedback_priority) {
+                (3, 0) => 3 | (3 << 8),
+                (3, 3) => 3,
+                other => panic!("unexpected classes {other:?}"),
+            };
+            classes | slots.get(&flow.id).map_or(0, |slot| slot << 16)
         })
         .collect::<Vec<u64>>();
-    assert!(expected.contains(&(3 | (3 << 8))) && expected.contains(&3));
+    assert!(expected.contains(&(3 | (3 << 8) | (2 << 16))) && expected.contains(&3));
     for (backend, words) in measure(&image) {
         assert_eq!(words.pfc_class_words, expected, "{backend}");
     }

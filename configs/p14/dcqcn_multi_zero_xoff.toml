@@ -15,8 +15,9 @@ log_path = "logs/dcqcn_multi"
 port_rate = 1000000000
 capacity = 512
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 0.2
+drop = "TailDrop"
+ecn_capacity_bytes = 512_000
+ecn = { kmin_bytes = 103_000, kmax_bytes = 103_000, pmax = 1 }
 
 [link]
 mode = "Pfc"
@@ -44,8 +45,7 @@ max_rate_gbps = 10.0
 g = 0.5
 ai_rate_gbps = 0.5
 hai_rate_gbps = 1.0
-mi_factor = 0.5
-rtt_ns = 100000
+rp_timer_ns = 100000
 cnp_interval_ns = 10000
 pacing_interval_ns = 1000
 cnp_priority = 0
@@ -67,8 +67,7 @@ max_rate_gbps = 10.0
 g = 0.5
 ai_rate_gbps = 0.5
 hai_rate_gbps = 1.0
-mi_factor = 0.5
-rtt_ns = 100000
+rp_timer_ns = 100000
 cnp_interval_ns = 10000
 pacing_interval_ns = 1000
 cnp_priority = 0

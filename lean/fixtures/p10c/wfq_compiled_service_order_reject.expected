@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 31: WFQ served payload 0, but the least finish tag among the eligible packets is payload 25

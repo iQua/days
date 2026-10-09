@@ -1,0 +1,33 @@
+# P16 H3: the reduced dense AICB trace (32 GPUs, TP8, PP2) under the Megatron fidelity: per-stage
+# DP2 rings and PP Send/Recv between the two 16-GPU stages, on the rail of
+# reduced-dense-simai.toml.
+seed = 7
+duration = 0.01
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 32
+gpus_per_server = 8
+nics_per_asw = 2
+psws = 4
+gpu_type = "A100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[workload.aicb]
+trace = "reduced-dense-w32-tp8-pp2.txt"
+trace_sha256 = "b5c96935c6455dec3bc84ee18efca38b671927639d68fe7db50f33bea7241cca"
+fidelity = "megatron"
+expert_routing = "uniform"
+
+[workload.aicb.simai]
+conf = "SimAI.conf"
+conf_sha256 = "1fe56bee9c2a0e0f27fdbe816c2c51c9254b5d5a6c5e05adaac347a758e77fcf"
+send_lat_us = 3
+nvls_enable = true
+pxn_enable = false

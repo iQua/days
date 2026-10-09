@@ -64,7 +64,7 @@ const ADDED_HOSTS: u64 = EDGE_SWITCHES * (LARGE_HOSTS_PER_EDGE - SMALL_HOSTS_PER
 /// The E1 flow set's open-loop traffic, and the queue-pair traffic that replaces it.
 const OPEN_LOOP_TRAFFIC: &str = "traffic = { initial_delay = 0.0, size = 1_540_000, arr_dist = { type = \"Uniform\", low = 0.000001232, high = 0.000001232 }, pkt_size_dist = { type = \"DiscreteUniform\", low = 1540, high = 1540 } }";
 const TCP_TRAFFIC: &str = "traffic = { initial_delay = 0.0, size = 1_540_000, arr_dist = { type = \"Uniform\", low = 1, high = 1 }, pkt_size_dist = { type = \"DiscreteUniform\", low = 1540, high = 1540 }, tcp = { cc_algorithm = \"Reno\" } }";
-const QUEUE_PAIR_TRAFFIC: &str = "traffic = { initial_delay = 0.0, size = 1_540_000, arr_dist = { type = \"Uniform\", low = 1, high = 1 }, pkt_size_dist = { type = \"DiscreteUniform\", low = 1540, high = 1540 }, dcqcn = { rate_gbps = 100.0, min_rate_gbps = 0.1, max_rate_gbps = 100.0, g = 0.00390625, ai_rate_gbps = 0.02, hai_rate_gbps = 0.2, mi_factor = 0.5, rtt_ns = 50000, cnp_interval_ns = 0, pacing_interval_ns = 100 }, roce = { retransmit_timeout_ns = 1_000_000 } }";
+const QUEUE_PAIR_TRAFFIC: &str = "traffic = { initial_delay = 0.0, size = 1_540_000, arr_dist = { type = \"Uniform\", low = 1, high = 1 }, pkt_size_dist = { type = \"DiscreteUniform\", low = 1540, high = 1540 }, dcqcn = { rate_gbps = 100.0, min_rate_gbps = 0.1, max_rate_gbps = 100.0, g = 0.00390625, ai_rate_gbps = 0.02, hai_rate_gbps = 0.2, rp_timer_ns = 50000, pacing_interval_ns = 100 }, roce = { retransmit_timeout_ns = 1_000_000 } }";
 
 /// E1 on a k = 8 fat tree with `hosts_per_edge` hosts per edge switch and one flow per host,
 /// open-loop or queue pairs, written to a file private to this process and test.

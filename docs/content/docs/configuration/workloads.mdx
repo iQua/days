@@ -1,0 +1,117 @@
+---
+title: Workloads
+description: Lower an AICB/SimAI training trace onto the Spectrum-X fabric with [workload.aicb], taking every fabric parameter from SimAI.conf.
+---
+
+**Scope: Days AGO.** A `[workload.aicb]` table makes an AICB trace the scenario's traffic. The legacy loader rejects the `workload` key.
+
+AICB (Alibaba's AI communication benchmark) writes one trace per training configuration: a header with the parallelism (`TP`, `EP`, `PP`, `ga`, `all_gpus`) and one record per model layer with its forward, input-gradient and weight-gradient compute times, collective types and sizes. SimAI runs such a trace on a topology file and a `SimAI.conf`. Days AGO's adapter (`src/workload/aicb/`) reads the same three inputs: it parses the trace, forms SimAI's communicator groups, plans each rank's schedule as SimAI's workload loop runs it, derives every switch, link and transport parameter from `SimAI.conf`, and lowers the result through the workload IR (`src/scenario/workload.rs`) into the same stage groups a TOML `[[collective]]` or `[[compute]]` lowers to. Every backend runs the lowered image; see [Collectives](/docs/configuration/collectives) and [Spectrum-X](/docs/configuration/topology#spectrum-x).
+
+## A scenario
+
+`tests/fixtures/aicb/b4-simai.toml` runs SimAI's dense GPT-13B baseline (128 A100 GPUs, TP8, gradient accumulation 1) under the SimAI fidelity:
+
+```toml
+seed = 7
+duration = 0.4
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 128
+gpus_per_server = 8
+nics_per_asw = 64
+psws = 64
+gpu_type = "A100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[workload.aicb]
+trace = "b4-gpt13b-w128-tp8-pp2-gbs8.txt"
+trace_sha256 = "8268ee8380f9105452428a283713a1e3451fe054635da212aaf9131c09c8a68f"
+fidelity = "simai"
+expert_routing = "uniform"
+
+[workload.aicb.simai]
+conf = "SimAI.conf"
+conf_sha256 = "1fe56bee9c2a0e0f27fdbe816c2c51c9254b5d5a6c5e05adaac347a758e77fcf"
+topology = "Spectrum-X_128g_8gps_100Gbps_A100"
+send_lat_us = 3
+nvls_enable = true
+pxn_enable = false
+```
+
+```bash
+cargo run --release --bin days -- --engine scalar tests/fixtures/aicb/b4-simai.toml
+```
+
+The run prints a `record=days_workload` line before the usual records (see [The run manifest](#the-run-manifest)). On this scenario Days AGO finishes the iteration at 312,140,431 ns of simulated time, on Scalar and on CPU with 4 workers; SimAI finishes the same trace on the same fabric at 315,442,327 ns (`days-gpu/evidence/P16/b4pin/report.md`, which attributes most of the difference to the recorded divergences below and leaves a small residue unattributed). The MoE comparison uses the M2s trace: the gbs 64 Qwen3-30B-A3B-like trace (128 GPUs, TP2, EP32; sha256 `fee71765…`) that SimAI's reference run used, run through the same `[workload.aicb]` path with SimAI fidelity and uniform routing, from a scenario held in the evidence repository (`days-gpu/evidence/P16/moepin/tooling/scenario/m2s-simai.toml`) rather than a committed fixture. On it, Days AGO finishes at 376,940,721 ns against SimAI's 341,224,212 ns, 10.47% later. Days AGO's own marking costs 22.68 ms (the run with the ramp against a run whose ramp is never reached); Days AGO without marking is still 13.04 ms slower than SimAI with its marking, so at least 13.04 ms of the gap is unrelated to marking; SimAI's own marking cost is unmeasured, so the 22.68 ms is not marking's share of the gap. Both Days AGO runs have zero PFC pauses and zero drops (`days-gpu/evidence/P16/ecnramp/report.md`). The committed `smoke-simai.toml` runs a different trace, the gbs 128 one (sha256 `94cc56ea…`); it runs to completion at 629,875,182 ns on Scalar (`days-gpu/evidence/P16/flagsmoke2/report.md`) and has no SimAI counterpart run. The lowered images run byte-identically on Scalar, CPU, Metal and CUDA.
+
+## `[workload.aicb]`
+
+| Key | Rule |
+| --- | --- |
+| `trace` | The AICB trace, relative to the scenario file. |
+| `trace_sha256` | Required. The trace's SHA-256; a mismatch is refused with both digests in the message. |
+| `fidelity` | `"simai"` or `"megatron"`; see [Fidelity](#fidelity). |
+| `expert_routing` | `"uniform"` or `"imbalanced"`; see [Expert routing](#expert-routing). |
+| `imbalanced` | The `[workload.aicb.imbalanced]` table: `seed`, `experts`, `topk`, `tokens_per_rank`, and `zipf` (`0` or `1`). Required with `expert_routing = "imbalanced"` and refused otherwise. |
+| `simai` | The `[workload.aicb.simai]` table, always required. |
+
+`[workload.aicb.simai]`:
+
+| Key | Rule |
+| --- | --- |
+| `conf`, `conf_sha256` | Required. SimAI's `SimAI.conf`, relative to the scenario file, and its SHA-256. It is the fabric's single source; see [What SimAI.conf sets](#what-simaiconf-sets). |
+| `topology` | Optional. One of the three SimAI topology files Days AGO knows: `Spectrum-X_1024g_8gps_400Gbps_H100`, `Spectrum-X_512g_8gps_400Gbps_H100`, or `Spectrum-X_128g_8gps_100Gbps_A100`. The scenario's `[topology.spectrum_x]` must equal that file's parameters field by field, and the render of the fabric in SimAI's grammar must hash to the file's pinned SHA-256. Without it the fabric is not pairable with a SimAI run, and the manifest says `simai_topology=none`. |
+| `send_lat_us`, `nvls_enable`, `pxn_enable` | SimAI's `AS_SEND_LAT`, `AS_NVLS_ENABLE` and `AS_PXN_ENABLE` environment pins. Required together under `fidelity = "simai"`; optional, together, under `"megatron"`. `pxn_enable = true` is refused ("AS_PXN_ENABLE = 1 adds PXN forwarding flows, which Days does not model"). `nvls_enable = true` on an `H100` or `H800` fabric refuses a tensor-parallel all-reduce of 8 or more ranks under the SimAI fidelity, which SimAI would run as NVLS. `send_lat_us` is recorded, not modelled. |
+
+Every table rejects unknown keys. The scenario must declare `[topology] category = "SpectrumX"` with `[topology.spectrum_x]`, and the trace's `all_gpus` must equal `gpus`. It must not declare `[switch]`, `[link]`, `[routing]`, `[[flow]]`, `[[flow_set]]`, `[[collective]]`, `[[collective_set]]` or `[[compute]]`: "an AICB scenario takes `[switch]` from SimAI.conf and its trace; remove it". `seed` and `duration` are the scenario's as usual.
+
+## Fidelity
+
+Both fidelities share the parser, the per-rank schedule, SimAI's size rules and the lowering. They differ in how ranks are grouped and in which of SimAI's limits are enforced.
+
+- **`simai`**: SimAI as it runs. Pipeline parallelism is forced to 1 and the groups are SimAI's own (`MockNcclGroup`: tensor-parallel, data-parallel, expert-parallel and expert-data-parallel groups; the adapter's groups equal SimAI's byte for byte on the three committed configurations, pinned by `tests/fixtures/aicb/mockncclgroup-*.txt`). Only uniform expert routing is allowed. The conditions under which SimAI would never finish are refused rather than simulated: a forward or input-gradient collective of 0 bytes; a ring whose per-message size floors to 0 (SimAI creates the stream but sends nothing); any message whose last packet would fall in SimAI's unsignalled send window (a last payload of at most 8 or at least 8,948 bytes, with 52 bytes of headers at a 9,000-byte MTU); a compute or `process_time` above `2^31 - 1` ns (SimAI narrows it to `int`); and the two environment refusals above.
+- **`megatron`**: Megatron-style placement. Groups are formed per pipeline stage from the stage's contiguous block of ranks, and pipeline transfers become `SendRecv` operations between the stages in trace order (the GPipe schedule, exact for `ga = 1`). SimAI's size rules still apply so that a `PP = 1` trace lowers to the same operations under both fidelities; the hang window is counted in the manifest but not enforced. Either expert routing is allowed.
+
+Size rules, applied in SimAI's order under both fidelities: a forward collective of 1 to 4,095 bytes becomes 4,096 bytes; a weight-gradient collective of 0 bytes is dropped; ring messages are `floor(floor(S / n) / c)` bytes and all-to-all pairs `floor(S / n)`; an all-to-all below one byte per pair becomes one byte per pair under the SimAI fidelity. A rank's consecutive delays (compute, `process_time`, SimAI's one-tick gaps, and every tensor-parallel collective, whose ranks share one server) are fused into one compute stage per segment; the NVLink delay of each fused collective comes from the formula on the [Spectrum-X](/docs/configuration/topology#nvlink-is-delay-only) page. Weight-gradient collectives run on stream 1, SimAI's data queue, in the order SimAI's LIFO queue realizes when every waiting collective is issued before the running one can finish (`data_queue=lifo` in the manifest); with at most two data collectives the issue order already is that order (`fifo`); otherwise the adapter falls back to issue order and records it (`fifo-fallback`).
+
+## Expert routing
+
+- **`uniform`**: SimAI's all-to-all, `floor(S / n)` bytes per ordered pair.
+- **`imbalanced`**: a Days AGO-only arm, refused under the SimAI fidelity ("imbalanced expert routing is a Days-only arm; use fidelity = \"megatron\""). Each dispatch and combine pair of all-to-alls in the trace becomes one seeded routing matrix (the combine sends the transpose), with the semantics of a TOML [`[collective.alltoall]`](/docs/configuration/collectives#seeded-all-to-all): `seed`, `experts` (a multiple of the expert-parallel group size), `topk`, `tokens_per_rank`, and `zipf` (`1` for Zipf(1) popularity, `0` for equal popularity). The bytes per routed copy are `S / (tokens_per_rank * topk)`, which must divide exactly. `tests/fixtures/aicb/smoke-imbalanced.toml` is this arm on the MoE smoke trace.
+
+## What SimAI.conf sets
+
+The adapter reads `SimAI.conf` with SimAI's own key list and arities; an unknown key or a repeated one is refused, because SimAI's reader would misread the file silently. Six keys must hold the values Days AGO models, each refused otherwise with the reason: `CC_MODE 1` (Mellanox DCQCN), `ENABLE_QCN 1`, `USE_DYNAMIC_PFC_THRESHOLD 1`, `L2_BACK_TO_ZERO 0`, `RATE_BOUND 1`, and `ACK_HIGH_PRIO 0`; `ERROR_RATE_PER_LINK` must be zero and `LINK_DOWN` all zeros. From the rest it derives the tables a hand-written scenario would declare:
+
+| `SimAI.conf` | Days AGO |
+| --- | --- |
+| `PACKET_PAYLOAD_SIZE` | The MTU of every queue pair, and the packet size the hang window is computed with. |
+| `BUFFER_SIZE` (MiB) | `switch.ecn_capacity_bytes = BUFFER_SIZE * 2^20`, the byte capacity each egress queue tail-drops at (33,554,432 B for 32 MiB), and `switch.capacity = ceil(BUFFER_SIZE * 2^20 / MTU)` packets (3,729 at 9,000 B), which on an ECN queue only the device planners read, as a per-queue sizing hint. |
+| `KMIN_MAP`, `KMAX_MAP`, `PMAX_MAP` (KB per link rate) | `switch.ecn_by_rate`: SimAI's own ramp per link rate, `kmin_bytes` and `kmax_bytes` as the KB values times 1,000 and `pmax` as the exact decimal, decided over the queue's byte depth: with SimAI's shipped values, 400,000 to 1,600,000 B at 100 Gb/s and 800,000 to 3,200,000 B at 400 Gb/s, `pmax = 0.2`. Every link rate of the fabric must have an entry, and `kmax` must not exceed the buffer. Days AGO decides at enqueue; SimAI marks at dequeue (the `ecn-enqueue` divergence). |
+| `USE_DYNAMIC_PFC_THRESHOLD`, with the fabric's port counts | `link.pfc.by_tier`: SimAI's dynamic threshold evaluated at an empty shared buffer, per switch tier, `(BUFFER - sum of the ports' headroom - ports * 4096) >> shift` with SimAI's shift rule; `xon = xoff - 3072`. |
+| (headroom, `3 * rate * delay / 8` per port) | `link.pfc.headroom_by_rate`: the larger of SimAI's headroom and the headroom Days AGO's validator requires for lossless operation (75,000 B at 400 Gb/s; 30,574 B at 100 Gb/s, above SimAI's 18,750 B). PFC is enabled on the data class, with `host_links = true`. |
+| `MIN_RATE`, `RATE_AI`, `RATE_HAI`, `EWMA_GAIN`, `ALPHA_RESUME_INTERVAL`, `RATE_DECREASE_INTERVAL`, `RP_TIMER` (µs), `FAST_RECOVERY_TIMES`, `CLAMP_TARGET_RATE` | The DCQCN controller of every queue pair. Its maximum and initial rate is the NIC rate, and `pacing_interval_ns = ceil(MTU * 8e9 / nic_rate_bps)` (720 ns at 100 Gb/s, 180 ns at 400 Gb/s). |
+| `HAS_WIN`, `VAR_WIN` | `window_bytes` = SimAI's `maxBdp` for the fabric (`ServerLocality::max_bdp_bytes`: 72,500 B on the 128-GPU file, 236,000 B on the 1,024-GPU file), with `variable_window = true`; `HAS_WIN 0` gives no window. |
+| `L2_ACK_INTERVAL` | Must be `1` (SimAI reads it in bytes; 1 acknowledges every packet). `L2_CHUNK_SIZE` must be a positive integer and has no further effect. |
+| (not in the file) | `ack_size_bytes = 60`, `retransmit_timeout_ns = 0` (SimAI's NACK-only recovery), `nack_interval_ns = 500000`, data priority 3 with the feedback on the same class, and `routing.policy = "SimAiEcmp"` with issue ordinals from the realized start order. |
+
+The keys that configure HPCC, PINT and DCTCP, and SimAI's output files, monitors and stop time, are inert: they may be present and their values are not read. `GLOBAL_T`, `PAUSE_TIME`, `DATA_RATE`, `LINK_DELAY`, `NIC_TOTAL_PAUSE_TIME` and `L2_CHUNK_SIZE` are recorded only; their effects in SimAI are among the divergences below or have none under the required values.
+
+## The run manifest
+
+`days` prints the adapter's manifest as one `record=days_workload` line before the engine's own records. Its fields, in order: `adapter=aicb`, `trace`, `trace_sha256`, `records`, `tp`, `ep`, `pp`, `ga`, `all_gpus`, `fidelity`, `expert_routing` (with `seed`, `experts`, `topk`, `tokens_per_rank` and `zipf` when imbalanced), `simai_conf_sha256`, `simai_topology` and `simai_topology_sha256` (or `simai_topology=none`), the three environment pins (or `send_lat_us=none`), the derived fabric (`mtu_bytes`, `window_bytes`, `queue_capacity_packets`, `queue_capacity_bytes`, `ecn_ramp_by_rate` as `rate:kmin/kmax/pmax` entries, `pfc_asw_xoff`, `pfc_asw_xon`, `pfc_psw_xoff`, `pfc_psw_xon`, `headroom_by_rate` as `rate:bytes` pairs), the plan's counts (`collectives`, `operations`, `fused_segments`, `fused_single_server_ops`, `fp_clamps`, `elided`, `hang_window_recorded`), `data_queue` and `data_queue_order`, `ecmp_ordinals` (`exact` when the per-pair message order is SimAI's, `proxy` otherwise), and `divergences`. The manifest is host metadata: it never enters the image, so the result bytes do not depend on it.
+
+The nine recorded divergences are the parts of SimAI that Days AGO does not reproduce, listed on every run: `static-pfc-thresholds` (SimAI's thresholds move with its shared buffer), `per-queue-capacity` (SimAI shares one 32 MiB buffer per switch; Days AGO gives each egress queue the whole buffer), `ecn-enqueue` (Days AGO decides the mark when a packet is admitted; SimAI when it departs), `no-52b-header` (SimAI's packets carry 52 bytes of headers), `credit-pacer`, `edge-triggered-pause` (SimAI pauses for `PAUSE_TIME`), `delay-only-nvlink`, `delivery-semantics` (a Days AGO stage completes when its last byte is acknowledged; SimAI's when its last packet is sent), and `as-send-lat`.
+
+## Fixtures
+
+`tests/fixtures/aicb/README.md` records the provenance and SHA-256 of every committed input: the dense b4 trace (`b4-gpt13b-w128-tp8-pp2-gbs8.txt`), the MoE smoke trace (`smoke-moe-w128-tp2-ep32.txt`: a Qwen3-30B-A3B-like model on 128 GPUs, TP2, EP32), SimAI's shipped `SimAI.conf`, three `MockNcclGroup` dumps from SimAI's own code, and three reduced traces generated with the vendored AICB for 32- and 256-GPU rails. The scenarios cover both fidelities and both routings: `b4-simai.toml`, `b4-megatron.toml` (per-stage groups and pipeline `SendRecv`), `smoke-simai.toml`, `smoke-imbalanced.toml`, `reduced-dense-simai.toml`, `reduced-dense-megatron.toml`, `reduced-moe-simai.toml`, `reduced-moe-imbalanced.toml`, and `reduced-moe-w256-simai.toml`. The 1,024-GPU flagship trace is not committed; `flagship-simai.toml` names it, and `tests/p16_aicb_flagship.rs` (ignored by default) reads its path from `DAYS_AICB_FLAGSHIP`.
+
+`tests/p16_aicb_runs.rs` runs the four reduced scenarios to completion on Scalar, with every stage finished, and requires CPU (1, 2 and 4 workers), Metal and CUDA to equal it under Full and Summary observation, at the stop, at half the stop and from checkpoints; it lowers b4 and the smoke in full and runs them to a cutoff past their first cross-host collectives. b4 to completion (51.8 M data packets) is an `#[ignore]` test. On a device under Full observation the plan is sized from the requested run, and a plan larger than the device's memory limit is refused before allocation (see [Internals](/docs/internals#device-planning-and-bounded-arenas)).

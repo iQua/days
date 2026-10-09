@@ -41,7 +41,7 @@ The gate converts pause quanta to seconds as `pause_quanta * 512 / link_rate_bps
 
 ## Days AGO PFC
 
-Days AGO requires `[link.pfc]` with eight-entry `xoff`, `xon`, and `buffer_capacity` arrays. It implements edge-triggered XOFF/XON. Omit `refresh_interval` and `drain_interval`, or set them to zero; nonzero timer values produce this rejection:
+Days AGO requires `[link.pfc]` with eight-entry `xoff`, `xon`, and `buffer_capacity` arrays (or, on the Spectrum-X topology, the `by_tier` and `headroom_by_rate` tables [below](#thresholds-by-switch-tier-on-the-rail-fabric)). It implements edge-triggered XOFF/XON. Omit `refresh_interval` and `drain_interval`, or set them to zero; nonzero timer values produce this rejection:
 
 ```text
 PFC refresh/drain timers are outside the T25 executor mechanism; use edge-triggered XOFF/XON
@@ -67,7 +67,26 @@ A paused host keeps queuing what its flows send and transmits the first queued p
 
 RoCE queue pairs also stop sending while their data class is paused at their host. The pacer's next tick sends nothing, adds no pacing credit, and parks the pacer. The resume restarts it at its next pacing tick after the resume. An ACK, NACK or timeout during the pause restarts the pacer as usual, and its next tick parks it again. Other flow types keep generating packets into the host queue while paused.
 
-Because the thresholds are per link, a port fed by many links can hold up to the sum of their `buffer_capacity` values before every link is paused. Size `xoff` and `buffer_capacity` so that this sum fits the switch queue (`switch.capacity` packets), or the queue drops before PFC holds it. `host_links` changes the lowered image only when it is `true`, and it runs on Scalar and CPU: Metal and CUDA refuse it at validation.
+Because the thresholds are per link, a port fed by many links can hold up to the sum of their `buffer_capacity` values before every link is paused. Size `xoff` and `buffer_capacity` so that this sum fits the switch queue (`switch.capacity` packets), or the queue drops before PFC holds it. `host_links` changes the lowered image only when it is `true`. It runs on Scalar, CPU, Metal, and CUDA.
+
+### Thresholds by switch tier on the rail fabric
+
+On the [Spectrum-X](/docs/configuration/topology#spectrum-x) topology, two tables replace the flat arrays. `by_tier` gives the XOFF and XON arrays of the leaf (`asw`) and spine (`psw`) switches separately, as SimAI sets one threshold per switch from its port count; `headroom_by_rate` gives each monitor's headroom by the rate of the link it controls, so a monitor's buffer capacity is its XOFF plus that headroom on every enabled priority:
+
+```toml
+[link.pfc]
+host_links = true
+by_tier = [
+    { tier = "asw", xoff = [0, 0, 0, 4168818, 0, 0, 0, 0], xon = [0, 0, 0, 4165746, 0, 0, 0, 0] },
+    { tier = "psw", xoff = [0, 0, 0, 4154756, 0, 0, 0, 0], xon = [0, 0, 0, 4151684, 0, 0, 0, 0] },
+]
+headroom_by_rate = [
+    { rate_bps = 100000000000, bytes = 30574 },
+    { rate_bps = 400000000000, bytes = 75000 },
+]
+```
+
+`by_tier` must list the `asw` and `psw` tiers once each, with eight XOFF and XON entries that enable the same priorities; it replaces `xoff` and `xon`, and it is refused off the rail fabric ("unsupported `link.pfc.by_tier` off the SpectrumX rail fabric; switch tiers are rail tiers"). `headroom_by_rate` needs one positive headroom per distinct link rate, replaces `buffer_capacity`, and must have a row for every controlled link's rate ("`link.pfc.headroom_by_rate` has no row for a 100000000000 b/s controlled link"). The usual rule `xon < xoff <= buffer_capacity` and the validator's headroom minimum still apply. The AICB adapter derives both tables from `SimAI.conf`; see [Workloads](/docs/configuration/workloads).
 
 ## Propagation interaction
 

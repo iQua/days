@@ -1,0 +1,67 @@
+# LeanGuard CI fixture (Days AGO TCP Reno): four TCP Reno flows from hosts 0-3 share switch 5's
+# egress to host 4. A 10-packet TailDrop queue forces losses, so the trace covers every tcp_check
+# Reno coverpoint: new ACK, duplicate ACK, fast-recovery entry, inflation, partial and full ACK,
+# and timeout. tests/leanguard_certificates.rs lowers it and writes the Scalar certificate
+# lean/fixtures/tcp/reno-compiled-tcp-events.csv.
+seed = 16
+edges = [[0, 5],[1, 5],[2, 5],[3, 5],[4, 5]]
+hosts = [0, 1, 2, 3, 4]
+duration = 2.0
+
+[switch]
+port_rate = 1000000000
+capacity = 10
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[0, 4]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "Reno"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[1, 4]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "Reno"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[2, 4]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "Reno"
+
+[[flow]]
+flow_type = "TCP"
+graph = [[3, 4]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 20000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.tcp]
+cc_algorithm = "Reno"

@@ -16,7 +16,8 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use days::scenario::compile_config;
+use days::scenario::compile_config_with_manifest;
+use days::topos::route::RouteWorkers;
 #[cfg(any(
     test,
     all(feature = "metal", target_vendor = "apple"),
@@ -32,16 +33,7 @@ const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Stock device capacity caps; `--channel-events-per-stream` overrides one lane.
-const CAPACITY_CAPS: DeviceCapacityCaps = DeviceCapacityCaps {
-    fallback_fel_events_per_lp: Some(16_384),
-    queue_packets_per_lp: Some(2_048),
-    channel_events_per_stream: Some(2_048),
-    remote_staging_events_per_lp: Some(2_048),
-    outbox_events_total: Some(2_000_000),
-    tcp_receiver_ranges_per_flow: Some(64),
-    tcp_ledger_segments_per_flow: Some(4_096),
-    observation_events_per_lp: Some(512),
-};
+const CAPACITY_CAPS: DeviceCapacityCaps = days::STOCK_CAPACITY_CAPS;
 
 const DEFAULT_MAX_CAPACITY_RETRIES: usize = 16;
 const DEFAULT_ROUND_THREADS_PER_BLOCK: usize = 256;
@@ -653,9 +645,13 @@ fn engine_available(engine: Engine) -> Result<(), String> {
 
 fn run(cli: &Cli) -> Result<(), String> {
     let lowering_started = Instant::now();
-    let image = compile_config(&cli.config)
+    let (image, manifest) = compile_config_with_manifest(&cli.config, RouteWorkers::available())
         .map_err(|error| format!("failed to lower {}: {error}", cli.config.display()))?;
     let lowering_ns = lowering_started.elapsed().as_nanos();
+    // An AICB scenario's run manifest (P16 H3): what the run was made from, before its result.
+    if let Some(manifest) = manifest {
+        println!("{manifest}");
+    }
     match cli.engine {
         Engine::Scalar => run_scalar_engine(cli, &image, lowering_ns),
         Engine::Cpu => run_cpu_engine(cli, &image, lowering_ns),

@@ -28,8 +28,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "cuda.rs",
         predicate: r#"feature = "cuda-test-hooks""#,
-        count: 38,
-        purpose: "CUDA-only fault injection, capacity, and worklist-compaction hooks, the P14 round-kernel override that forces either `days_round` build (the config field, its default, and its one read), the P14 round-3 one-module-per-run probes (the launched-kernel record on the timing and the run and its two fills, the three handle-identity helpers that build it, the module-contents probe, and the mixed-array record probe), the P14 round-4 live-round-module count: its atomic import, the per-device counter and its initialisation, each loaded module's entry (the field, its registration, the entry type and its two impls), and the count at graph capture on the timing and the run with its read and two fills, and the P14 cuda-host per-thread run-step probe (its record body and its take)",
+        count: 42,
+        purpose: "CUDA-only fault injection, capacity, and worklist-compaction hooks, the P14 round-kernel override that forces either `days_round` build (the config field, its default, and its one read), the P14 round-3 one-module-per-run probes (the launched-kernel record on the timing and the run and its two fills, the three handle-identity helpers that build it, the module-contents probe, and the mixed-array record probe), the P14 round-4 live-round-module count: its atomic import, the per-device counter and its initialisation, each loaded module's entry (the field, its registration, the entry type and its two impls), and the count at graph capture on the timing and the run with its read and two fills, the P14 cuda-host per-thread run-step probe (its record body and its take), and the P16 H4 RESUME-scan counters (their params word, the reset at run start, the counter rows appended at upload, and their read at readback)",
     },
     AllowedFeatureGate {
         path: "metal.rs",
@@ -56,6 +56,18 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         purpose: "the P14 cuda-host PFC-state scan probe, compiled exactly where its CUDA planner hook is: a per-thread scan counter (empty in every other build), its increment in the two whole-fabric PFC scans, and its read-and-reset for the hook",
     },
     AllowedFeatureGate {
+        path: "device_pfc.rs",
+        predicate: r#"any(feature = "cuda-test-hooks", all(feature = "metal-test-hooks", target_vendor = "apple"))"#,
+        count: 5,
+        purpose: "the P16 H4 RESUME-scan counters shared by the two device test-hook builds, whose kernels alone count: the words per LP, the counts type, the per-thread last-run counts, their recording at readback and their take",
+    },
+    AllowedFeatureGate {
+        path: "lib.rs",
+        predicate: r#"any(feature = "cuda-test-hooks", all(feature = "metal-test-hooks", target_vendor = "apple"))"#,
+        count: 1,
+        purpose: "the P16 H4 RESUME-scan counters are exported only with a device test-hook build",
+    },
+    AllowedFeatureGate {
         path: "metal.rs",
         predicate: r#"feature = "planner-test-hooks""#,
         count: 5,
@@ -64,8 +76,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"any(test, feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
-        count: 2,
-        purpose: "T20l fix 2's readback-compaction sizing module and P14 Lane B's DCQCN device-row codecs (`device_mechanism`) compile only for the crate's own unit tests and the two device backends that use them",
+        count: 3,
+        purpose: "T20l fix 2's readback-compaction sizing module, P14 Lane B's DCQCN device-row codecs (`device_mechanism`) and P16 G1's stage-region codec (`device_stage`) compile only for the crate's own unit tests and the two device backends that use them",
     },
     AllowedFeatureGate {
         path: "device_capacity.rs",
@@ -166,14 +178,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "validate.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 4,
-        purpose: "pre-index validator scans, their two equality hooks and the stage-lookup probe exist only for standard tests",
+        count: 9,
+        purpose: "pre-index validator scans, their two equality hooks and the stage-lookup probe exist only for standard tests, as does P16 H4's generator-pass probe (its per-thread counter, its increments in `staged_generators` and in P16 H3's `scan_generators` and `generators_ascend`, and its take)",
     },
     AllowedFeatureGate {
         path: "scalar.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 2,
-        purpose: "the stage-scan counting run and the stage-index equality hook exist only for standard tests",
+        count: 7,
+        purpose: "the stage-scan counting run, the stage-index equality hook, and the P16 PFC service probe (its counts field, the counts type, its two increments, and the counting run) exist only for standard tests",
     },
     AllowedFeatureGate {
         path: "stage_index.rs",
@@ -190,8 +202,14 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"feature = "planner-test-hooks""#,
+        count: 2,
+        purpose: "validator flow-index equality hook and the P16 H1 per-host stage-width probe are exported only for standard tests",
+    },
+    AllowedFeatureGate {
+        path: "stage_sizing.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
         count: 1,
-        purpose: "validator flow-index equality hook is exported only for standard tests",
+        purpose: "the P16 H1 per-host stage-width probe (ruling R11's width rule, read by `tests/p16_stage_streams.rs`) exists only for standard tests",
     },
 ];
 
@@ -215,9 +233,8 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     "prepare_tcp_attempts",
     "install_tcp_attempts",
     // P15: DCQCN and RoCE queue-pair transitions, keyed through the same counted view; a host can
-    // hold many queue pairs.
+    // hold many queue pairs. (P16 removed the DCQCN control timer: the controller has no events.)
     "host_dcqcn_cnp_arrival",
-    "host_dcqcn_control_timer",
     "host_roce_pacing_timer",
     "host_roce_feedback_arrival",
     "host_roce_timeout",
@@ -228,6 +245,10 @@ const STAGE_PATH_FUNCTIONS: &[&str] = &[
     // P15 host-link PFC: a RESUME restarts its class's pause-parked queue pairs, read by
     // generator position from the host's parked list through the same counted view.
     "host_pfc_remote_arrival",
+    // P16 H2: a stage notify's sender timer completes its local successors, and its arrival
+    // advances the stages waiting on it, through the same counted view.
+    "host_notify_timer",
+    "host_notify_arrival",
 ];
 
 /// The only functions of `executor/src/scalar.rs` that may scan a host's generator or TCP-receiver

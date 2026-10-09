@@ -164,7 +164,8 @@ fn by_flow(flows: impl ExactSizeIterator<Item = FlowId>) -> KeyedList {
 }
 
 impl HostStageIndex {
-    pub(crate) fn build(state: &HostState) -> Self {
+    /// `joins` is the image's `stage_joins`, which holds the predecessor runs of join stages.
+    pub(crate) fn build(state: &HostState, joins: &[FlowId]) -> Self {
         // The stage views are created at the first stage record, so a host without stages builds
         // none.
         let mut stage_views: Option<Box<StageViews>> = None;
@@ -173,14 +174,14 @@ impl HostStageIndex {
                 continue;
             };
             let views = stage_views.get_or_insert_with(Box::default);
-            if let Some(predecessor) = dependencies.local_predecessor {
+            for predecessor in dependencies.local.iter(joins) {
                 views
                     .local_successors
                     .entry(predecessor)
                     .or_default()
                     .push(position);
             }
-            if let Some(predecessor) = dependencies.inbound_predecessor {
+            for predecessor in dependencies.inbound.iter(joins) {
                 views
                     .inbound_successors
                     .entry(predecessor)
@@ -332,9 +333,9 @@ pub(crate) type HostStageParts<'a> = (
 );
 
 impl HostStageSlot {
-    pub(crate) fn build(state: &HostState) -> Self {
+    pub(crate) fn build(state: &HostState, joins: &[FlowId]) -> Self {
         Self {
-            index: HostStageIndex::build(state),
+            index: HostStageIndex::build(state, joins),
             generator_reads: StageScanProbe::default(),
             stage_reads: StageScanProbe::default(),
             receiver_reads: StageScanProbe::default(),
@@ -622,20 +623,32 @@ pub(crate) mod legacy_scans {
     }
 
     /// The generators `complete_local_successors` updates for `completed`, in table order.
-    pub(crate) fn local_successors(state: &HostState, completed: FlowId) -> Vec<usize> {
+    pub(crate) fn local_successors(
+        state: &HostState,
+        joins: &[FlowId],
+        completed: FlowId,
+    ) -> Vec<usize> {
         positions_where(state, |position, _| {
             state
                 .stage_dependencies(position)
-                .is_some_and(|dependencies| dependencies.local_predecessor == Some(completed))
+                .is_some_and(|dependencies| {
+                    dependencies.local.iter(joins).any(|flow| flow == completed)
+                })
         })
     }
 
     /// The generators `record_inbound_progress` updates for `inbound`, in table order.
-    pub(crate) fn inbound_successors(state: &HostState, inbound: FlowId) -> Vec<usize> {
+    pub(crate) fn inbound_successors(
+        state: &HostState,
+        joins: &[FlowId],
+        inbound: FlowId,
+    ) -> Vec<usize> {
         positions_where(state, |position, _| {
             state
                 .stage_dependencies(position)
-                .is_some_and(|dependencies| dependencies.inbound_predecessor == Some(inbound))
+                .is_some_and(|dependencies| {
+                    dependencies.inbound.iter(joins).any(|flow| flow == inbound)
+                })
         })
     }
 
@@ -675,10 +688,11 @@ pub(crate) mod legacy_scans {
 #[cfg(feature = "planner-test-hooks")]
 pub(crate) fn check_host_index(
     state: &HostState,
+    joins: &[FlowId],
     index: &HostStageIndex,
     extra_flows: impl IntoIterator<Item = FlowId>,
 ) -> Result<(), String> {
-    let rebuilt = HostStageIndex::build(state);
+    let rebuilt = HostStageIndex::build(state, joins);
     if *index != rebuilt {
         return Err(format!(
             "the maintained index {index:?} differs from the one derived from the host state {rebuilt:?}"
@@ -689,8 +703,8 @@ pub(crate) fn check_host_index(
     for (position, generator) in state.generators.iter().enumerate() {
         queries.push(generator.flow);
         if let Some(dependencies) = state.stage_dependencies(position) {
-            queries.extend(dependencies.local_predecessor);
-            queries.extend(dependencies.inbound_predecessor);
+            queries.extend(dependencies.local.iter(joins));
+            queries.extend(dependencies.inbound.iter(joins));
         }
     }
     queries.extend(state.tcp_receivers.iter().map(|receiver| receiver.flow));
@@ -733,14 +747,14 @@ pub(crate) fn check_host_index(
         let indexed = index
             .local_successors_of(flow)
             .map_or_else(Vec::new, |(successors, _)| successors.to_vec());
-        let scanned = legacy_scans::local_successors(state, flow);
+        let scanned = legacy_scans::local_successors(state, joins, flow);
         if indexed != scanned {
             return mismatch("local successors", &indexed, &scanned);
         }
         let indexed = index
             .inbound_successors_of(flow)
             .map_or_else(Vec::new, |(successors, _)| successors.to_vec());
-        let scanned = legacy_scans::inbound_successors(state, flow);
+        let scanned = legacy_scans::inbound_successors(state, joins, flow);
         if indexed != scanned {
             return mismatch("inbound successors", &indexed, &scanned);
         }

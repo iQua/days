@@ -70,6 +70,8 @@ error: --workers is a CPU-engine option and does not apply to --engine scalar
 
 Device capacity is refuse-or-run. An attempt that runs out of capacity is discarded, the host raises the relevant floor, and the run retries. A warm-start snapshot holds capacities only, not simulation state or compiled kernels, so retries, cap overrides, and warm starts change memory use and the number of attempts, never the result bytes. The snapshot file starts with the header `days-capacity-warm-start v2` and ends with a record count; a truncated or corrupt snapshot is refused.
 
+Before an attempt allocates anything, the device compares the plan's bytes with its memory limit (Metal: the recommended working set; CUDA: the free memory of a discrete GPU, or total memory less a reserve on a managed GPU such as the GB10; see [Internals](/docs/internals#device-planning-and-bounded-arenas)). A larger plan is refused with the executor's `DeviceMemoryExceeded` error, which names the planned bytes and the limit; the run exits with status 1 and nothing was uploaded. Cut the run earlier with `--exclusive-horizon-ns`, or lower the caps. A device Full-observation plan grows with the cutoff, because the observation logs are sized for the requested run; a Summary run, which `days` always makes, is not affected by that term.
+
 ### CUDA engine
 
 - `--cuda-device <N>`: the CUDA device ordinal to run on; default `0`. Each device has its own CUDA context. An ordinal the host does not have fails when its context is created; on a one-GPU host:
@@ -93,6 +95,8 @@ Each engine prints its records in this order:
 | `scalar` | `days_scalar`, then `days_result` |
 | `cpu` | per repetition: `days_cpu`, then `days_result` |
 | `metal`, `cuda` | `days_protocol`, then `days_capacity_warm_start` (only with `--dump-capacity-warm-start`), `days_device`, `days_result` |
+
+A scenario with a `[workload.aicb]` table prints one `record=days_workload` line first, as soon as it is compiled and before the engine's records; its fields are listed on the [Workloads](/docs/configuration/workloads#the-run-manifest) page.
 
 Fields ending in `_ns` that measure elapsed time (`wall_ns`, `run_ns`, `lowering_ns`, `device_ns`, and the CPU timing fields) are wall-clock measurements and vary between runs. Every other field is determined by the scenario and options.
 

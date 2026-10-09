@@ -1,0 +1,62 @@
+# P16 D2 fixture (device Full observation sized for the requested run). The fabric, queue pairs
+# and DCQCN keys of configs/p15/roce_compute_dag.toml, with a long compute and long flows: compute
+# `forward` (1 ms) -> RoCE RingAllReduce `grad` of 40 MB per rank, so every queue pair is Blocked
+# at the start, its pacing grid is anchored at 0, and the first event is the end of `forward`.
+# Run to a cutoff a few microseconds past that event, a device Full plan sized from the whole
+# run's packet counts holds about 2 GB of observation logs for a few hundred records.
+seed = 42
+edges = [[0, 1], [1, 2], [2, 3]]
+hosts = [0, 1, 2, 3]
+duration = 1.0
+
+[switch]
+port_rate = 1000000000
+capacity = 300
+discipline = "FIFO"
+drop = "TailDrop"
+ecn_capacity_bytes = 300_000
+ecn = { kmin_bytes = 300_000, kmax_bytes = 300_000, pmax = 1 }
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+host_links = true
+buffer_capacity = [0, 0, 0, 100000, 0, 0, 0, 0]
+xoff = [0, 0, 0, 20000, 0, 0, 0, 0]
+xon = [0, 0, 0, 10000, 0, 0, 0, 0]
+
+[[compute]]
+name = "forward"
+hosts = [0, 2, 1, 3]
+duration_ns = 1000000
+
+[[collective]]
+name = "grad"
+after = "forward"
+collective_type = "RingAllReduce"
+flow_type = "RoCE"
+priority = 3
+flow_count = 4
+sources = [0, 2, 1, 3]
+sinks = [2, 1, 3, 0]
+
+[collective.traffic]
+initial_delay = 0.0
+size = 40000000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[collective.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+rp_timer_ns = 50000
+pacing_interval_ns = 1000
+
+[collective.traffic.roce]
+retransmit_timeout_ns = 1000000
+feedback_priority = 0

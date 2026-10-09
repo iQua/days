@@ -17,10 +17,9 @@ released and finishes where its successor sees it finish:
   class-paused (C6), with `time_ns` and `first_pacing_time_ns` equal to the release row's
   `time_ns`). The release row's status is the pacer's armed status that tick starts from (its
   `before_status`, which `RoceEventLog` binds to the controller's rate; the collective log alone
-  can only bound it to `Scheduled` or `Blocked`). The controller's first control tick is one
-  control interval later (the pair's
-  first DCQCN row, of any kind, holds `before_next_control_time_ns = time_ns +
-  control_interval_ns`; a pair with no DCQCN row before the horizon is not checked).
+  can only bound it to `Scheduled` or `Blocked`). The pair's controller has no timer to anchor
+  (P16 ruling D2: it starts pristine and is armed by its first ECN echo), so nothing else ties it
+  to the release.
 * **No early start.** A logged RoCE stage that is never released has no queue-pair rows.
 * **Completion.** A local completion caused by a RoCE queue pair (the successor's row names it as
   `cause_flow_id`, and it is in the sender log) shares its event key with that pair's sender row
@@ -55,7 +54,7 @@ def ackCompletion (row : CollectiveEventLog.Row) : Bool :=
   row.cause = .localCompletion && !CollectiveEventLog.causeIsTimer row
 
 def checkStages (horizonNs : Option Nat) (collective : List CollectiveEventLog.Row)
-    (sender : List SenderRow) (dcqcn : List DcqcnEventLog.Row) : Except String Unit := do
+    (sender : List SenderRow) : Except String Unit := do
   -- The completions the collective log names, so only their sender rows are kept.
   let mut wanted : Std.HashSet KeyedPair := ∅
   let mut released : Std.HashSet Pair := ∅
@@ -77,10 +76,6 @@ def checkStages (horizonNs : Option Nat) (collective : List CollectiveEventLog.R
     let keyed := keyedPair row.key row.nodeId row.flowId
     if wanted.contains keyed then
       atKey := atKey.insert keyed row
-  let mut firstDcqcn : Std.HashMap Pair DcqcnEventLog.Row := ∅
-  for row in dcqcn do
-    if !firstDcqcn.contains (row.nodeId, row.flowId) then
-      firstDcqcn := firstDcqcn.insert (row.nodeId, row.flowId) row
   for row in collective do
     let at_ := requireAt "collective" row.srcLine
     let pair := (row.nodeId, row.flowId)
@@ -106,11 +101,6 @@ def checkStages (horizonNs : Option Nat) (collective : List CollectiveEventLog.R
               s!"RoCE stage queue pair's first pacing tick is not at its release instant, on a grid anchored there (node_id={row.nodeId}, flow_id={row.flowId})"
             at_ (first.before.status = senderStatus row.afterStatus)
               s!"RoCE stage release status is not its queue pair's armed status at its first tick (node_id={row.nodeId}, flow_id={row.flowId})"
-        if let some first := firstDcqcn.get? pair then
-          at_
-            (first.before.nextControlTimeNs =
-              row.key.timeNs + first.config.controlIntervalNs)
-            s!"RoCE stage queue pair's first control tick is not one control interval after its release (node_id={row.nodeId}, flow_id={row.flowId})"
       else if !released.contains pair then
         at_ (!firstSender.contains pair)
           s!"unreleased RoCE stage has queue-pair rows (node_id={row.nodeId}, flow_id={row.flowId})"

@@ -13,7 +13,7 @@ Days AGO separates immutable packet data from scheduling:
 - `Event` stores the target LP, event kind, payload ID, and canonical `EventKey`.
 - `FlowDescriptor` stores priority and forward/reverse routes, so priority is not repeated in each packet record.
 
-`PacketKind` is closed over data, feedback, TCP data, TCP ACK, PFC, DCQCN CNP, and a source-local DCQCN control timer token. Data is `Ect0` until `ecn_marked` becomes true; feedback and control packets are `NotEct`. The image has no legacy `Packet.time`, `queueing_delay`, or `last_packet` fields.
+`PacketKind` is closed over data, feedback, TCP data, TCP ACK, PFC, DCQCN CNP, RoCE data, RoCE ACK, RoCE NACK, and a source-local RoCE pacing-timer token that is never enqueued or transmitted. The DCQCN controller has no timer token: its timers are applied at the flow's next transition. Data is `Ect0` until `ecn_marked` becomes true; feedback and control packets are `NotEct`. The image has no legacy `Packet.time`, `queueing_delay`, or `last_packet` fields.
 
 ## Time and order
 

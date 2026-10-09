@@ -42,13 +42,13 @@ A device run prints `record=days_protocol` (the run configuration), `record=days
 
 ## Rejected mechanisms
 
-Metal and CUDA reject images containing RED, collective stages, or compute stages before execution. The error names the backend and recommends Scalar or CPU:
+Every mechanism Days AGO lowers runs on all four backends. Mechanisms outside its model are refused at lowering, before any backend is selected; for example a legacy drop policy:
 
 ```text
-backend Metal does not support RED admission; use Scalar or Cpu
+unsupported drop policy `RED`; Days AGO's only drop rule is TailDrop (RED, RED_ECN and ECN_THRESHOLD were removed in P16): ECN marking is `switch.ecn` or `switch.ecn_by_rate`
 ```
 
-This is a capability rejection, not a silent fallback. See the [`days` CLI reference](/docs/reference/cli/days) for every option and record field.
+A backend that cannot run an image (for example a zero-lookahead channel on the parallel backends) rejects it at validation with a message naming the backend. Neither case is a silent fallback. See the [`days` CLI reference](/docs/reference/cli/days) for every option and record field.
 
 ## Legacy Days
 

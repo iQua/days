@@ -55,6 +55,8 @@ struct Contract {
     retransmissions: usize,
     acks: usize,
     nacks: usize,
+    /// ACKs and NACKs echoing CE (P16 ruling D4: a queue pair's receiver sends no CNP).
+    echoes: usize,
     cnps: usize,
     /// PFC pause and resume transitions (the frames are switch-sourced control, not observed).
     pfc_controls: usize,
@@ -99,8 +101,14 @@ fn contract(result: &RunResult) -> Contract {
         match packet.kind {
             PacketKind::RoceData(header) if header.retransmission => contract.retransmissions += 1,
             PacketKind::RoceData(_) => contract.fresh_data += 1,
-            PacketKind::RoceAck(_) => contract.acks += 1,
-            PacketKind::RoceNack(_) => contract.nacks += 1,
+            PacketKind::RoceAck(header) => {
+                contract.acks += 1;
+                contract.echoes += usize::from(header.ce_echo);
+            }
+            PacketKind::RoceNack(header) => {
+                contract.nacks += 1;
+                contract.echoes += usize::from(header.ce_echo);
+            }
             PacketKind::DcqcnCnp(_) => contract.cnps += 1,
             _ => {}
         }
@@ -453,12 +461,14 @@ fn nack_only_profile_has_no_timeout_and_can_stall() {
     assert!(stalled.1.snd_una < stalled.1.pacer.total_bytes);
 }
 
+/// The P15 fixture's CNPs are ECN echoes on ACKs since P16 (rulings D4-D6): the congestion signal
+/// still flows under PFC, with no CNP at all.
 #[test]
-fn cnps_under_pfc_complete_every_queue_pair() {
+fn echoes_under_pfc_complete_every_queue_pair() {
     let result = run_identical("roce_cnp_under_pfc.toml");
     let contract = contract(&result);
     assert_eq!(contract.finished_pairs, 4, "{contract:?}");
-    assert!(contract.cnps > 0, "{contract:?}");
+    assert!(contract.echoes > 0 && contract.cnps == 0, "{contract:?}");
     assert!(contract.pfc_controls > 0, "{contract:?}");
     assert_eq!(contract.dropped, 0, "{contract:?}");
 }
@@ -469,7 +479,7 @@ fn a_separate_feedback_class_changes_the_run() {
     let separate = run_identical("roce_feedback_priority.toml");
     let contract = contract(&separate);
     assert_eq!(contract.finished_pairs, 4, "{contract:?}");
-    assert!(contract.cnps > 0, "{contract:?}");
+    assert!(contract.echoes > 0 && contract.cnps == 0, "{contract:?}");
     assert_ne!(
         shared.departures, separate.departures,
         "feedback on an unpaused class must change the schedule"
@@ -523,30 +533,37 @@ fn scalar_anchor(name: &str) -> (u64, u64) {
 }
 
 /// Frozen at authoring (`b448d08`, 2026-10-01, sim), with `roce_mixed_tcp` re-frozen at `e32bf1f`
-/// when it moved to an ACK every 4 packets: the anchors the device lane proves Metal and CUDA
+/// when it moved to an ACK every 4 packets; every anchor re-frozen at P16 D1 (2026-10-03, Mac) for
+/// the Mellanox-form controller, the ECN echo (no CNP) and the queue-pair window fields
+/// (`days-gpu/evidence/P16/dcqcn-impl/anchors.md`): the anchors the device lane proves Metal and CUDA
 /// against. `run_identical` shows CPU at 1-4 workers equal to Scalar; the `days` CLI cross-check
-/// (Scalar and CPU at 2 workers) is `days-gpu/evidence/P15/qp-impl/sim/p15_anchors.tsv`.
+/// (Scalar and CPU at 2 workers) is `days-gpu/evidence/P15/qp-impl/sim/p15_anchors.tsv`. Every
+/// anchor re-frozen at P16 ecnramp (2026-10-08, Mac) for the byte ECN step; with `drop_mark`
+/// normalized, `roce_cnp_under_pfc` and `roce_feedback_priority` mark fewer data packets (ACKs now
+/// count their 60 B toward the 50,000 B step) and the rest are unchanged
+/// (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`).
 const ANCHORS: [(&str, u64, u64); 7] = [
-    ("roce_lossless_pfc.toml", 45_710, 0x7e1f_a3a8_7997_030c),
-    ("roce_gbn_lossy.toml", 46_238, 0x4c94_e615_e09a_e734),
-    ("roce_timeout.toml", 34_578, 0x3488_8b67_3127_c7cc),
-    ("roce_nack_only.toml", 34_559, 0x9715_1362_f757_31bf),
-    ("roce_cnp_under_pfc.toml", 58_280, 0x70b0_1e3d_c0d6_15a8),
-    ("roce_feedback_priority.toml", 58_323, 0x6b64_e238_d4d0_3c96),
-    ("roce_mixed_tcp.toml", 52_398, 0x7612_b5cd_28d5_5949),
+    ("roce_lossless_pfc.toml", 46_261, 0xaa03_bbd8_1cd7_b0c5),
+    ("roce_gbn_lossy.toml", 46_488, 0x9159_37dc_3c0c_15fb),
+    ("roce_timeout.toml", 35_202, 0xf44b_63d3_0ee8_dda7),
+    ("roce_nack_only.toml", 35_181, 0xdd48_bebf_f7f0_7cb1),
+    ("roce_cnp_under_pfc.toml", 57_734, 0x3c48_4c47_67f1_0add),
+    ("roce_feedback_priority.toml", 57_735, 0xd800_ffac_5e0b_8d64),
+    ("roce_mixed_tcp.toml", 52_647, 0x435d_d558_548d_35aa),
 ];
 
 /// Host-link PFC anchors (`p15/hostpfc`, frozen at `c26865f` on the Mac; the sim gate's CLI
-/// confirms them on Linux, Scalar and CPU at 2 workers).
+/// confirms them on Linux, Scalar and CPU at 2 workers); re-frozen at P16 D1 and ecnramp with the
+/// others.
 const HOST_PFC_ANCHORS: [(&str, u64, u64); 2] = [
     (
         "hostpfc_incast_lossless.toml",
-        67_609,
-        0x08e4_d33e_ffae_89bb,
+        67_898,
+        0x2974_fef5_6bb8_bae3,
     ),
     // Fix round 1: the Summary anchor of the multi-QP and TCP variant (frozen on the Mac at
     // c762428's code; the sim gate's CLI confirms it on Linux).
-    ("hostpfc_multi_qp_tcp.toml", 78_419, 0x7a1d_7dd4_4487_b8f4),
+    ("hostpfc_multi_qp_tcp.toml", 78_210, 0x1a69_bd0c_f289_d7e5),
 ];
 
 #[test]
@@ -592,7 +609,9 @@ fn hpcc_incast_with_host_pfc_loses_nothing() {
 fn hpcc_fixture_matches_its_frozen_anchor() {
     assert_eq!(
         scalar_anchor("hpcc_incast64_dragonfly.toml"),
-        // Re-frozen at c26865f: the fixture re-sized for host-link PFC (hostpfc-design.md §10.2).
-        (1_262_683, 0x7ec5_84fc_7397_55b8)
+        // Re-frozen at c26865f: the fixture re-sized for host-link PFC (hostpfc-design.md §10.2);
+        // re-frozen at P16 D1 for the Mellanox-form controller and the ECN echo; re-frozen at P16
+        // ecnramp for the byte ECN step (unchanged with `drop_mark` normalized).
+        (1_279_643, 0x0fcd_2d1c_bac1_a04e)
     );
 }

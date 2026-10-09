@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 2: queue (node_id=5, queue_id=0) has a PFC monitor: pass the run's PFC certificate

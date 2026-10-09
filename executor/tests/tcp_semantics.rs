@@ -14,8 +14,8 @@ use days_executor::{
 };
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 use days_executor::{
-    CapacityWarmStart, DeviceCapacityCaps, DropMarkPolicy, EcnThresholdPolicy,
-    MechanismTransitionRecord, QueueDepthUnit, RunResult,
+    CapacityWarmStart, DeviceCapacityCaps, DropMarkPolicy, EcnRampPolicy,
+    MechanismTransitionRecord, RunResult,
 };
 #[cfg(feature = "cuda")]
 use days_executor::{CudaArena, CudaConfig, CudaError, CudaExecutor, run_cuda_with_observations};
@@ -220,6 +220,9 @@ fn tcp_image(control: TcpCongestionControl, total_bytes: u64) -> SimulationImage
             payload: FIRST,
         }],
         seed: 1,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -419,6 +422,9 @@ fn switched_tcp_image(
             payload: FIRST,
         }],
         seed: 11,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
@@ -2325,7 +2331,7 @@ fn dcqcn_cnp_and_non_data_ecn_state_cannot_hide_in_a_tcp_checkpoint() {
         PacketKind::DcqcnCnp(DcqcnCnpHeader {
             trigger_payload: FIRST,
         }),
-        PacketKind::DcqcnControlTimer,
+        PacketKind::RocePacingTimer,
     ] {
         let packet = PacketDescriptor {
             id: PayloadId(99),
@@ -2354,7 +2360,7 @@ fn dcqcn_cnp_and_non_data_ecn_state_cannot_hide_in_a_tcp_checkpoint() {
     }
 
     let mut retyped_control = image.clone();
-    retyped_control.initial_packets[ack_index].kind = PacketKind::DcqcnControlTimer;
+    retyped_control.initial_packets[ack_index].kind = PacketKind::RocePacingTimer;
     retyped_control.initial_packets[ack_index].size_bytes = 0;
     for backend in [
         Backend::Scalar,
@@ -2363,9 +2369,9 @@ fn dcqcn_cnp_and_non_data_ecn_state_cannot_hide_in_a_tcp_checkpoint() {
         Backend::Cuda,
     ] {
         let error = validate(&retyped_control, backend)
-            .expect_err("a DCQCN control token requires its DCQCN generator")
+            .expect_err("a timer token requires the queue pair that owns it")
             .to_string();
-        assert!(error.contains("DCQCN"), "{backend}: {error}");
+        assert!(error.contains("queue pair"), "{backend}: {error}");
     }
 
     let mut orphan_receiver = image.clone();
@@ -2415,10 +2421,12 @@ fn reachable_tcp_ack_ecn_image() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = MSS;
-    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     image
 }
@@ -2438,10 +2446,12 @@ fn ack_descendant_forward_ecn_checkpoint() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = 2 * MSS;
-    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     let prefix = run_scalar_with_observations(&image, Some(459), ObservationMode::Summary)
         .expect("prefix must leave the first ACK at the source-arrival boundary");
@@ -2464,10 +2474,12 @@ fn data_descendant_chain_forward_ecn_checkpoint() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = 2 * MSS;
-    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    image.switch_states[0].queues[0].drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     let prefix = run_scalar_with_observations(&image, Some(42), ObservationMode::Summary)
         .expect("prefix must leave data in flight after its first forward admission");
@@ -2491,10 +2503,12 @@ fn ack_descendant_chain_reverse_ecn_checkpoint() -> SimulationImage {
         unreachable!()
     };
     tcp.total_bytes = 2 * MSS;
-    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-        unit: QueueDepthUnit::Packets,
-        capacity: 64,
-        threshold: 1,
+    image.switch_states[1].queues[0].drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+        capacity_bytes: u64::MAX,
+        kmin_bytes: 1,
+        kmax_bytes: 1,
+        pmax_numerator: 1,
+        pmax_denominator: 1,
     });
     let prefix = run_scalar_with_observations(&image, Some(459), ObservationMode::Summary)
         .expect("prefix must leave the first ACK at the source-arrival boundary");
@@ -3376,16 +3390,24 @@ fn scalar_adversarial_trace_covers_tcp_leanguard_transition_classes() {
             after,
         }],
     ));
-    let output_dir = std::env::var_os("DAYS_TCP_TRACE_DIR").map(std::path::PathBuf::from);
+    // Each trace is a committed LeanGuard fixture that CI's `run-tcp-campaign.sh` checks, with its
+    // mutations. Set `DAYS_UPDATE_LEANGUARD_FIXTURES=1` to regenerate.
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lean/fixtures/tcp");
     for (algorithm, records) in traces {
         let csv = days_executor::tcp_transitions_csv(&records)
             .expect("one scalar run must have unique canonical event keys");
         assert_eq!(csv.lines().count(), records.len() + 1);
-        if let Some(directory) = &output_dir {
-            std::fs::create_dir_all(directory).expect("create requested TCP trace directory");
-            let name = format!("{}-tcp-events.csv", algorithm.to_ascii_lowercase());
-            std::fs::write(directory.join(name), csv).expect("write requested TCP LeanGuard trace");
+        let path = fixtures.join(format!("{}-tcp-events.csv", algorithm.to_ascii_lowercase()));
+        if std::env::var_os("DAYS_UPDATE_LEANGUARD_FIXTURES").is_some() {
+            std::fs::create_dir_all(&fixtures).expect("create the TCP fixture directory");
+            std::fs::write(&path, &csv).expect("write the TCP LeanGuard fixture");
         }
+        assert_eq!(
+            csv,
+            std::fs::read_to_string(&path).unwrap_or_default(),
+            "{}",
+            path.display()
+        );
     }
 }
 

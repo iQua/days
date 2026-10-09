@@ -6,16 +6,19 @@ open LeanGuard.P10c.RoceEventLog
 
 def usage : String :=
   "usage: p10c_roce_check receiver <roce_receiver.csv>\n" ++
-  "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> [--pfc <pfc.csv>] [--horizon-ns <ns>] [<stop_time_ns>]\n" ++
-  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> [--pfc <pfc.csv>] [--horizon-ns <ns>] [--collective <collective.csv>] [<stop_time_ns>]\n" ++
-  "  <dcqcn.csv> is the dcqcn_transitions_csv of the same run (the sender's rate and status).\n" ++
-  "  <pfc.csv> is the pfc_transitions_csv of the same run; it is required when the sender log\n" ++
-  "  has the data_class column (schema Amendment 3), and the pauses and resumes are checked\n" ++
+  "       p10c_roce_check sender <roce_sender.csv> <dcqcn.csv> --pfc <pfc.csv> [--horizon-ns <ns>] [<stop_time_ns>]\n" ++
+  "       p10c_roce_check trace <roce_sender.csv> <roce_receiver.csv> <dcqcn.csv> --pfc <pfc.csv> [--horizon-ns <ns>] [--collective <collective.csv>] [<stop_time_ns>]\n" ++
+  "  <dcqcn.csv> is the dcqcn_transitions_csv of the same run: each queue pair's controller\n" ++
+  "  transitions, at the sender rows that make them (the sender's rate and status).\n" ++
+  "  <pfc.csv> is the pfc_transitions_csv of the same run (header-only without PFC); it is required\n" ++
+  "  (the sender log's data_class, schema Amendment 3), and the pauses and resumes are checked\n" ++
   "  against its host PAUSE and RESUME records.\n" ++
   "  --horizon-ns <ns> checks a prefix of a run: the logs hold exactly its events with\n" ++
   "  time_ns < <ns>; pending events at or after it need not have fired.\n" ++
   "  --collective <collective.csv> (trace mode) is the collective_transitions_csv of the same run:\n" ++
   "  each RoCE stage's queue pair starts at its release and completes its successor's prerequisite.\n" ++
+  "  The sender log must carry the full P16 sender schema (every column the executor writes); a\n" ++
+  "  missing column is named and rejected. No other sender format is read.\n" ++
   "  <stop_time_ns> is the image's stop_time_ns, which no CSV records; when omitted, one stop\n" ++
   "  time must fit every armed and stopped pacer decision in the log."
 
@@ -106,7 +109,6 @@ def main (args : List String) : IO UInt32 := do
               let collectiveRows ←
                 inRole "collective" (LeanGuard.P10c.CollectiveEventLog.parseCsv content)
               LeanGuard.P10c.RoceStages.checkStages options.horizon collectiveRows senderRows
-                dcqcnRows
   | _ =>
       IO.eprintln usage
       pure 2

@@ -53,7 +53,7 @@ Legacy execution can use Nexosim's single-threaded or multithreaded executor. Re
 
 ## Shared topology, different assembly
 
-`src/topos/build.rs` constructs FatTree, Torus, Dragonfly, or custom graphs and returns both the switch graph and semantic host attachments. The engines consume that shared structure differently:
+`src/topos/build.rs` constructs FatTree, Torus, Dragonfly, Spectrum-X, or custom graphs and returns both the switch graph and semantic host attachments. The legacy runtime refuses Spectrum-X. The engines consume that shared structure differently:
 
 | Concern | Exact engine | Legacy engine |
 | --- | --- | --- |

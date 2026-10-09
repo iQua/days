@@ -20,8 +20,9 @@ duration = 0.05
 port_rate = 1000000000
 capacity = 300
 discipline = "FIFO"
-drop = "ECN_THRESHOLD"
-ecn_threshold = 1.0
+drop = "TailDrop"
+ecn_capacity_bytes = 300_000
+ecn = { kmin_bytes = 300_000, kmax_bytes = 300_000, pmax = 1 }
 
 [link]
 mode = "Pfc"
@@ -50,11 +51,8 @@ max_rate_gbps = 1.0
 g = 0.00390625
 ai_rate_gbps = 0.005
 hai_rate_gbps = 0.05
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 1000
-increase_byte_threshold = 100000
 
 [flow.traffic.roce]
 retransmit_timeout_ns = 0
@@ -78,11 +76,8 @@ max_rate_gbps = 1.0
 g = 0.00390625
 ai_rate_gbps = 0.005
 hai_rate_gbps = 0.05
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 1000
-increase_byte_threshold = 100000
 
 [flow.traffic.roce]
 retransmit_timeout_ns = 0
@@ -106,11 +101,8 @@ max_rate_gbps = 1.0
 g = 0.00390625
 ai_rate_gbps = 0.005
 hai_rate_gbps = 0.05
-mi_factor = 0.5
-rtt_ns = 50000
-cnp_interval_ns = 10000
+rp_timer_ns = 50000
 pacing_interval_ns = 1000
-increase_byte_threshold = 100000
 
 [flow.traffic.roce]
 retransmit_timeout_ns = 0

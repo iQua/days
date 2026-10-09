@@ -4,9 +4,9 @@ use std::path::PathBuf;
 
 use days::scenario::compile_config;
 use days_executor::{
-    DropMarkPolicy, EcnThresholdPolicy, MetalConfig, MetalRun, ObservationMode, QueueDepthUnit,
-    SimulationImage, run_metal, run_metal_with_observations, run_scalar,
-    run_scalar_with_observations, size_default_device_plan,
+    DropMarkPolicy, EcnRampPolicy, MetalConfig, MetalRun, ObservationMode, SimulationImage,
+    run_metal, run_metal_with_observations, run_scalar, run_scalar_with_observations,
+    size_default_device_plan,
 };
 
 const BASELINE_FIXTURES: [&str; 2] = [
@@ -25,10 +25,12 @@ fn apply_byte_ecn_policy(image: &mut SimulationImage) -> usize {
         .flat_map(|state| &mut state.queues)
     {
         assert_eq!(queue.drop_mark, DropMarkPolicy::TailDrop);
-        queue.drop_mark = DropMarkPolicy::EcnThreshold(EcnThresholdPolicy {
-            unit: QueueDepthUnit::Bytes,
-            capacity: 4_000,
-            threshold: 1_000,
+        queue.drop_mark = DropMarkPolicy::EcnRamp(EcnRampPolicy {
+            capacity_bytes: 4_000,
+            kmin_bytes: 500,
+            kmax_bytes: 2_500,
+            pmax_numerator: 1,
+            pmax_denominator: 2,
         });
         queue_count += 1;
     }
@@ -126,6 +128,21 @@ fn fattree_k4_byte_ecn_sizing_and_complete_result_match_scalar() {
             .iter()
             .any(|packet| packet.ecn_marked),
         "the byte-policy fixture must exercise ECN marking"
+    );
+    let inside = |row: &&days_executor::AqmTransitionRecord| {
+        let depth = row.queued_bytes_before + row.packet_size_bytes;
+        depth > row.policy.kmin_bytes && depth < row.policy.kmax_bytes
+    };
+    let transitions = &scalar.diagnostics.as_ref().unwrap().aqm_transitions;
+    let drawn = transitions.iter().filter(inside).collect::<Vec<_>>();
+    assert!(
+        drawn
+            .iter()
+            .any(|row| row.action == days_executor::AqmTransitionAction::Mark)
+            && drawn
+                .iter()
+                .any(|row| row.action == days_executor::AqmTransitionAction::Enqueue),
+        "the ramp must both mark and admit unmarked between kmin and kmax"
     );
     assert!(scalar.diagnostics.is_some());
     scalar.diagnostics = None;

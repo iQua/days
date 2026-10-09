@@ -10,7 +10,10 @@ use rand::rngs::SmallRng;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::topos::config::{Config, DragonflyConfig, FatTreeConfig, TopoCategory, TorusConfig};
+use crate::topos::config::{
+    DragonflyConfig, FatTreeConfig, SpectrumXConfig, TopoCategory, TopoConfig, TorusConfig,
+};
+use crate::topos::rail::{RailProfile, RailTopology};
 
 /// Structural identity of a built topology.
 ///
@@ -29,6 +32,8 @@ pub enum TopologyProfile {
         groups: u64,
         routers_per_group: u64,
     },
+    /// SimAI's rail-optimized single-ToR fabric (P16 H2): ASWs then PSWs, one NIC link per GPU.
+    Rail(RailProfile),
     Custom,
 }
 
@@ -64,7 +69,10 @@ pub struct HostAttachments {
 }
 
 impl HostAttachments {
-    fn new(entries: Vec<HostAttachment>, distinct_source_sampling: bool) -> Result<Self> {
+    pub(crate) fn new(
+        entries: Vec<HostAttachment>,
+        distinct_source_sampling: bool,
+    ) -> Result<Self> {
         let host_ids = entries.iter().map(|entry| entry.host_id).collect();
         Ok(Self {
             entries,
@@ -437,6 +445,23 @@ impl TopologyBuilder for DragonflyConfig {
     }
 }
 
+impl TopologyBuilder for SpectrumXConfig {
+    fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
+        let rail = RailTopology::new(self)?;
+        info!(
+            "Building a Spectrum-X rail fabric with {} GPU(s), {} ASW(s) and {} PSW(s).",
+            self.gpus,
+            rail.profile().asws,
+            self.psws
+        );
+        Ok((
+            rail.graph(),
+            rail.host_attachments()?,
+            rail.topology_profile(),
+        ))
+    }
+}
+
 impl TopologyBuilder for TorusConfig {
     fn build(&self) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
         let dimension = self.dim as u32;
@@ -468,10 +493,22 @@ pub fn build_graph_with_profile(
     file_path: &str,
 ) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
     let content = fs::read_to_string(file_path)?;
+    build_graph_with_profile_from_str(&content)
+}
 
-    let config: Config = match toml::from_str::<Config>(&content) {
+/// [`build_graph_with_profile`] of a scenario's text.
+pub fn build_graph_with_profile_from_str(
+    content: &str,
+) -> Result<(UnGraph<usize, ()>, HostAttachments, TopologyProfile)> {
+    // Only the topology table is read here; every caller parses (and checks) the rest of the
+    // scenario with its own schema.
+    let config: TopologySource = match toml::from_str::<TopologySource>(content) {
         Ok(config) => config,
         Err(err) => {
+            // The topology tables refuse unknown keys (P16 a2aset part 2); name the table.
+            if let Some(table) = crate::utils::serde_fields::unknown_key_table(content, &err) {
+                return Err(TopologyError::InvalidConfig(format!("{err}(in {table})")));
+            }
             eprintln!("Failed to deserialize: {}", err);
             return Err(TopologyError::TomlParseError(err));
         }
@@ -500,9 +537,24 @@ pub fn build_graph_with_profile(
                     .ok_or_else(|| TopologyError::InvalidConfig("Missing Dragonfly config".into()))?
                     .build()
             }
+            TopoCategory::SpectrumX => {
+                debug!("Initializing Spectrum-X rail graph");
+                topo_config
+                    .spectrum_x
+                    .ok_or_else(|| TopologyError::InvalidConfig("Missing SpectrumX config".into()))?
+                    .build()
+            }
         },
-        None => build_custom_graph(&content),
+        None => build_custom_graph(content),
     }
+}
+
+/// The part of a scenario file the topology builders read: a partial view of the root, whose
+/// unknown keys the scenario root refuses (`scenario::compile`); the topology tables themselves
+/// refuse unknown keys.
+#[derive(Deserialize)]
+struct TopologySource {
+    topology: Option<TopoConfig>,
 }
 
 fn build_custom_graph(

@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 6: ECN ramp decision mismatch (data packet)

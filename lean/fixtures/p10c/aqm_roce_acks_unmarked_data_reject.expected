@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 32: ECN ramp decision mismatch (roce_data packet)

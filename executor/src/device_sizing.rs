@@ -190,10 +190,6 @@ impl DeviceEventArenaSizing {
     }
 }
 
-/// Complete host-only sizing report for a projected or exact GPU device plan.
-///
-/// Open-loop images retain the established 28 planes. TCP images add one packed auxiliary plane
-/// for receiver ranges, segment ledgers, and full-observation transition state.
 /// Words a production device plan spends on the P14 DCQCN and PFC and the P15 queue-pair and
 /// host-link PFC mechanism state.
 ///
@@ -217,6 +213,11 @@ pub struct MechanismPlaneWords {
     pub pfc_class_words: Vec<u64>,
 }
 
+/// Complete host-only sizing report for a projected or exact GPU device plan.
+///
+/// Every plan carries the established 28 planes and one packed auxiliary plane, `tcp_state`: the
+/// per-flow receiver and ledger rows, the TCP receive ranges and segment ledgers, the stage region
+/// (P16) and the RoCE receiver region (P15). Both planners allocate it for every image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeviceSizingReport {
     pub planes: Vec<DevicePlaneSizing>,
@@ -295,15 +296,15 @@ pub(crate) struct DcqcnDeviceWork {
     pub pacing_ticks: usize,
     /// Data packets the flow can still source.
     pub packets: usize,
-    /// Control-timer transitions, which continue through the stop time after the flow finishes.
-    pub control_ticks: usize,
 }
 
 /// Bounds a DCQCN source's remaining work without simulating its controller.
 ///
-/// The controller clamps the pacing rate to `[minimum, maximum]`, so every pacing tick adds at least
-/// `minimum_rate * interval` credit quanta and one packet needs at most
-/// `ceil(packet_bits * denominator * 1e9 / (minimum_rate * interval))` ticks. Pacing therefore ends
+/// The Mellanox-form controller has no timer event (P16 ruling D2), so its only device work is
+/// the pacing tick. Its rate never falls below `dcqcn_rate_floor_bps(minimum)` (the cut floors at
+/// the minimum, and the average truncates each half), so every pacing tick adds at least
+/// `floor * interval` credit quanta and one packet needs at most
+/// `ceil(packet_bits * denominator * 1e9 / (floor * interval))` ticks. Pacing therefore ends
 /// within that many ticks per remaining packet, and never after the stop time. Every packet costs
 /// at least one tick, so `packets <= pacing_ticks`. The bounds are outward-safe: they size arenas
 /// and the round bound, and an over-estimate costs only memory.
@@ -314,14 +315,6 @@ pub(crate) fn dcqcn_device_work(
 ) -> DcqcnDeviceWork {
     let stop = image.stop_time_ns;
     let control = &dcqcn.controller;
-    let control_ticks = if control.next_control_time_ns <= stop {
-        usize::try_from(
-            1 + (stop - control.next_control_time_ns) / control.config.control_interval_ns.max(1),
-        )
-        .unwrap_or(usize::MAX)
-    } else {
-        0
-    };
     let rate = dcqcn.rate;
     if !matches!(
         generator.next_emission.status,
@@ -329,10 +322,7 @@ pub(crate) fn dcqcn_device_work(
     ) || generator.bytes_emitted >= rate.total_bytes
         || generator.next_emission.departure_time_ns > stop
     {
-        return DcqcnDeviceWork {
-            control_ticks,
-            ..DcqcnDeviceWork::default()
-        };
+        return DcqcnDeviceWork::default();
     }
     let stop_ticks = 1 + u128::from(stop - generator.next_emission.departure_time_ns)
         / u128::from(rate.pacing_interval_ns.max(1));
@@ -342,14 +332,15 @@ pub(crate) fn dcqcn_device_work(
         .saturating_mul(8)
         .saturating_mul(u128::from(rate.rate_denominator))
         .saturating_mul(1_000_000_000);
-    let tick = u128::from(control.config.minimum_rate_bps.max(1))
-        .saturating_mul(u128::from(rate.pacing_interval_ns.max(1)));
+    let tick = u128::from(crate::dcqcn::dcqcn_rate_floor_bps(
+        control.config.minimum_rate_bps,
+    ))
+    .saturating_mul(u128::from(rate.pacing_interval_ns.max(1)));
     let ticks_per_packet = cost.div_ceil(tick).max(1);
     let pacing_ticks = stop_ticks.min(packets.saturating_mul(ticks_per_packet).saturating_add(1));
     DcqcnDeviceWork {
         pacing_ticks: usize::try_from(pacing_ticks).unwrap_or(usize::MAX),
         packets: usize::try_from(packets.min(pacing_ticks)).unwrap_or(usize::MAX),
-        control_ticks,
     }
 }
 
@@ -546,6 +537,10 @@ pub fn size_default_device_plan(
         .iter()
         .map(|packet| (packet.id, packet))
         .collect::<BTreeMap<_, _>>();
+    // P16 G2: the planners' concurrency groups (ruling G7), decided once.
+    let concurrency = crate::stage_sizing::SizingConcurrency::for_image(image);
+    let mut queue_charges = crate::stage_sizing::ConcurrentCharges::default();
+    let mut fel_charges = crate::stage_sizing::ConcurrentCharges::default();
 
     let mut queue_capacities = vec![1_usize; node_count];
     let mut aggregate_queue_packets = vec![0_usize; node_count];
@@ -560,14 +555,43 @@ pub fn size_default_device_plan(
         let feedback_count = flow_feedback_counts[flow_index];
         let data_count = packet_count.saturating_sub(feedback_count);
         let source_slot = flow.source.0 as usize;
-        queue_capacities[source_slot] =
-            queue_capacities[source_slot].saturating_add(context.source_queue_bounds[flow_index]);
+        let group = concurrency
+            .as_ref()
+            .and_then(|concurrency| concurrency.group(flow_index));
+        // Ruling G8: a windowed queue pair's host-queue bounds, as the planners derive them.
+        let window = concurrency
+            .as_ref()
+            .and_then(|concurrency| concurrency.window_packets(flow_index));
+        crate::stage_sizing::charge(
+            &mut queue_capacities,
+            &mut queue_charges,
+            concurrency
+                .as_ref()
+                .and_then(|concurrency| concurrency.host_queue_group(flow_index)),
+            source_slot,
+            crate::stage_sizing::CLASS_DATA,
+            window.map_or(context.source_queue_bounds[flow_index], |window| {
+                data_count.min(window)
+            }),
+        );
+        if let Some(window) = window {
+            crate::stage_sizing::charge(
+                &mut queue_capacities,
+                &mut queue_charges,
+                group,
+                flow.target.0 as usize,
+                crate::stage_sizing::CLASS_FEEDBACK,
+                feedback_count.min(window),
+            );
+        }
         legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot].saturating_add(4);
         if context.tcp_generators[flow_index].is_some() {
             legacy_fel_capacities[source_slot] = legacy_fel_capacities[source_slot]
                 .saturating_add(tcp_fallback_timer_packet_bound(data_count));
         }
         let mut route_capacities = FlowRouteCapacities {
+            group,
+            fel_charges: &mut fel_charges,
             fel: &mut legacy_fel_capacities,
             queue: &mut queue_capacities,
             aggregate_queue_packets: &mut aggregate_queue_packets,
@@ -589,6 +613,28 @@ pub fn size_default_device_plan(
             PacketKind::Feedback,
             &mut route_capacities,
         );
+    }
+    let mut compute_timer_slots = 0_usize;
+    if let Some(concurrency) = &concurrency {
+        queue_charges.apply(concurrency, &mut queue_capacities);
+        fel_charges.apply(concurrency, &mut legacy_fel_capacities);
+        concurrency.add_compute_timers(&mut legacy_fel_capacities);
+        let mut timers = vec![0_usize; node_count];
+        concurrency.add_compute_timers(&mut timers);
+        compute_timer_slots = checked_sum(&timers, "compute timer slots")?;
+    }
+    // P16 H2: the stage notifies' terms, exactly as both device planners add them.
+    let notify = notify_capacities(image);
+    let notify_sources = notify.as_ref().map_or(0, |notify| {
+        notify
+            .sources
+            .iter()
+            .fold(0_usize, |total, (_, count)| total.saturating_add(*count))
+    });
+    if let Some(notify) = &notify {
+        for &(node, count) in notify.sources.iter().chain(&notify.targets) {
+            legacy_fel_capacities[node] = legacy_fel_capacities[node].saturating_add(count);
+        }
     }
     for node in &image.nodes {
         let slot = node.id.0 as usize;
@@ -621,7 +667,7 @@ pub fn size_default_device_plan(
                                 usize::try_from(queue.queue_capacity_packets).unwrap_or(usize::MAX),
                             );
                         }
-                        crate::DropMarkPolicy::EcnThreshold(policy) => {
+                        crate::DropMarkPolicy::EcnRamp(policy) => {
                             queue_capacities[slot] = ecn_queue_packet_bound(
                                 aggregate_queue_packets[slot],
                                 policy,
@@ -630,7 +676,7 @@ pub fn size_default_device_plan(
                             .max(initial)
                             .max(1);
                         }
-                        crate::DropMarkPolicy::TailDrop | crate::DropMarkPolicy::Red(_) => {}
+                        crate::DropMarkPolicy::TailDrop => {}
                     }
                 }
             }
@@ -658,22 +704,22 @@ pub fn size_default_device_plan(
     //
     // Outward safety of each term, at live-timer scale:
     //   * the `1` covers one pacing chain, which pops its predecessor before pushing its
-    //     successor. A DCQCN source owns two chains, pacing and control, so each DCQCN
-    //     generator adds 2, exactly as both device planners do.
+    //     successor. A DCQCN source owns one chain, pacing (the Mellanox-form controller has no
+    //     timer event, P16), so each DCQCN generator adds 1, exactly as both device planners do.
     //   * each source-owned TCP flow contributes at most one record, because the T20g live-state
     //     contract removes a superseded timeout at the transition that supersedes it and disarm
     //     always precedes re-arm inside a single transition.
     //   * imported events stay a hard floor: an image may supply legacy residue that no armed
     //     timer owns, and that residue is resident until its deadline.
-    //   * a queue-pair source owns three: pacing, control and its one live timeout (P15), as both
-    //     device planners reserve.
+    //   * a queue-pair source owns two: pacing and its one live timeout, as both device planners
+    //     reserve.
     let dcqcn_timer_slots = image
         .host_states
         .iter()
         .flat_map(|state| &state.generators)
         .map(|generator| match generator.kind {
-            FlowGeneratorKind::Dcqcn(_) => 2,
-            FlowGeneratorKind::Roce(_) => 3,
+            FlowGeneratorKind::Dcqcn(_) => 1,
+            FlowGeneratorKind::Roce(_) => 2,
             FlowGeneratorKind::Constant(_)
             | FlowGeneratorKind::Tcp(_)
             | FlowGeneratorKind::Rate(_) => 0,
@@ -683,12 +729,22 @@ pub fn size_default_device_plan(
         .checked_add(image.initial_events.len())
         .and_then(|slots| slots.checked_add(runtime_tcp_timer_slots))
         .and_then(|slots| slots.checked_add(dcqcn_timer_slots))
+        .and_then(|slots| slots.checked_add(compute_timer_slots))
+        .and_then(|slots| slots.checked_add(notify_sources))
         .ok_or_else(|| sizing_error("fallback FEL slots overflow usize"))?;
     let legacy_heap_event_slots = checked_sum(&legacy_fel_capacities, "legacy FEL slots")?;
     let queue_slots = checked_sum(&queue_capacities, "queue slots")?;
-    let remote_capacities = derived_remote_capacities(image, &context);
+    let mut remote_capacities = derived_remote_capacities(image, &context, concurrency.as_ref());
+    let mut channel_capacities = derived_channel_stream_capacities(image, &context)?;
+    if let Some(notify) = &notify {
+        for &(node, count) in &notify.sources {
+            remote_capacities[node] = remote_capacities[node].saturating_add(count);
+        }
+        for &(channel, count) in &notify.lanes {
+            channel_capacities[channel] = channel_capacities[channel].saturating_add(count);
+        }
+    }
     let remote_staging_slots = checked_sum(&remote_capacities, "remote staging slots")?;
-    let channel_capacities = derived_channel_stream_capacities(image, &context)?;
     let channel_stream_event_slots = checked_sum(&channel_capacities, "channel stream slots")?;
     let service_stream_event_slots = node_count
         .checked_mul(2)
@@ -710,7 +766,7 @@ pub fn size_default_device_plan(
         })
         .ok_or_else(|| sizing_error("stream record words overflow usize"))?;
     let stream_state_words = stream_state_words(image, remote_staging_slots)?.max(1);
-    let inbound_producer_words = inbound_producer_words(image);
+    let inbound_producer_words = inbound_producer_words(image, notify.as_ref());
 
     let route_words = image
         .flows
@@ -775,21 +831,18 @@ pub fn size_default_device_plan(
             })
         })
         .collect::<Result<Vec<_>, DeviceSizingError>>()?;
-    if image.host_states.iter().any(|state| {
-        !state.tcp_receivers.is_empty()
-            || state
-                .generators
-                .iter()
-                .any(|generator| matches!(generator.kind, FlowGeneratorKind::Tcp(_)))
-    }) {
-        let tcp_words = packed_tcp_state_words(image, &flow_data_counts, &context)?;
-        planes.push(DevicePlaneSizing {
-            index: planes.len(),
-            name: "tcp_state",
-            words: tcp_words,
-            bytes: checked_product(tcp_words, WORD_BYTES, "TCP state plane bytes")?,
-        });
-    }
+    // Both planners allocate `tcp_state` for every image (P16 G2: an image without TCP still
+    // carries its receiver and ledger rows, and its stage and RoCE regions live there).
+    let has_stages = concurrency
+        .as_ref()
+        .is_some_and(|concurrency| concurrency.has_stages());
+    let tcp_words = packed_tcp_state_words(image, has_stages, &flow_data_counts, &context)?;
+    planes.push(DevicePlaneSizing {
+        index: planes.len(),
+        name: "tcp_state",
+        words: tcp_words,
+        bytes: checked_product(tcp_words, WORD_BYTES, "TCP state plane bytes")?,
+    });
     let total_device_bytes = planes.iter().try_fold(0_usize, |total, plane| {
         total
             .checked_add(plane.bytes)
@@ -900,7 +953,7 @@ impl CapacityContext {
                     }
                     // Device backends refuse RoCE queue pairs at validation; these sizes keep a
                     // direct sizing request conservative. A retransmission may resend any packet
-                    // from the cumulative acknowledgment on, and feedback is an ACK, NACK or CNP.
+                    // from the cumulative acknowledgment on, and feedback is an ACK or NACK.
                     FlowGeneratorKind::Roce(roce) => {
                         minimum_data_sizes[index] =
                             minimum_data_sizes[index].min(finite_generator_minimum_packet_size(
@@ -927,7 +980,7 @@ impl CapacityContext {
                 | PacketKind::DcqcnCnp(_)
                 | PacketKind::RoceAck(_)
                 | PacketKind::RoceNack(_) => &mut minimum_feedback_sizes[packet.flow.0 as usize],
-                PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => continue,
+                PacketKind::RocePacingTimer | PacketKind::StageNotify => continue,
             };
             *minimum = (*minimum).min(packet.size_bytes);
         }
@@ -959,6 +1012,101 @@ impl CapacityContext {
     }
 }
 
+/// Run-time event slots the stage notifies of an image need (P16 H2), shared by both planners and
+/// the sizing projection. A notify that has not fired yet holds one timer at its source (a
+/// fallback-heap event), stages one emission in its source's outbox, and puts one event on its
+/// host pair's lane stream (or, without streams, in its target's event heap). A fired notify's
+/// remaining arrival is an initial event, which every planner already reserves.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct NotifyCapacities {
+    /// `(node slot, unfired notifies sourced there)`, ascending by node.
+    pub sources: Vec<(usize, usize)>,
+    /// `(node slot, unfired notifies targeting it)`, ascending by node.
+    pub targets: Vec<(usize, usize)>,
+    /// `(channel index, unfired notifies on that lane)`, ascending by channel.
+    pub lanes: Vec<(usize, usize)>,
+}
+
+/// The stage notifies' capacity terms, or `None` for an image without one (decided in one pass
+/// over the stage tables; a stageless image reads no generator).
+pub(crate) fn notify_capacities(image: &SimulationImage) -> Option<NotifyCapacities> {
+    use std::collections::BTreeMap;
+    let mut pairs = BTreeMap::<(crate::NodeId, crate::NodeId), usize>::new();
+    for state in image
+        .host_states
+        .iter()
+        .filter(|state| !state.stages.is_empty())
+    {
+        for (position, generator) in state.generators.iter().enumerate() {
+            let Some(stage) = state.stage(position) else {
+                continue;
+            };
+            if matches!(stage.role, crate::StageRole::Collective(_))
+                && matches!(generator.kind, crate::FlowGeneratorKind::Constant(_))
+                && matches!(
+                    generator.next_emission.status,
+                    crate::GeneratorStatus::Blocked | crate::GeneratorStatus::Scheduled
+                )
+            {
+                let flow = image.flows.get(generator.flow.0 as usize)?;
+                *pairs.entry((flow.source, flow.target)).or_default() += 1;
+            }
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    let mut sources = BTreeMap::<usize, usize>::new();
+    let mut targets = BTreeMap::<usize, usize>::new();
+    let mut lanes = BTreeMap::<usize, usize>::new();
+    for (index, channel) in image.channels.iter().enumerate() {
+        let Some(link) = image.links.get(channel.link.0 as usize) else {
+            continue;
+        };
+        if link.source != channel.source || link.target != channel.target {
+            continue;
+        }
+        if let Some(count) = pairs.remove(&(channel.source, channel.target)) {
+            *sources.entry(channel.source.0 as usize).or_default() += count;
+            *targets.entry(channel.target.0 as usize).or_default() += count;
+            lanes.insert(index, count);
+        }
+    }
+    Some(NotifyCapacities {
+        sources: sources.into_iter().collect(),
+        targets: targets.into_iter().collect(),
+        lanes: lanes.into_iter().collect(),
+    })
+}
+
+/// `(producer, target)` of every stage-notify lane: the lane's source host feeds its target host's
+/// inbound merge (P16 H2).
+pub(crate) fn notify_lane_producers<'a>(
+    image: &'a SimulationImage,
+    notify: Option<&'a NotifyCapacities>,
+) -> impl Iterator<Item = (u64, usize)> + 'a {
+    notify
+        .map_or(&[][..], |notify| &notify.lanes)
+        .iter()
+        .map(|&(channel, _)| {
+            let channel = image.channels[channel];
+            (channel.source.0, channel.target.0 as usize)
+        })
+}
+
+/// Whether an initial packet occupies a queue or a link of its flow's route, so the per-flow packet
+/// counts that size the queue, staging and channel arenas include it. A queue pair's zero-byte
+/// pacing token never enters a queue or crosses a link, and a PFC frame travels on its reverse
+/// control lane, never on its flow's route. P16 G1: neither does a compute stage's timer token,
+/// the only zero-byte `Data` packet the validator admits. P16 H2: nor a stage notify, which
+/// crosses its host pair's lane.
+pub(crate) fn initial_packet_is_routed(packet: &crate::PacketDescriptor) -> bool {
+    !(matches!(
+        packet.kind,
+        PacketKind::RocePacingTimer | PacketKind::Pfc(_) | PacketKind::StageNotify
+    ) || (packet.kind == PacketKind::Data && packet.size_bytes == 0))
+}
+
 fn flow_packet_counts(
     image: &SimulationImage,
 ) -> Result<(Vec<usize>, Vec<usize>), DeviceSizingError> {
@@ -969,9 +1117,7 @@ fn flow_packet_counts(
         if matches!(packet.kind, PacketKind::TcpData(_)) && !live_payloads.contains(&packet.id) {
             continue;
         }
-        // The zero-byte DCQCN control-timer token never enters a queue or crosses a link, and a PFC
-        // frame travels on its reverse control lane, never on its flow's route.
-        if packet.kind.is_timer_token() || matches!(packet.kind, PacketKind::Pfc(_)) {
+        if !crate::device_sizing::initial_packet_is_routed(packet) {
             continue;
         }
         let counts = if packet.kind.is_data() {
@@ -1068,11 +1214,12 @@ fn flow_packet_counts(
     for state in &image.host_states {
         for generator in &state.generators {
             // One ACK (TCP) or at most one CNP (DCQCN) per data packet; a queue pair's receiver
-            // answers a data arrival with at most one ACK or NACK and one CNP (validator
-            // invariant 20 of `evidence/P15/qp-design.md` §7).
+            // answers a data arrival with at most one ACK or NACK (P16: its ACKs echo ECN and it
+            // sends no CNP).
             let per_packet = match generator.kind {
-                FlowGeneratorKind::Tcp(_) | FlowGeneratorKind::Dcqcn(_) => 1,
-                FlowGeneratorKind::Roce(_) => 2,
+                FlowGeneratorKind::Tcp(_)
+                | FlowGeneratorKind::Dcqcn(_)
+                | FlowGeneratorKind::Roce(_) => 1,
                 FlowGeneratorKind::Constant(_) | FlowGeneratorKind::Rate(_) => 0,
             };
             if per_packet != 0 {
@@ -1092,6 +1239,7 @@ fn flow_packet_counts(
 
 fn packed_tcp_state_words(
     image: &SimulationImage,
+    has_stages: bool,
     data_counts: &[usize],
     context: &CapacityContext,
 ) -> Result<usize, DeviceSizingError> {
@@ -1102,7 +1250,7 @@ fn packed_tcp_state_words(
     // -flow frontier, against a 5.74 GB record arena.
     const LEDGER_META_WORDS: usize = crate::tcp_ledger_ring::TCP_LEDGER_META_WORDS;
     const LEDGER_RECORD_WORDS: usize = crate::tcp_ledger_ring::TCP_LEDGER_RECORD_WORDS;
-    let flow_count = image.flows.len().max(1);
+    let flow_count = image.flows.len();
     let receiver_range_slots = image
         .host_states
         .iter()
@@ -1114,8 +1262,7 @@ fn packed_tcp_state_words(
             total
                 .checked_add(bound.max(receiver.out_of_order.len()))
                 .ok_or_else(|| sizing_error("TCP receiver range slots overflow usize"))
-        })?
-        .max(1);
+        })?;
     let ledger = crate::tcp_ledger::seed_image(image).map_err(|conflict| {
         sizing_error(format!(
             "TCP flow {:?} sequence {} changed segment size from {} to {} bytes",
@@ -1143,12 +1290,14 @@ fn packed_tcp_state_words(
             .checked_add(bound.max(resident))
             .ok_or_else(|| sizing_error("TCP ledger record slots overflow usize"))
     })?;
-    [
+    // The planners allocate the receiver, range and ledger regions as one buffer of at least one
+    // word, then append the stage region (P16 G1) and the RoCE region (P15).
+    let packed = [
         checked_product(flow_count, RECEIVER_WORDS, "TCP receiver rows")?,
         checked_product(receiver_range_slots, RANGE_WORDS, "TCP receive ranges")?,
         checked_product(flow_count, LEDGER_META_WORDS, "TCP ledger metadata")?,
         checked_product(
-            ledger_record_slots.max(1),
+            ledger_record_slots,
             LEDGER_RECORD_WORDS,
             "TCP ledger records",
         )?,
@@ -1158,7 +1307,86 @@ fn packed_tcp_state_words(
         total
             .checked_add(words)
             .ok_or_else(|| sizing_error("TCP state plane overflows usize"))
-    })
+    })?
+    .max(1);
+    let stage_words = if has_stages {
+        stage_region_words(image)?
+    } else {
+        0
+    };
+    [stage_words, roce_region_words(image)?]
+        .into_iter()
+        .try_fold(packed, |total, words| {
+            total
+                .checked_add(words)
+                .ok_or_else(|| sizing_error("TCP state plane overflows usize"))
+        })
+}
+
+/// Words of one queue-pair receiver record in the RoCE region (`device_mechanism`).
+pub(crate) const ROCE_RECEIVER_WORDS: usize = 10;
+
+/// Words of the RoCE region at the tail of `tcp_state`: one record per queue-pair receiver, zero
+/// without any (`device_mechanism::append_roce_region`).
+pub(crate) fn roce_region_words(image: &SimulationImage) -> Result<usize, DeviceSizingError> {
+    image
+        .host_states
+        .iter()
+        .filter_map(|state| state.roce_receivers.as_deref())
+        .try_fold(0_usize, |total, receivers| {
+            total
+                .checked_add(checked_product(
+                    receivers.len(),
+                    ROCE_RECEIVER_WORDS,
+                    "RoCE region",
+                )?)
+                .ok_or_else(|| sizing_error("RoCE region overflows usize"))
+        })
+}
+
+/// Words of one stage row in the stage region (`device_stage`).
+pub(crate) const STAGE_ROW_WORDS: usize = 5;
+
+/// Words of the stage region before the RoCE region (`device_stage::encode_stage_region`): a row
+/// per flow, then one successor entry per local and per inbound predecessor, and one credit word
+/// per inbound predecessor of an inbound join; zero without stages.
+pub(crate) fn stage_region_words(image: &SimulationImage) -> Result<usize, DeviceSizingError> {
+    if image
+        .host_states
+        .iter()
+        .all(|state| state.stages.is_empty())
+    {
+        return Ok(0);
+    }
+    let successors = image
+        .host_states
+        .iter()
+        .flat_map(|state| state.stages.iter().flatten())
+        .map(|stage| {
+            stage.dependencies.local.count() as usize + stage.dependencies.inbound.count() as usize
+        })
+        .fold(0_usize, usize::saturating_add);
+    // Without an inbound join no flow carries a credit word, and nothing is collected.
+    let mut credited = Vec::new();
+    for stage in image
+        .host_states
+        .iter()
+        .flat_map(|state| state.stages.iter().flatten())
+    {
+        if let crate::StagePredecessors::Join { .. } = stage.dependencies.inbound {
+            credited.extend(stage.dependencies.inbound.iter(&image.stage_joins));
+        }
+    }
+    credited.sort_unstable();
+    credited.dedup();
+    checked_product(
+        image.flows.len().max(1),
+        STAGE_ROW_WORDS,
+        "stage region rows",
+    )?
+    .checked_add(successors)
+    .and_then(|words| words.checked_add(credited.len()))
+    .ok_or_else(|| sizing_error("stage region overflows usize"))
 }
 
 pub(crate) fn paced_single_source_queue_bound(
@@ -1393,27 +1621,20 @@ pub(crate) fn horizon_queue_packet_bound(
     whole_flow_packets.min(emissions.saturating_add(residency).saturating_add(2))
 }
 
-/// Converts a finite ECN admission limit into an outward-safe queue-record bound.
+/// Converts the ECN ramp's byte capacity into an outward-safe queue-record bound.
 ///
 /// The admission decision reads the waiting queue before enqueue and accepts only when the
-/// post-enqueue depth is at most `C`. For a byte policy, if every routed or resident packet is at
-/// least `m` bytes, `waiting * m <= queued_bytes <= C`, hence
-/// `waiting <= floor(C / m)`. The packet policy gives `waiting <= C` directly. Intersecting that
+/// post-enqueue byte depth is at most `C`. If every routed or resident packet is at least `m`
+/// bytes, `waiting * m <= queued_bytes <= C`, hence `waiting <= floor(C / m)`. Intersecting that
 /// queue-level invariant with the aggregate finite-flow packet count is safe across horizons;
 /// summing per-flow horizon arrivals is not, because waiting packets persist between horizons.
 /// The in-service packet is stored in its own plane and therefore is not part of this bound.
 pub(crate) fn ecn_queue_packet_bound(
     aggregate_flow_packets: usize,
-    policy: crate::EcnThresholdPolicy,
+    policy: crate::EcnRampPolicy,
     minimum_packet_bytes: u64,
 ) -> usize {
-    if policy.capacity == 0 {
-        return aggregate_flow_packets;
-    }
-    let semantic_packet_limit = match policy.unit {
-        crate::QueueDepthUnit::Packets => policy.capacity,
-        crate::QueueDepthUnit::Bytes => policy.capacity / minimum_packet_bytes.max(1),
-    };
+    let semantic_packet_limit = policy.capacity_bytes / minimum_packet_bytes.max(1);
     aggregate_flow_packets.min(usize::try_from(semantic_packet_limit).unwrap_or(usize::MAX))
 }
 
@@ -1535,6 +1756,9 @@ fn source_queue_bounds(
 }
 
 struct FlowRouteCapacities<'a> {
+    /// The flow's concurrency group if it is an unfinished stage (P16 G2, ruling G7).
+    group: Option<u32>,
+    fel_charges: &'a mut crate::stage_sizing::ConcurrentCharges,
     fel: &'a mut [usize],
     queue: &'a mut [usize],
     aggregate_queue_packets: &'a mut [usize],
@@ -1563,7 +1787,7 @@ fn add_flow_route_capacities(
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => (flow.reverse_route.as_slice(), flow.source),
-        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => return,
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => return,
     };
     for index in 0..route.len() {
         let target = route
@@ -1579,7 +1803,14 @@ fn add_flow_route_capacities(
             packet_kind,
             route[index],
         );
-        capacities.fel[target_slot] = capacities.fel[target_slot].saturating_add(burst);
+        crate::stage_sizing::charge(
+            capacities.fel,
+            capacities.fel_charges,
+            capacities.group,
+            target_slot,
+            crate::stage_sizing::charge_class(packet_kind),
+            burst,
+        );
         if image.nodes[target_slot].kind == NodeKind::Switch {
             capacities.aggregate_queue_packets[target_slot] =
                 capacities.aggregate_queue_packets[target_slot].saturating_add(packet_count);
@@ -1594,14 +1825,14 @@ fn add_flow_route_capacities(
                     | PacketKind::DcqcnCnp(_)
                     | PacketKind::RoceAck(_)
                     | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
-                    PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => unreachable!(),
+                    PacketKind::RocePacingTimer | PacketKind::StageNotify => unreachable!(),
                 });
             let queue = image.switch_states[image.nodes[target_slot].state_slot as usize]
                 .queues
                 .first();
-            let contribution = if queue.is_some_and(|queue| {
-                matches!(queue.drop_mark, crate::DropMarkPolicy::EcnThreshold(_))
-            }) {
+            let contribution = if queue
+                .is_some_and(|queue| matches!(queue.drop_mark, crate::DropMarkPolicy::EcnRamp(_)))
+            {
                 let link = image.links[route[index].0 as usize];
                 horizon_queue_packet_bound(
                     packet_count,
@@ -1641,7 +1872,7 @@ fn flow_link_serialization_ns(
         | PacketKind::DcqcnCnp(_)
         | PacketKind::RoceAck(_)
         | PacketKind::RoceNack(_) => context.minimum_feedback_sizes[flow_index],
-        PacketKind::DcqcnControlTimer | PacketKind::RocePacingTimer => return 0,
+        PacketKind::RocePacingTimer | PacketKind::StageNotify => return 0,
     };
     serialization_time_ns(minimum_size, image.links[link_id.0 as usize].rate_bps)
         .expect("lowered GPU image has positive finite serialization intervals")
@@ -1751,16 +1982,24 @@ fn flow_link_fel_bound(
 
 /// Per-producer remote staging capacities.
 ///
-/// The device planners keep a matching whole-plan `derived_remote_capacity` — the same sum with the
-/// same `2` per node folded in as the seed — because it is what they upload as
-/// `params[P_OUTBOX_CAPACITY]`. This module no longer needs that scalar: the streams-enabled plan
-/// it sizes carries [`STREAMS_OUTBOX_RECORD_SLOTS`] outbox records, and the capacity number is not
-/// a plane. Uncapped, `capacities.iter().sum()` reproduces it exactly.
-fn derived_remote_capacities(image: &SimulationImage, context: &CapacityContext) -> Vec<usize> {
+/// The device planners upload the uncapped sum of these capacities (2 per node included) as
+/// `params[P_OUTBOX_CAPACITY]`. This module does not need that scalar: the streams-enabled plan it
+/// sizes carries [`STREAMS_OUTBOX_RECORD_SLOTS`] outbox records, and the capacity number is not a
+/// plane. The bounds of a host's unfinished stages are charged together (P16 G2, ruling G7).
+fn derived_remote_capacities(
+    image: &SimulationImage,
+    context: &CapacityContext,
+    concurrency: Option<&crate::stage_sizing::SizingConcurrency>,
+) -> Vec<usize> {
     let mut capacities = vec![2_usize; image.nodes.len()];
+    let mut charges = crate::stage_sizing::ConcurrentCharges::default();
     for (index, flow) in image.flows.iter().enumerate() {
         let feedback_count = context.feedback_counts[index];
         let data_count = context.packet_counts[index].saturating_sub(feedback_count);
+        let group = concurrency.and_then(|concurrency| concurrency.group(index));
+        // A windowed pair with its timeout off has at most its window's packets, and as many
+        // feedback packets, in the network at once (ruling R11 (b)).
+        let window = concurrency.and_then(|concurrency| concurrency.window_packets(index));
         for (route, packet_count, packet_kind) in [
             (flow.route.as_slice(), data_count, PacketKind::Data),
             (
@@ -1771,16 +2010,27 @@ fn derived_remote_capacities(image: &SimulationImage, context: &CapacityContext)
         ] {
             for link_id in route {
                 let producer = image.links[link_id.0 as usize].source.0 as usize;
-                capacities[producer] = capacities[producer].saturating_add(flow_link_round_bound(
+                let bound = flow_link_round_bound(
                     image,
                     context,
                     index,
                     packet_count,
                     packet_kind,
                     *link_id,
-                ));
+                );
+                crate::stage_sizing::charge(
+                    &mut capacities,
+                    &mut charges,
+                    group,
+                    producer,
+                    crate::stage_sizing::charge_class(packet_kind),
+                    window.map_or(bound, |window| bound.min(window)),
+                );
             }
         }
+    }
+    if let Some(concurrency) = concurrency {
+        charges.apply(concurrency, &mut capacities);
     }
     capacities
 }
@@ -1946,7 +2196,7 @@ fn stream_state_words(
     })
 }
 
-fn inbound_producer_words(image: &SimulationImage) -> usize {
+fn inbound_producer_words(image: &SimulationImage, notify: Option<&NotifyCapacities>) -> usize {
     let mut inbound = vec![BTreeSet::new(); image.nodes.len()];
     for flow in &image.flows {
         for (route, terminal) in [
@@ -1964,6 +2214,10 @@ fn inbound_producer_words(image: &SimulationImage) -> usize {
         }
     }
     for (producer, target) in crate::device_pfc::pfc_control_lane_producers(image) {
+        inbound[target].insert(producer);
+    }
+    // P16 H2: a stage notify's lane delivers from its source host to its target host.
+    for (producer, target) in notify_lane_producers(image, notify) {
         inbound[target].insert(producer);
     }
     inbound.iter().map(BTreeSet::len).sum()
@@ -2005,10 +2259,32 @@ mod tests {
         horizon_queue_packet_bound, paced_single_source_queue_bound, planning_horizon_ns,
         tcp_fallback_timer_packet_bound, tcp_ledger_segment_bound, tcp_receiver_range_bound,
     };
-    use crate::{
-        DeviceEventArenaSizing, EcnThresholdPolicy, QueueDepthUnit, TcpCongestionControl,
-        TcpGenerator,
-    };
+    use crate::{DeviceEventArenaSizing, EcnRampPolicy, TcpCongestionControl, TcpGenerator};
+
+    /// P16 G1 (design note §4.2, item 1): a compute stage's zero-byte `Data` token names its
+    /// timer and is never routed, like a queue pair's pacing token; a sized data packet is.
+    #[test]
+    fn compute_timer_tokens_and_pacing_tokens_are_not_routed() {
+        let packet = |kind, size_bytes| crate::PacketDescriptor {
+            id: crate::PayloadId(1),
+            flow: crate::FlowId(0),
+            size_bytes,
+            ecn_marked: false,
+            kind,
+        };
+        assert!(!super::initial_packet_is_routed(&packet(
+            crate::PacketKind::Data,
+            0
+        )));
+        assert!(!super::initial_packet_is_routed(&packet(
+            crate::PacketKind::RocePacingTimer,
+            0
+        )));
+        assert!(super::initial_packet_is_routed(&packet(
+            crate::PacketKind::Data,
+            1
+        )));
+    }
 
     #[test]
     fn exact_plan_report_sums_production_plane_words() {
@@ -2123,10 +2399,12 @@ mod tests {
         assert_eq!(1 + 8 * per_flow_horizon, 801);
 
         let whole_flow_packets = 8 * 65_536;
-        let byte_policy = EcnThresholdPolicy {
-            unit: QueueDepthUnit::Bytes,
-            capacity: 262_144,
-            threshold: 262_144,
+        let byte_policy = EcnRampPolicy {
+            capacity_bytes: 262_144,
+            kmin_bytes: 262_144,
+            kmax_bytes: 262_144,
+            pmax_numerator: 1,
+            pmax_denominator: 1,
         };
         assert_eq!(
             ecn_queue_packet_bound(whole_flow_packets, byte_policy, 256),
@@ -2136,28 +2414,6 @@ mod tests {
             ecn_queue_packet_bound(800, byte_policy, 256),
             800,
             "the semantic bound remains capped by the aggregate finite-flow count"
-        );
-
-        let packet_policy = EcnThresholdPolicy {
-            unit: QueueDepthUnit::Packets,
-            capacity: 777,
-            threshold: 700,
-        };
-        assert_eq!(
-            ecn_queue_packet_bound(whole_flow_packets, packet_policy, 1),
-            777
-        );
-        assert_eq!(
-            ecn_queue_packet_bound(
-                whole_flow_packets,
-                EcnThresholdPolicy {
-                    capacity: 0,
-                    ..byte_policy
-                },
-                256,
-            ),
-            whole_flow_packets,
-            "zero capacity is the unbounded semantic policy"
         );
     }
 
@@ -2170,10 +2426,12 @@ mod tests {
         assert_eq!(
             ecn_queue_packet_bound(
                 2_000,
-                EcnThresholdPolicy {
-                    unit: QueueDepthUnit::Bytes,
-                    capacity: 1_024,
-                    threshold: 1_024,
+                EcnRampPolicy {
+                    capacity_bytes: 1_024,
+                    kmin_bytes: 1_024,
+                    kmax_bytes: 1_024,
+                    pmax_numerator: 1,
+                    pmax_denominator: 1,
                 },
                 minimum,
             ),

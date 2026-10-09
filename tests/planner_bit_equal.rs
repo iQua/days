@@ -44,6 +44,10 @@ const FIXTURES: &[&str] = &[
     // apart from the data class (host rows, the class word).
     "configs/p15/roce_gbn_lossy.toml",
     "configs/p15/hostpfc_multi_qp_tcp.toml",
+    // P16 G2: collective and compute stages over RoCE and TCP, whose arenas are charged per host
+    // chain (ruling G7), and the outbox capacity that sums them.
+    "configs/p15/roce_compute_dag.toml",
+    "configs/p15/roce_tcp_mixed_collectives.toml",
 ];
 
 const TEST_CAPS: DeviceCapacityCaps = DeviceCapacityCaps {
@@ -200,25 +204,21 @@ fn rate_image() -> SimulationImage {
             payload: token,
         }],
         seed: 25,
+        stage_joins: Vec::new(),
+        seeded_all_to_alls: Vec::new(),
+        stage_streams: Vec::new(),
     }
 }
 
+/// The DCQCN fixture with inert PFC state. P16 D1 (ruling D10, condition 4): the legacy-format
+/// `configs/dcqcn_1s.toml` no longer lowers, so this reads `configs/p14/dcqcn_1s_zero_xoff.toml`,
+/// which at `main` 9ff20ea lowered to the byte-identical image of the old splice (zero XOFF/XON
+/// into the legacy file) with an equal Metal sizing report
+/// (`days-gpu/evidence/P16/dcqcn-impl/planner-pin-move.txt`). The test pins no hash: it requires
+/// host and device planning to agree on this image.
 fn compile_dcqcn_inert_pfc_fixture() -> SimulationImage {
-    let source = fixture_path("configs/dcqcn_1s.toml");
-    let mut config = fs::read_to_string(&source)
-        .unwrap_or_else(|error| panic!("failed to read {}: {error}", source.display()));
-    let buffer_capacity = "buffer_capacity = [0, 0, 0, 0, 0, 0, 0, 0]";
-    assert!(config.contains(buffer_capacity));
-    config = config.replacen(
-        buffer_capacity,
-        &format!(
-            "{buffer_capacity}\nxoff = [0, 0, 0, 0, 0, 0, 0, 0]\nxon = [0, 0, 0, 0, 0, 0, 0, 0]"
-        ),
-        1,
-    );
-    let file = NamedTempFile::new().expect("temporary DCQCN fixture must open");
-    fs::write(file.path(), config).expect("temporary DCQCN fixture must be written");
-    compile_config(file.path())
+    let path = fixture_path("configs/p14/dcqcn_1s_zero_xoff.toml");
+    compile_config(&path)
         .unwrap_or_else(|error| panic!("failed to lower the DCQCN inert-PFC fixture: {error}"))
 }
 
@@ -332,7 +332,8 @@ fn device_planners_are_bit_equal_to_legacy_planning_across_fixture_families() {
                 "ecn-threshold",
                 &[(
                     "drop = \"TailDrop\"",
-                    "drop = \"ECN_THRESHOLD\"\necn_threshold = 0.5",
+                    "drop = \"TailDrop\"\necn_capacity_bytes = 100000\n\
+                     ecn = { kmin_bytes = 50000, kmax_bytes = 50000, pmax = 1 }",
                 )],
             ),
         ),
@@ -398,14 +399,19 @@ fn assert_0695_initial_plan(
     // P15 lane R4 appended one params word addressing the RoCE receiver region (`u64::MAX` for this
     // image, which carries no queue pairs and plans no RoCE words). No other plane moved.
     let p15_roce_params_bytes = std::mem::size_of::<u64>();
+    // P16 G1 appended one params word addressing the stage region (`u64::MAX` for this image, which
+    // carries no collective or compute stage and plans no stage words). No other plane moved.
+    let p16_stage_params_bytes = std::mem::size_of::<u64>();
     assert_eq!(
         strict.total_device_bytes,
         expected_total_device_bytes
             + t21_round_scratch_bytes
             + p14_pfc_params_bytes
-            + p15_roce_params_bytes,
+            + p15_roce_params_bytes
+            + p16_stage_params_bytes,
         "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region, \
-         the P14 PFC-offset params word and the P15 RoCE-offset params word",
+         the P14 PFC-offset params word, the P15 RoCE-offset params word and the P16 \
+         stage-offset params word",
     );
 }
 
@@ -668,51 +674,43 @@ fn unsupported_device_families_are_rejected_before_planning() {
     }
 
     // P14 Lane B: DCQCN with (inert) PFC state now runs on both device backends, so its planner
-    // must plan it, bit-equal to legacy planning, instead of rejecting it. RED admission remains
-    // device-unsupported and keeps the rejection branch exercised.
+    // must plan it, bit-equal to legacy planning, instead of rejecting it. A TailDrop packet
+    // capacity beyond the devices' 32-bit queue limit keeps the rejection branch exercised (it was
+    // RED admission until P16 ecnramp removed RED).
     let dcqcn = compile_dcqcn_inert_pfc_fixture();
-    let mut red = dcqcn.clone();
-    for queue in red
+    let mut oversized = dcqcn.clone();
+    for queue in oversized
         .switch_states
         .iter_mut()
         .flat_map(|state| &mut state.queues)
     {
-        queue.drop_mark = days_executor::DropMarkPolicy::Red(days_executor::RedPolicyState {
-            unit: days_executor::QueueDepthUnit::Packets,
-            capacity: 64,
-            min_threshold: 8,
-            max_threshold: 32,
-            max_probability_numerator: 1,
-            max_probability_denominator: 10,
-            average_scaled: 0,
-            counter: 0,
-            mark_ecn: false,
-        });
+        queue.drop_mark = days_executor::DropMarkPolicy::TailDrop;
+        queue.queue_capacity_packets = u64::from(u32::MAX) + 1;
     }
     planner_rejections += 1;
 
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     assert!(
         assert_metal_planner_bit_equal_for_testing(
-            &red,
+            &oversized,
             None,
             metal_config(true, true),
             ObservationMode::Summary,
         )
-        .is_err_and(|error| error.to_string().contains("RED admission")),
-        "Metal must reject RED before planning"
+        .is_err_and(|error| error.to_string().contains("exceeds backend Metal limit")),
+        "Metal must reject an oversized queue before planning"
     );
 
     #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
     assert!(
         assert_cuda_planner_bit_equal_for_testing(
-            &red,
+            &oversized,
             None,
             cuda_config(true, true),
             ObservationMode::Summary,
         )
-        .is_err_and(|error| error.to_string().contains("RED admission")),
-        "CUDA must reject RED before planning"
+        .is_err_and(|error| error.to_string().contains("exceeds backend Cuda limit")),
+        "CUDA must reject an oversized queue before planning"
     );
 
     #[cfg(all(feature = "metal", target_vendor = "apple"))]

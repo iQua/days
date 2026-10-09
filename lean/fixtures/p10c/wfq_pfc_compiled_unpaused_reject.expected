@@ -1,0 +1,2 @@
+exit=1
+REJECT: line 233: WFQ select claims paused priorities []; the PFC certificate pauses [3] on queue (node_id=14, queue_id=0)
