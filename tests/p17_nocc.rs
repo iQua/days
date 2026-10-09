@@ -15,7 +15,8 @@ use days_executor::{
     Backend, CpuConfig, DcqcnController, FlowGeneratorKind, GeneratorStatus,
     MechanismTransitionRecord, ObservationMode, PacketKind, PfcControlAction,
     RoceCongestionControl, RoceGenerator, RoceSenderKind, RoceTransitionRecord, RunResult,
-    SimulationImage, run_cpu_with_observations, run_scalar_with_observations, validate,
+    SimulationImage, roce_sender_transitions_csv, run_cpu_with_observations,
+    run_scalar_with_observations, validate,
 };
 
 const LINE_RATE_BPS: u64 = 1_000_000_000;
@@ -352,4 +353,42 @@ fn only_nocc_pairs_render_their_mode() {
         );
         assert_eq!(rendered.contains("congestion_control"), nocc, "{name}");
     }
+}
+
+/// qp-schema Amendment 7 (design note R6): the sender CSV appends a `congestion_control` column,
+/// `dcqcn` or `none`, on every row of each pair.
+#[test]
+fn the_sender_csv_names_each_pairs_congestion_control() {
+    let image = lower("nocc_mixed.toml");
+    let nocc = nocc_flows(&image);
+    let result = run_identical("nocc_mixed.toml");
+    let csv = roce_sender_transitions_csv(
+        &result
+            .diagnostics
+            .as_ref()
+            .expect("full observation carries diagnostics")
+            .mechanism_transitions,
+    )
+    .expect("sender CSV");
+    let mut lines = csv.lines();
+    let header = lines
+        .next()
+        .expect("a header")
+        .split(',')
+        .collect::<Vec<_>>();
+    assert_eq!(header.len(), 46);
+    assert_eq!(header[45], "congestion_control");
+    let flow = header
+        .iter()
+        .position(|column| *column == "flow_id")
+        .unwrap();
+    let mut seen = [0_usize; 2];
+    for line in lines {
+        let fields = line.split(',').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 46, "{line}");
+        let none = nocc.contains(&fields[flow].parse::<u64>().unwrap());
+        assert_eq!(fields[45], if none { "none" } else { "dcqcn" }, "{line}");
+        seen[usize::from(none)] += 1;
+    }
+    assert!(seen[0] > 0 && seen[1] > 0, "{seen:?}");
 }
