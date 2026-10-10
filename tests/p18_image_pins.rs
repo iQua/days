@@ -7,11 +7,13 @@
 //! `tests/planner_bit_equal.rs` compares two device planners over one image, so it cannot prove a
 //! lowering change bit-equal; this file can.
 //!
-//! b4 and the MoE smoke lower from committed fixtures. The M2s trace is not committed: set
-//! `DAYS_AICB_M2S` (days-gpu `evidence/P17/profile/tooling/scenarios/m2s_tp2ep32.txt`, sha256
-//! `fee71765…`) and run in release, one test at a time:
+//! b4 and the MoE smoke lower from committed fixtures. The M2s and flagship traces are not
+//! committed: set `DAYS_AICB_M2S` (days-gpu `evidence/P17/profile/tooling/scenarios/
+//! m2s_tp2ep32.txt`, sha256 `fee71765…`) and `DAYS_AICB_FLAGSHIP` (see `p16_aicb_flagship.rs`)
+//! and run in release, one test at a time:
 //! `cargo test --release --test p18_image_pins -- --ignored --test-threads=1`.
-//! Only b4 (15 MB of Debug text) runs by default; the others are ignored (ruling
+//! The flagship's Debug rendering is 84 GB (hashed in about 25 minutes) and its lowering needs
+//! about 36 GB of host memory. Only b4 (15 MB of Debug text) runs by default; the others are ignored (ruling
 //! 6), since the smoke alone formats to 2.5 GB, which a debug CI build would spend minutes
 //! hashing.
 
@@ -89,6 +91,20 @@ fn m2s_lowers_to_its_frozen_image() {
             flows: 229_504,
             debug_bytes: 1_368_201_675,
             debug_fnv1a64: 0xc8ea_d6f6_f3fe_6815,
+        },
+    );
+}
+
+#[test]
+#[ignore = "P18 image pin: about 40 GB; set DAYS_AICB_FLAGSHIP, run in release"]
+fn the_flagship_lowers_to_its_frozen_image() {
+    check(
+        "flagship",
+        &aicb::lower_flagship(),
+        ImageFingerprint {
+            flows: 14_709_760,
+            debug_bytes: 84_041_270_569,
+            debug_fnv1a64: 0x614c_ec4f_3889_ecb0,
         },
     );
 }
