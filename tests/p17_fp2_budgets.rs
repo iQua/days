@@ -129,3 +129,51 @@ fn the_packet_store_does_not_allocate_per_packet() {
          slab with a free list"
     );
 }
+
+/// A mid-run horizon of `FIXTURE` at which 28 events and 16 packets are pending.
+const MID_RUN_HORIZON_NS: u64 = 20_000;
+
+/// A Scalar result holds its pending events and resident packets without spare capacity.
+///
+/// The future-event list drains into its own heap buffer (no allocation at the end of a run), so
+/// a result built straight from that buffer would keep the run's largest event list as empty
+/// capacity for as long as the caller holds the result: on `e5_wide_k32_q200_cubic` that was
+/// 524,288 slots of 56 B (28 MiB) with no event pending, at `cca76c16`. Checked at a mid-run
+/// horizon (events and packets pending, the checkpoint a resume reads) and at the end of the run.
+/// The same rule for the host-state table is `cpu_host_lp_heap_budget`'s
+/// `scalar_result_host_states_carry_no_spare_capacity`.
+#[test]
+fn a_scalar_result_carries_no_spare_capacity() {
+    let image = compile_config_with_route_workers(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE),
+        RouteWorkers::serial(),
+    )
+    .expect("the fixture lowers");
+    for horizon in [Some(MID_RUN_HORIZON_NS), None] {
+        let result = run_scalar(&image, horizon).expect("the Scalar run succeeds");
+        println!(
+            "record=p17_fp2_scalar_result_capacity fixture={FIXTURE} horizon={horizon:?} \
+             pending_len={} pending_capacity={} resident_len={} resident_capacity={}",
+            result.pending_events.len(),
+            result.pending_events.capacity(),
+            result.resident_packets.len(),
+            result.resident_packets.capacity()
+        );
+        if horizon.is_some() {
+            assert!(
+                !result.pending_events.is_empty() && !result.resident_packets.is_empty(),
+                "the mid-run horizon leaves events and packets pending"
+            );
+        }
+        assert_eq!(
+            result.pending_events.capacity(),
+            result.pending_events.len(),
+            "horizon {horizon:?}: the Scalar result's pending events keep spare capacity"
+        );
+        assert_eq!(
+            result.resident_packets.capacity(),
+            result.resident_packets.len(),
+            "horizon {horizon:?}: the Scalar result's resident packets keep spare capacity"
+        );
+    }
+}
