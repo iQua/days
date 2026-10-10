@@ -34,16 +34,53 @@ impl ZeroPlane {
 /// pairs, so most routes repeat. A route's first occurrence, in flow order (forward route, then
 /// reverse), places it; the map is keyed by the route itself, so placement depends only on the
 /// image. An empty route reads nothing and takes offset 0.
+///
+/// The map is only looked up, never iterated, so its order cannot reach the plane; it hashes a
+/// route's link ids with [`RouteHasher`], a fixed multiplicative hash, so a lookup costs a few
+/// multiplies rather than a B-tree descent of slice comparisons (which made planning 5% slower on
+/// the MoE smoke).
 pub(crate) struct RoutePlane<'image> {
     words: Vec<u64>,
-    offsets: std::collections::BTreeMap<&'image [crate::LinkId], u64>,
+    offsets: std::collections::HashMap<
+        &'image [crate::LinkId],
+        u64,
+        std::hash::BuildHasherDefault<RouteHasher>,
+    >,
+    /// The last route placed and its offset: consecutive flows often repeat a route (a ring's
+    /// steps between one pair), which one comparison answers without hashing.
+    last: Option<(&'image [crate::LinkId], u64)>,
+}
+
+/// A fixed (unseeded) word hash for route keys: deterministic across runs and processes.
+#[derive(Default)]
+pub(crate) struct RouteHasher(u64);
+
+impl std::hash::Hasher for RouteHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+
+    fn write_u64(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+
+    fn write_usize(&mut self, word: usize) {
+        self.write_u64(word as u64);
+    }
 }
 
 impl<'image> RoutePlane<'image> {
     pub(crate) fn new() -> Self {
         Self {
             words: Vec::new(),
-            offsets: std::collections::BTreeMap::new(),
+            offsets: std::collections::HashMap::default(),
+            last: None,
         }
     }
 
@@ -52,12 +89,19 @@ impl<'image> RoutePlane<'image> {
         if route.is_empty() {
             return 0;
         }
+        if let Some((last, offset)) = self.last {
+            if last == route {
+                return offset;
+            }
+        }
         let words = &mut self.words;
-        *self.offsets.entry(route).or_insert_with(|| {
+        let offset = *self.offsets.entry(route).or_insert_with(|| {
             let offset = words.len() as u64;
             words.extend(route.iter().map(|link| link.0));
             offset
-        })
+        });
+        self.last = Some((route, offset));
+        offset
     }
 
     /// The plane's words: at least one, as every uploaded plane.
