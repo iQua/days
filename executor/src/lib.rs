@@ -43,6 +43,7 @@ mod merge_audit;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub mod metal;
 pub mod model;
+pub mod phase_marks;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 mod planner_capacity;
 mod roce;

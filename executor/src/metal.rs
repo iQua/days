@@ -1290,6 +1290,7 @@ impl MetalExecutor {
         }
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
+        crate::phase_marks::mark("validated", 0);
         validate_config(config)?;
         let round_kernel = selected_round_kernel(image, config);
 
@@ -1316,6 +1317,7 @@ impl MetalExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
+                crate::phase_marks::mark("planned", 0);
                 // The plain kernel has no device-side stop: the host refuses it, before upload, on
                 // any plan holding state a mechanism transition would act on.
                 if round_kernel == RoundKernel::Plain {
@@ -1334,11 +1336,15 @@ impl MetalExecutor {
                     .into());
                 }
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
+                crate::phase_marks::mark("uploaded", planned_bytes);
                 let _execution_guard = metal_device_execution_guard();
                 let timing = self.direct.run(&buffers, attempt_config, round_kernel)?;
+                crate::phase_marks::mark("executed", planned_bytes);
                 #[cfg(feature = "metal-test-hooks")]
                 panic_after_execution_if_requested();
-                buffers.finish(&self.direct, image, observation_mode, timing)
+                let run = buffers.finish(&self.direct, image, observation_mode, timing)?;
+                crate::phase_marks::mark("read_back", planned_bytes);
+                Ok(run)
             })();
             match attempt {
                 Ok(mut run) => {
@@ -4081,6 +4087,7 @@ impl SharedBuffer {
                 words.len(),
             );
         }
+        crate::phase_marks::mark("device_alloc", bytes);
         Ok(Self {
             raw,
             words: words.len(),
@@ -4105,6 +4112,7 @@ impl SharedBuffer {
             .ok_or_else(|| {
                 MetalError::Unavailable(format!("failed to allocate {bytes}-byte shared buffer"))
             })?;
+        crate::phase_marks::mark("device_alloc", bytes);
         Ok(Self { raw, words })
     }
 

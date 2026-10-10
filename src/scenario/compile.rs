@@ -1086,9 +1086,11 @@ fn compile_text(
     let (graph, hosts, profile) = build_graph_with_profile_from_str(content)?;
 
     let image = lower(model, &graph, hosts, profile, route_workers)?;
+    days_executor::phase_marks::mark("lowered", 0);
     validate(&image, Backend::Scalar).map_err(|error| {
         CompileError::Invalid(format!("lowered image failed validation: {error}"))
     })?;
+    days_executor::phase_marks::mark("compile_validated", 0);
     Ok(image)
 }
 

@@ -1510,6 +1510,7 @@ impl CudaExecutor {
             crate::merge_audit::reset();
         }
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+        crate::phase_marks::mark("validated", 0);
         validate_config(config)?;
         let direct = self.direct_for(config.device_index)?;
         let round_kernel = selected_round_kernel(image, config);
@@ -1550,6 +1551,7 @@ impl CudaExecutor {
                     &mut tcp_capacity_floors,
                 )?;
                 record_run_step("planned");
+                crate::phase_marks::mark("planned", 0);
                 // The plain kernel has no device-side stop: the host refuses it, before upload, on
                 // any plan holding state a mechanism transition would act on. The module is
                 // already loaded; on a refusal it is unloaded when the run returns, before any
@@ -1573,11 +1575,14 @@ impl CudaExecutor {
                 // before any buffer or graph, and no other run's module is in the context.
                 let buffers = CudaBuffers::new(&direct.stream, plan, direct.provisioning)?;
                 record_run_step("buffers_allocated");
+                crate::phase_marks::mark("uploaded", planned_bytes);
                 let timing = direct.run(&buffers, attempt_config, &held.module)?;
+                crate::phase_marks::mark("executed", planned_bytes);
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
                 let mut run =
                     buffers.finish(&direct, &held.module, image, observation_mode, timing)?;
+                crate::phase_marks::mark("read_back", planned_bytes);
                 run.module_load_ns = held.load_ns;
                 Ok(run)
             })();
@@ -4421,6 +4426,7 @@ impl CudaBuffer {
                 raw
             }
         };
+        crate::phase_marks::mark("device_alloc", len * std::mem::size_of::<u64>());
         Ok(Self {
             storage,
             raw,
