@@ -12,7 +12,8 @@ use days_executor::{
     PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RoceCongestionControl,
     RoceGenerator, RocePacer, RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage,
     StageDependencies, StagePredecessors, StageRole, SwitchQueueState, SwitchState,
-    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
+    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, ValidatedImage,
+    event_phase,
 };
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -1080,7 +1081,8 @@ pub fn compile_config_with_route_workers(
     path: impl AsRef<Path>,
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
-    compile_scenario(path.as_ref(), route_workers, None)
+    compile_scenario(path.as_ref(), route_workers, None, Backend::Scalar)
+        .map(ValidatedImage::into_image)
 }
 
 /// Lowers a TOML scenario's topology, switch and link configuration (and any stage groups it
@@ -1090,7 +1092,13 @@ pub fn compile_config_with_workload(
     workload: &super::workload::Workload,
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
-    compile_scenario(path.as_ref(), route_workers, Some(workload))
+    compile_scenario(
+        path.as_ref(),
+        route_workers,
+        Some(workload),
+        Backend::Scalar,
+    )
+    .map(ValidatedImage::into_image)
 }
 
 /// [`compile_config_with_route_workers`], with the run manifest of an AICB scenario
@@ -1100,11 +1108,23 @@ pub fn compile_config_with_manifest(
     path: impl AsRef<Path>,
     route_workers: RouteWorkers,
 ) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    compile_config_validated(path, route_workers, Backend::Scalar)
+        .map(|(image, manifest)| (image.into_image(), manifest))
+}
+
+/// [`compile_config_with_manifest`], validated once for the backend that will run the image
+/// (P18 c4): for a device backend, the Scalar validation every lowering runs plus the device's
+/// own refusals ([`ValidatedImage`]). A device entry given the result does not validate again.
+pub fn compile_config_validated(
+    path: impl AsRef<Path>,
+    route_workers: RouteWorkers,
+    backend: Backend,
+) -> Result<(ValidatedImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
     let path = path.as_ref();
     let content = read_scenario(path)?;
-    match compile_text(&content, route_workers, None) {
+    match compile_text(&content, route_workers, None, backend) {
         Err(CompileError::Parse(_)) if crate::workload::aicb::is_aicb_scenario(&content) => {
-            compile_aicb(path, &content, route_workers)
+            compile_aicb(path, &content, route_workers, backend)
         }
         other => other.map(|image| (image, None)),
     }
@@ -1124,14 +1144,15 @@ fn compile_scenario(
     path: &Path,
     route_workers: RouteWorkers,
     workload: Option<&super::workload::Workload>,
-) -> Result<SimulationImage, CompileError> {
+    backend: Backend,
+) -> Result<ValidatedImage, CompileError> {
     let content = read_scenario(path)?;
-    match compile_text(&content, route_workers, workload) {
+    match compile_text(&content, route_workers, workload, backend) {
         // An AICB scenario has no `[switch]` of its own, so it does not parse as an ordinary one.
         Err(CompileError::Parse(_))
             if workload.is_none() && crate::workload::aicb::is_aicb_scenario(&content) =>
         {
-            compile_aicb(path, &content, route_workers).map(|(image, _)| image)
+            compile_aicb(path, &content, route_workers, backend).map(|(image, _)| image)
         }
         other => other,
     }
@@ -1143,10 +1164,16 @@ fn compile_aicb(
     path: &Path,
     content: &str,
     route_workers: RouteWorkers,
-) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    backend: Backend,
+) -> Result<(ValidatedImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
     let prepared = crate::workload::aicb::prepare(path, content)
         .map_err(|error| CompileError::Invalid(format!("AICB scenario: {error}")))?;
-    let image = compile_text(&prepared.text, route_workers, Some(&prepared.workload))?;
+    let image = compile_text(
+        &prepared.text,
+        route_workers,
+        Some(&prepared.workload),
+        backend,
+    )?;
     Ok((image, Some(prepared.manifest)))
 }
 
@@ -1154,7 +1181,8 @@ fn compile_text(
     content: &str,
     route_workers: RouteWorkers,
     workload: Option<&super::workload::Workload>,
-) -> Result<SimulationImage, CompileError> {
+    backend: Backend,
+) -> Result<ValidatedImage, CompileError> {
     crate::validate_config_text(content).map_err(CompileError::Unsupported)?;
 
     let source: SourceConfig =
@@ -1171,7 +1199,7 @@ fn compile_text(
 
     let image = lower(model, &graph, hosts, profile, route_workers)?;
     days_executor::phase_marks::mark("lowered", 0);
-    validate(&image, Backend::Scalar).map_err(|error| {
+    let image = ValidatedImage::new(image, backend).map_err(|error| {
         CompileError::Invalid(format!("lowered image failed validation: {error}"))
     })?;
     days_executor::phase_marks::mark("compile_validated", 0);

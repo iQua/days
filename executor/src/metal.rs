@@ -43,9 +43,9 @@ use crate::{
     ArrivalDisposition, Backend, CapacityRetryRecord, CapacityWarmStart, DeviceCapacityCaps,
     DeviceCapacityFloors, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
     GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
-    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
+    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunImage, RunResult, RunSummary,
     SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
-    TcpTimerState, validate,
+    TcpTimerState,
 };
 
 const LANES: usize = 1_024;
@@ -983,8 +983,8 @@ pub struct MetalRun {
 /// Metal execution is serialized process-wide: one executor executes at a time, and concurrent
 /// callers queue until execution and readback complete. The compiled executor is cached
 /// process-wide.
-pub fn run_metal(
-    image: &SimulationImage,
+pub fn run_metal<'image>(
+    image: impl Into<RunImage<'image>>,
     exclusive_horizon_ns: Option<u64>,
     config: MetalConfig,
 ) -> Result<MetalRun, MetalError> {
@@ -1001,8 +1001,8 @@ pub fn run_metal(
 /// Metal execution is serialized process-wide: one executor executes at a time, and concurrent
 /// callers queue until execution and readback complete. Executor construction may proceed
 /// concurrently.
-pub fn run_metal_with_observations(
-    image: &SimulationImage,
+pub fn run_metal_with_observations<'image>(
+    image: impl Into<RunImage<'image>>,
     exclusive_horizon_ns: Option<u64>,
     config: MetalConfig,
     observation_mode: ObservationMode,
@@ -1210,9 +1210,9 @@ impl MetalExecutor {
     }
 
     /// Runs with summary observations under the process-wide Metal execution envelope.
-    pub fn run(
+    pub fn run<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
     ) -> Result<MetalRun, MetalError> {
@@ -1230,9 +1230,9 @@ impl MetalExecutor {
     }
 
     /// Runs with explicit observation retention under the process-wide Metal execution envelope.
-    pub fn run_with_observations(
+    pub fn run_with_observations<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
@@ -1258,9 +1258,9 @@ impl MetalExecutor {
     /// semantics (the T20g invariant), so a warm start moves a run between "refuses once, then
     /// runs" and "runs immediately" and never between two answers. See
     /// [`CapacityWarmStart`] for the argument in full.
-    pub fn run_with_observations_warm_started(
+    pub fn run_with_observations_warm_started<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
@@ -1275,9 +1275,9 @@ impl MetalExecutor {
         )
     }
 
-    fn run_with_observations_mode(
+    fn run_with_observations_mode<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
@@ -1289,9 +1289,13 @@ impl MetalExecutor {
             crate::device_pfc::take_resume_scan_counts_for_testing();
             crate::merge_audit::reset();
         }
-        validate(image, Backend::Metal)
+        // P18 c4: an image validated for this backend at compile is not validated again.
+        let run_image = image.into();
+        run_image
+            .validate_for(Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
         crate::phase_marks::mark("validated", 0);
+        let image = run_image.image();
         validate_config(config)?;
         let round_kernel = selected_round_kernel(image, config);
 
@@ -1485,7 +1489,8 @@ pub fn assert_metal_planner_bit_equal_for_testing(
     config: MetalConfig,
     observation_mode: ObservationMode,
 ) -> Result<(), MetalError> {
-    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Metal)
+        .map_err(|error| MetalError::Validation(error.to_string()))?;
     validate_config(config)?;
     let (packet_counts, feedback_counts) = flow_packet_counts(image)?;
     let data_counts = packet_counts
@@ -1538,7 +1543,8 @@ pub fn mechanism_plane_words_metal_for_testing(
     image: &SimulationImage,
     config: MetalConfig,
 ) -> Result<crate::MechanismPlaneWords, MetalError> {
-    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Metal)
+        .map_err(|error| MetalError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = MetalPlan::new(image, None, config, ObservationMode::Summary)?;
     let pfc_offset = plan.params[PARAM_PFC_OFFSET];
@@ -1585,7 +1591,8 @@ pub fn size_metal_plan_for_testing(
     config: MetalConfig,
     observation_mode: ObservationMode,
 ) -> Result<crate::DeviceSizingReport, MetalError> {
-    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Metal)
+        .map_err(|error| MetalError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
     let words = plan.plane_words();

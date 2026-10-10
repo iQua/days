@@ -1341,7 +1341,7 @@ fn concurrent_public_api_runs_match_the_scalar_result() {
             thread::spawn(move || {
                 start.wait();
                 executor.run_with_observations(
-                    &image,
+                    &*image,
                     Some(27),
                     MetalConfig::default(),
                     ObservationMode::Full,

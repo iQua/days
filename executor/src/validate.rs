@@ -602,6 +602,110 @@ fn payload_sequences_by_owner(image: &SimulationImage) -> Vec<Vec<u64>> {
 
 /// Validates all scenario-dependent assumptions required by the selected backend.
 pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), ValidationError> {
+    validate_passes(image, backend, None)
+}
+
+/// An image validated once for the backend that will run it (P18 c4, ruling 2(a)).
+///
+/// A device run used to validate its image twice: `compile` for Scalar, then the device entry for
+/// the device (431 G instructions at the 1,024-GPU flagship). A `ValidatedImage` carries the
+/// verdict instead: its fields are private and it hands out only shared references, so the image
+/// cannot change after validation, and a device entry given one validated for its own backend
+/// skips validation.
+///
+/// What it accepts is exactly what the two validations together accepted. For a device backend
+/// [`ValidatedImage::new`] runs the Scalar validation and then the device's own refusals, reusing
+/// the Scalar passes' products: the device's capability checks, its queue capacity and WFQ limits
+/// (`validate_owned_service_state`) and the parallel backends' zero-delay channel check, in
+/// [`validate`]'s order, so the first device error is the one the device validation reports.
+/// Every other device-dependent difference makes the device validation weaker than Scalar's: the
+/// global-time bound sums the service time of a subset of the initial packets on a device
+/// (`validate_global_time_capacity`), so a Scalar-valid image passes it there too.
+#[derive(Clone, Debug)]
+pub struct ValidatedImage {
+    image: SimulationImage,
+    backend: Backend,
+}
+
+impl ValidatedImage {
+    /// Validates `image` for `backend` once (for a device backend, for Scalar and the device).
+    pub fn new(image: SimulationImage, backend: Backend) -> Result<Self, ValidationError> {
+        match backend {
+            Backend::Metal | Backend::Cuda => {
+                validate_passes(&image, Backend::Scalar, Some(backend))
+            }
+            Backend::Scalar | Backend::Cpu { .. } => validate(&image, backend),
+        }?;
+        Ok(Self { image, backend })
+    }
+
+    /// The backend this image was validated for.
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+
+    /// The image, giving up the validation verdict.
+    pub fn into_image(self) -> SimulationImage {
+        self.image
+    }
+}
+
+impl std::ops::Deref for ValidatedImage {
+    type Target = SimulationImage;
+
+    fn deref(&self) -> &SimulationImage {
+        &self.image
+    }
+}
+
+/// The image a device run is given: borrowed, which the run validates for its backend as it always
+/// has, or a [`ValidatedImage`] it takes over (P18 c4), which it validates only if it was validated
+/// for another backend.
+#[derive(Debug)]
+pub enum RunImage<'image> {
+    Borrowed(&'image SimulationImage),
+    Validated(Box<ValidatedImage>),
+}
+
+impl<'image> From<&'image SimulationImage> for RunImage<'image> {
+    fn from(image: &'image SimulationImage) -> Self {
+        Self::Borrowed(image)
+    }
+}
+
+impl From<ValidatedImage> for RunImage<'_> {
+    fn from(image: ValidatedImage) -> Self {
+        Self::Validated(Box::new(image))
+    }
+}
+
+impl RunImage<'_> {
+    /// The image to run.
+    pub fn image(&self) -> &SimulationImage {
+        match self {
+            Self::Borrowed(image) => image,
+            Self::Validated(image) => image,
+        }
+    }
+
+    /// Validates the image for `backend` unless it already was.
+    pub fn validate_for(&self, backend: Backend) -> Result<(), ValidationError> {
+        match self {
+            Self::Validated(image) if image.backend() == backend => Ok(()),
+            _ => validate(self.image(), backend),
+        }
+    }
+}
+
+/// [`validate`] for `backend`, then, with `device`, the device's own refusals (see
+/// [`ValidatedImage`]).
+fn validate_passes(
+    image: &SimulationImage,
+    backend: Backend,
+    device: Option<Backend>,
+) -> Result<(), ValidationError> {
+    // Counted by tests through the phase hook (P18 c4); empty in production builds.
+    crate::phase_marks::mark("validation_pipeline", 0);
     if matches!(backend, Backend::Cpu { workers: 0 }) {
         return Err(ValidationError::new(
             "parallel backend Cpu requires at least one worker",
@@ -645,6 +749,11 @@ pub fn validate(image: &SimulationImage, backend: Backend) -> Result<(), Validat
     validate_payload_sequences(image, &flow_index, &future_work)?;
     validate_preloaded_arrival_capacity(image)?;
     validate_initial_payload_positions(image)?;
+    if let Some(device) = device {
+        validate_backend_capabilities(image, device)?;
+        validate_owned_service_state(image, &flow_index, device)?;
+        validate_channels(image, device, &derived_delays, &out_of_band_channels)?;
+    }
     Ok(())
 }
 

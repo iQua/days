@@ -45,9 +45,9 @@ use crate::{
     ArrivalDisposition, Backend, CapacityRetryRecord, CapacityWarmStart, DeviceCapacityCaps,
     DeviceCapacityFloors, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
     GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
-    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
+    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunImage, RunResult, RunSummary,
     SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
-    TcpTimerState, validate,
+    TcpTimerState,
 };
 
 const LANES: usize = 1_024;
@@ -1228,8 +1228,8 @@ pub struct CudaInitializationTimings {
 /// CUDA execution is serialized per device: one run executes on a device at a time, and
 /// concurrent callers of that device queue until execution and explicit readback complete. Runs on
 /// different devices proceed independently. Executor construction may proceed concurrently.
-pub fn run_cuda(
-    image: &SimulationImage,
+pub fn run_cuda<'image>(
+    image: impl Into<RunImage<'image>>,
     exclusive_horizon_ns: Option<u64>,
     config: CudaConfig,
 ) -> Result<CudaRun, CudaError> {
@@ -1242,8 +1242,8 @@ pub fn run_cuda(
 }
 
 /// Runs the production CUDA executor with explicit observation retention.
-pub fn run_cuda_with_observations(
-    image: &SimulationImage,
+pub fn run_cuda_with_observations<'image>(
+    image: impl Into<RunImage<'image>>,
     exclusive_horizon_ns: Option<u64>,
     config: CudaConfig,
     observation_mode: ObservationMode,
@@ -1515,9 +1515,9 @@ impl CudaExecutor {
         Ok((active as u64, worklist[..active].to_vec()))
     }
 
-    pub fn run(
+    pub fn run<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: CudaConfig,
     ) -> Result<CudaRun, CudaError> {
@@ -1531,9 +1531,9 @@ impl CudaExecutor {
 
     /// Executes and reads back under the run device's execution guard, which the run takes with
     /// its round module when it starts, before its first plan, and holds until it ends.
-    pub fn run_with_observations(
+    pub fn run_with_observations<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: CudaConfig,
         observation_mode: ObservationMode,
@@ -1559,9 +1559,9 @@ impl CudaExecutor {
     /// semantics (the T20g invariant), so a warm start moves a run between "refuses once, then
     /// runs" and "runs immediately" and never between two answers. See [`CapacityWarmStart`] for
     /// the argument in full.
-    pub fn run_with_observations_warm_started(
+    pub fn run_with_observations_warm_started<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: CudaConfig,
         observation_mode: ObservationMode,
@@ -1572,8 +1572,13 @@ impl CudaExecutor {
             crate::device_pfc::take_resume_scan_counts_for_testing();
             crate::merge_audit::reset();
         }
-        validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+        // P18 c4: an image validated for this backend at compile is not validated again.
+        let run_image = image.into();
+        run_image
+            .validate_for(Backend::Cuda)
+            .map_err(|error| CudaError::Validation(error.to_string()))?;
         crate::phase_marks::mark("validated", 0);
+        let image = run_image.image();
         validate_config(config)?;
         let direct = self.direct_for(config.device_index)?;
         let round_kernel = selected_round_kernel(image, config);
@@ -1790,7 +1795,8 @@ pub fn assert_cuda_planner_bit_equal_for_testing(
     config: CudaConfig,
     observation_mode: ObservationMode,
 ) -> Result<(), CudaError> {
-    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Cuda)
+        .map_err(|error| CudaError::Validation(error.to_string()))?;
     validate_config(config)?;
     let (packet_counts, feedback_counts) = flow_packet_counts(image)?;
     let data_counts = packet_counts
@@ -1843,7 +1849,8 @@ pub fn mechanism_plane_words_cuda_for_testing(
     image: &SimulationImage,
     config: CudaConfig,
 ) -> Result<crate::MechanismPlaneWords, CudaError> {
-    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Cuda)
+        .map_err(|error| CudaError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = CudaPlan::new(image, None, config, ObservationMode::Summary)?;
     let pfc_offset = plan.params[PARAM_PFC_OFFSET];
@@ -1890,7 +1897,8 @@ pub fn pfc_state_scans_cuda_plan_for_testing(
     image: &SimulationImage,
     config: CudaConfig,
 ) -> Result<usize, CudaError> {
-    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Cuda)
+        .map_err(|error| CudaError::Validation(error.to_string()))?;
     validate_config(config)?;
     crate::device_pfc::take_pfc_state_scans_for_testing();
     CudaPlan::new(image, None, config, ObservationMode::Summary)?;
@@ -1906,7 +1914,8 @@ pub fn size_cuda_plan_for_testing(
     config: CudaConfig,
     observation_mode: ObservationMode,
 ) -> Result<crate::DeviceSizingReport, CudaError> {
-    validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Cuda)
+        .map_err(|error| CudaError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = CudaPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
     let words = plan.plane_words();

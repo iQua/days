@@ -16,7 +16,7 @@ use std::str::FromStr;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-use days::scenario::compile_config_with_manifest;
+use days::scenario::compile_config_validated;
 use days::topos::route::RouteWorkers;
 #[cfg(any(
     test,
@@ -25,8 +25,8 @@ use days::topos::route::RouteWorkers;
 ))]
 use days_executor::CapacityRetryRecord;
 use days_executor::{
-    ChunkGranularity, CpuConfig, CpuRoundMetrics, DeviceCapacityCaps, RoundMetrics, RunResult,
-    SimulationImage, StaticPartitionPolicy, run_cpu, run_scalar,
+    Backend, ChunkGranularity, CpuConfig, CpuRoundMetrics, DeviceCapacityCaps, RoundMetrics,
+    RunResult, SimulationImage, StaticPartitionPolicy, ValidatedImage, run_cpu, run_scalar,
 };
 
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -645,8 +645,16 @@ fn engine_available(engine: Engine) -> Result<(), String> {
 
 fn run(cli: &Cli) -> Result<(), String> {
     let lowering_started = Instant::now();
-    let (image, manifest) = compile_config_with_manifest(&cli.config, RouteWorkers::available())
-        .map_err(|error| format!("failed to lower {}: {error}", cli.config.display()))?;
+    // P18 c4: a device engine's image is validated once, here, for that device; the Scalar and
+    // CPU engines run what the Scalar validation accepts, as before.
+    let backend = match cli.engine {
+        Engine::Metal => Backend::Metal,
+        Engine::Cuda => Backend::Cuda,
+        Engine::Scalar | Engine::Cpu => Backend::Scalar,
+    };
+    let (image, manifest) =
+        compile_config_validated(&cli.config, RouteWorkers::available(), backend)
+            .map_err(|error| format!("failed to lower {}: {error}", cli.config.display()))?;
     let lowering_ns = lowering_started.elapsed().as_nanos();
     // An AICB scenario's run manifest (P16 H3): what the run was made from, before its result.
     if let Some(manifest) = manifest {
@@ -658,8 +666,8 @@ fn run(cli: &Cli) -> Result<(), String> {
         Engine::Metal | Engine::Cuda => {
             print_protocol(cli);
             match cli.engine {
-                Engine::Metal => run_metal(cli, &image, lowering_ns),
-                _ => run_cuda(cli, &image, lowering_ns),
+                Engine::Metal => run_metal(cli, image, lowering_ns),
+                _ => run_cuda(cli, image, lowering_ns),
             }
         }
     }
@@ -1117,7 +1125,7 @@ fn cuda_available() -> Result<(), String> {
 }
 
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
-fn run_metal(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<(), String> {
+fn run_metal(cli: &Cli, image: ValidatedImage, lowering_ns: u128) -> Result<(), String> {
     use days_executor::{MetalConfig, MetalExecutor, ObservationMode};
 
     let executor =
@@ -1183,12 +1191,12 @@ fn run_metal(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<()
 }
 
 #[cfg(not(all(feature = "metal", target_vendor = "apple")))]
-fn run_metal(_cli: &Cli, _image: &SimulationImage, _lowering_ns: u128) -> Result<(), String> {
+fn run_metal(_cli: &Cli, _image: ValidatedImage, _lowering_ns: u128) -> Result<(), String> {
     metal_available()
 }
 
 #[cfg(feature = "cuda")]
-fn run_cuda(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<(), String> {
+fn run_cuda(cli: &Cli, image: ValidatedImage, lowering_ns: u128) -> Result<(), String> {
     use days_executor::{CudaConfig, CudaExecutor, ObservationMode};
 
     let executor = CudaExecutor::on_device(cli.cuda_device())
@@ -1254,7 +1262,7 @@ fn run_cuda(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Result<(),
 }
 
 #[cfg(not(feature = "cuda"))]
-fn run_cuda(_cli: &Cli, _image: &SimulationImage, _lowering_ns: u128) -> Result<(), String> {
+fn run_cuda(_cli: &Cli, _image: ValidatedImage, _lowering_ns: u128) -> Result<(), String> {
     cuda_available()
 }
 

@@ -184,7 +184,7 @@ pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
 pub use validate::{
-    Backend, RateSourceLookahead, ValidationError, pfc_line_rate_bytes,
+    Backend, RateSourceLookahead, RunImage, ValidatedImage, ValidationError, pfc_line_rate_bytes,
     pfc_required_headroom_bytes, rate_source_lookahead, validate,
 };
 #[cfg(feature = "planner-test-hooks")]
