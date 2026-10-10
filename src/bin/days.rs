@@ -25,8 +25,8 @@ use days::topos::route::RouteWorkers;
 ))]
 use days_executor::CapacityRetryRecord;
 use days_executor::{
-    ChunkGranularity, CpuConfig, CpuRoundMetrics, DeviceCapacityCaps, RoundMetrics, RunResult,
-    SimulationImage, StaticPartitionPolicy, run_cpu, run_scalar,
+    ChunkGranularity, CpuConfig, CpuRunTotals, DeviceCapacityCaps, RunResult, SimulationImage,
+    StaticPartitionPolicy, run_cpu, run_scalar,
 };
 
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
@@ -765,8 +765,7 @@ fn run_cpu_engine(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Resu
             config.straggler_threshold_events,
             config.spin_before_park,
             wall_ns,
-            run.rounds.iter().map(|round| &round.semantic),
-            &run.rounds,
+            &run.totals,
             run.result.summary,
         );
         print_result("cpu", &run.result, lowering_ns, wall_ns);
@@ -775,7 +774,7 @@ fn run_cpu_engine(cli: &Cli, image: &SimulationImage, lowering_ns: u128) -> Resu
 }
 
 #[allow(clippy::too_many_arguments)]
-fn print_cpu_record<'round>(
+fn print_cpu_record(
     path: &Path,
     repetition: usize,
     workers: usize,
@@ -784,183 +783,58 @@ fn print_cpu_record<'round>(
     straggler_threshold: Option<u64>,
     spin_before_park: u32,
     wall_ns: u128,
-    rounds: impl Iterator<Item = &'round RoundMetrics> + Clone,
-    cpu_rounds: &[CpuRoundMetrics],
+    totals: &CpuRunTotals,
     summary: days_executor::RunSummary,
 ) {
     let path = path.display();
-    let round_count = rounds.clone().count();
-    let total_events = rounds
-        .clone()
-        .map(|round| u128::from(round.events_processed))
-        .sum::<u128>();
-    let total_active_lps = rounds
-        .clone()
-        .map(|round| round.active_lp_count as u128)
-        .sum::<u128>();
-    let total_horizon_advance = rounds
-        .clone()
-        .map(|round| round.horizon_advance_ns)
-        .sum::<u128>();
-    let maximum_events = rounds
-        .clone()
-        .map(|round| round.events_processed)
-        .max()
-        .unwrap_or(0);
-    let maximum_active_lps = rounds
-        .clone()
-        .map(|round| round.active_lp_count)
-        .max()
-        .unwrap_or(0);
-    let maximum_lp_events = rounds
-        .clone()
-        .flat_map(|round| &round.lp_work)
-        .map(|work| work.events_processed)
-        .max()
-        .unwrap_or(0);
-    let mean_efficiency = mean(rounds.clone().map(|round| round.parallel_efficiency));
-    let minimum_efficiency = rounds
-        .clone()
-        .map(|round| round.parallel_efficiency)
-        .reduce(f64::min)
-        .unwrap_or(1.0);
-    let remote_events = rounds
-        .clone()
-        .map(|round| u128::from(round.messages_exchanged))
-        .sum::<u128>();
-    let same_time_continuations = rounds
-        .clone()
-        .flat_map(|round| &round.lp_work)
-        .map(|work| u128::from(work.same_time_continuations))
-        .sum::<u128>();
-    let physical_lp_probes = rounds
-        .clone()
-        .map(|round| u128::from(round.physical_lp_probes))
-        .sum::<u128>();
-    let round_divisor = u128::try_from(round_count.max(1)).expect("round count must fit u128");
-    let cpu_fields = if cpu_rounds.is_empty() {
+    let round_count = totals.rounds;
+    let total_events = totals.events;
+    let total_active_lps = totals.active_lps;
+    let total_horizon_advance = totals.horizon_advance_ns;
+    let maximum_events = totals.max_events_per_round;
+    let maximum_active_lps = totals.max_active_lps;
+    let maximum_lp_events = totals.max_lp_events;
+    let mean_efficiency = mean(totals.parallel_efficiency_sum, round_count);
+    let minimum_efficiency = totals.min_parallel_efficiency.unwrap_or(1.0);
+    let remote_events = totals.remote_events;
+    let same_time_continuations = totals.same_time_continuations;
+    let physical_lp_probes = totals.physical_lp_probes;
+    let round_divisor = u128::from(round_count.max(1));
+    let cpu_fields = if round_count == 0 {
         String::new()
     } else {
-        let mean_lp_time_efficiency = mean(
-            cpu_rounds
-                .iter()
-                .map(|round| round.lp_time_parallel_efficiency),
-        );
-        let mean_worker_efficiency = mean(
-            cpu_rounds
-                .iter()
-                .map(|round| round.worker_parallel_efficiency),
-        );
-        let mean_worker_utilization = mean(cpu_rounds.iter().map(|round| round.worker_utilization));
-        let straggler_lps = cpu_rounds
-            .iter()
-            .map(|round| round.partition.stragglers.len() as u128)
-            .sum::<u128>();
-        let bulk_chunks = cpu_rounds
-            .iter()
-            .map(|round| round.partition.bulk_chunks.len() as u128)
-            .sum::<u128>();
-        let owner_batches = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.owner_batch_messages))
-            .sum::<u128>();
-        let worker_wakes = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.worker_wake_messages))
-            .sum::<u128>();
-        let worker_completions = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.worker_completion_messages))
-            .sum::<u128>();
-        let chunk_requests = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.chunk_request_messages))
-            .sum::<u128>();
-        let classification_presence_messages = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.classification_presence_messages))
-            .sum::<u128>();
-        let classification_work_messages = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.classification_work_messages))
-            .sum::<u128>();
-        let classification_return_messages = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.classification_return_messages))
-            .sum::<u128>();
-        let owner_deliveries = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.owner_delivery_messages))
-            .sum::<u128>();
-        let owner_batches_merged = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.owner_batches_merged))
-            .sum::<u128>();
-        let early_owner_batches_merged = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.early_owner_batches_merged))
-            .sum::<u128>();
-        let owner_merge_ns = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.owner_merge_ns))
-            .sum::<u128>();
-        let early_owner_merge_ns = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.early_owner_merge_ns))
-            .sum::<u128>();
-        let pool_messages = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.pool_messages()))
-            .sum::<u128>();
-        let worker_busy_ns = cpu_rounds
-            .iter()
-            .flat_map(|round| &round.worker_timings)
-            .map(|worker| u128::from(worker.busy_ns))
-            .sum::<u128>();
-        let worker_idle_ns = cpu_rounds
-            .iter()
-            .flat_map(|round| &round.worker_timings)
-            .map(|worker| u128::from(worker.idle_ns))
-            .sum::<u128>();
-        let timed_rounds = cpu_rounds
-            .iter()
-            .filter(|round| !round.lp_timings.is_empty())
-            .collect::<Vec<_>>();
-        let timed_active_lps = timed_rounds
-            .iter()
-            .map(|round| round.lp_timings.len() as u128)
-            .sum::<u128>();
-        let timed_physical_lp_probes = timed_rounds
-            .iter()
-            .map(|round| u128::from(round.semantic.physical_lp_probes))
-            .sum::<u128>();
-        let timed_worker_busy_ns = timed_rounds
-            .iter()
-            .flat_map(|round| &round.worker_timings)
-            .map(|worker| u128::from(worker.busy_ns))
-            .sum::<u128>();
-        let lp_busy_ns = timed_rounds
-            .iter()
-            .flat_map(|round| &round.lp_timings)
-            .map(|lp| u128::from(lp.busy_ns))
-            .sum::<u128>();
+        let mean_lp_time_efficiency = mean(totals.lp_time_parallel_efficiency_sum, round_count);
+        let mean_worker_efficiency = mean(totals.worker_parallel_efficiency_sum, round_count);
+        let mean_worker_utilization = mean(totals.worker_utilization_sum, round_count);
+        let straggler_lps = totals.straggler_lps;
+        let bulk_chunks = totals.bulk_chunks;
+        let owner_batches = totals.owner_batch_messages;
+        let worker_wakes = totals.worker_wake_messages;
+        let worker_completions = totals.worker_completion_messages;
+        let chunk_requests = totals.chunk_request_messages;
+        let classification_presence_messages = totals.classification_presence_messages;
+        let classification_work_messages = totals.classification_work_messages;
+        let classification_return_messages = totals.classification_return_messages;
+        let owner_deliveries = totals.owner_delivery_messages;
+        let owner_batches_merged = totals.owner_batches_merged;
+        let early_owner_batches_merged = totals.early_owner_batches_merged;
+        let owner_merge_ns = totals.owner_merge_ns;
+        let early_owner_merge_ns = totals.early_owner_merge_ns;
+        let pool_messages = totals.pool_messages;
+        let worker_busy_ns = totals.worker_busy_ns;
+        let worker_idle_ns = totals.worker_idle_ns;
+        let timed_active_lps = totals.timed_active_lps;
+        let timed_physical_lp_probes = totals.timed_physical_lp_probes;
+        let timed_worker_busy_ns = totals.timed_worker_busy_ns;
+        let lp_busy_ns = totals.lp_busy_ns;
         let worker_machinery_ns = timed_worker_busy_ns.saturating_sub(lp_busy_ns);
-        let coordinator_partition_ns = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.coordinator_partition_ns))
-            .sum::<u128>();
-        let worker_wait_ns = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.worker_wait_ns))
-            .sum::<u128>();
-        let coordinator_exchange_ns = cpu_rounds
-            .iter()
-            .map(|round| u128::from(round.coordinator_exchange_ns))
-            .sum::<u128>();
+        let coordinator_partition_ns = totals.coordinator_partition_ns;
+        let worker_wait_ns = totals.worker_wait_ns;
+        let coordinator_exchange_ns = totals.coordinator_exchange_ns;
         let chunks = straggler_lps.saturating_add(bulk_chunks);
         let legacy_protocol_messages_estimate = 4_u128
             .saturating_mul(workers as u128)
-            .saturating_mul(round_count as u128)
+            .saturating_mul(u128::from(round_count))
             .saturating_add(3_u128.saturating_mul(chunks))
             .saturating_add(owner_batches);
         format!(
@@ -990,7 +864,7 @@ fn print_cpu_record<'round>(
              mean_coordinator_partition_ns={:.3} mean_worker_wait_ns={:.3} \
              mean_coordinator_exchange_ns={:.3}",
             pool_messages as f64 / round_divisor as f64,
-            timed_rounds.len(),
+            totals.timed_rounds,
             lp_busy_ns as f64 / timed_active_lps.max(1) as f64,
             worker_machinery_ns as f64 / timed_physical_lp_probes.max(1) as f64,
             wall_ns as f64 / physical_lp_probes.max(1) as f64,
@@ -1023,15 +897,9 @@ fn print_cpu_record<'round>(
     );
 }
 
-fn mean(values: impl Iterator<Item = f64>) -> f64 {
-    let (total, count) = values.fold((0.0, 0_u64), |(total, count), value| {
-        (total + value, count + 1)
-    });
-    if count == 0 {
-        1.0
-    } else {
-        total / count as f64
-    }
+/// The mean of `count` values whose round-ordered sum is `sum`; 1.0 for no values.
+fn mean(sum: f64, count: u64) -> f64 {
+    if count == 0 { 1.0 } else { sum / count as f64 }
 }
 
 fn print_protocol(cli: &Cli) {

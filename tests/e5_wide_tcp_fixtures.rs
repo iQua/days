@@ -12,10 +12,10 @@ use std::process::Command;
 
 use days::scenario::compile_config;
 use days_executor::{
-    ArrivalDisposition, Backend, CpuConfig, FlowGeneratorKind, ObservationMode, PacketDescriptor,
-    PacketKind, RunResult, SimulationImage, TcpCongestionControl, TcpTransitionInput,
-    TcpTransitionRecord, run_cpu_with_observations, run_scalar_rounds_with_observations,
-    size_default_device_plan, validate,
+    ArrivalDisposition, Backend, CpuConfig, CpuRoundRecords, FlowGeneratorKind, ObservationMode,
+    PacketDescriptor, PacketKind, RunResult, SimulationImage, TcpCongestionControl,
+    TcpTransitionInput, TcpTransitionRecord, run_cpu_with_observations,
+    run_scalar_rounds_with_observations, size_default_device_plan, validate,
 };
 
 const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1257,6 +1257,7 @@ fn e5_cubic_completion_anchor_is_identical_on_cpu_x2() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 2,
             ..CpuConfig::default()
         },
@@ -1264,9 +1265,9 @@ fn e5_cubic_completion_anchor_is_identical_on_cpu_x2() {
     )
     .expect("E5 CUBIC CPU x2 run failed");
     let anchor = fingerprint(&run.result);
-    let last_round = run.rounds.last().expect("E5 CUBIC CPU run must execute");
+    let last_round = run.rounds().last().expect("E5 CUBIC CPU run must execute");
     let transitions = run
-        .rounds
+        .rounds()
         .iter()
         .map(|round| u128::from(round.semantic.events_processed))
         .sum::<u128>();
@@ -1275,11 +1276,11 @@ fn e5_cubic_completion_anchor_is_identical_on_cpu_x2() {
          transitions={transitions} completionNs={}",
         anchor.bytes,
         anchor.fnv1a64,
-        run.rounds.len(),
+        run.rounds().len(),
         last_round.semantic.frontier_ns,
     );
     assert_cubic_anchor(anchor);
-    assert_eq!(run.rounds.len(), FROZEN_CUBIC_ROUNDS);
+    assert_eq!(run.rounds().len(), FROZEN_CUBIC_ROUNDS);
     assert_eq!(transitions, FROZEN_CUBIC_TRANSITIONS);
     assert_eq!(last_round.semantic.frontier_ns, CUBIC_COMPLETION_NS);
 }
@@ -1335,6 +1336,7 @@ fn e5_primary_completion_anchor_is_identical_on_cpu_x2_and_x4() {
             &image,
             None,
             CpuConfig {
+                round_records: CpuRoundRecords::PerRound,
                 workers,
                 ..CpuConfig::default()
             },
@@ -1342,21 +1344,21 @@ fn e5_primary_completion_anchor_is_identical_on_cpu_x2_and_x4() {
         )
         .unwrap_or_else(|error| panic!("E5 CPU x{workers} run failed: {error}"));
         let anchor = fingerprint(&run.result);
-        let last_round = run.rounds.last().expect("E5 CPU run must execute");
+        let last_round = run.rounds().last().expect("E5 CPU run must execute");
         println!(
             "E5 PRIMARY CPU x{workers} anchor: bytes={} fnv1a64={:016x} rounds={} \
              transitions={} completionNs={}",
             anchor.bytes,
             anchor.fnv1a64,
-            run.rounds.len(),
-            run.rounds
+            run.rounds().len(),
+            run.rounds()
                 .iter()
                 .map(|round| u128::from(round.semantic.events_processed))
                 .sum::<u128>(),
             last_round.semantic.frontier_ns,
         );
         assert_primary_anchor(anchor);
-        assert_eq!(run.rounds.len(), FROZEN_PRIMARY_ROUNDS);
+        assert_eq!(run.rounds().len(), FROZEN_PRIMARY_ROUNDS);
         assert_eq!(last_round.semantic.frontier_ns, PRIMARY_COMPLETION_NS);
     }
 }

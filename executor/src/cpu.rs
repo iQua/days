@@ -79,8 +79,26 @@ pub struct CpuConfig {
     pub dedicated_straggler_workers: usize,
     /// Optional deterministic capacity bound used by failure and sizing tests.
     pub max_outbox_events_per_lp: Option<usize>,
+    /// What the run keeps about its rounds: run totals only (the default), or also one record per
+    /// round.
+    pub round_records: CpuRoundRecords,
     #[doc(hidden)]
     pub fault_injection: Option<CpuFaultInjection>,
+}
+
+/// What a CPU run keeps about its rounds.
+///
+/// Both modes run the same rounds and produce the same `RunResult` and the same `CpuRunTotals`;
+/// they differ only in what the coordinator retains.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CpuRoundRecords {
+    /// Run totals only: the coordinator folds each round into `CpuRun::totals` once its late merge
+    /// timings have arrived, and keeps O(workers) bytes, whatever the round count.
+    #[default]
+    Totals,
+    /// Run totals, plus one `CpuRoundMetrics` per round in `CpuRun::rounds`: tests and profiling
+    /// probes. Retained memory grows with the round count and the active LPs per round.
+    PerRound,
 }
 
 impl Default for CpuConfig {
@@ -93,6 +111,7 @@ impl Default for CpuConfig {
             straggler_threshold_events: None,
             dedicated_straggler_workers: 1,
             max_outbox_events_per_lp: None,
+            round_records: CpuRoundRecords::Totals,
             fault_injection: None,
         }
     }
@@ -201,54 +220,360 @@ impl CpuRoundMetrics {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CpuRun {
     pub result: RunResult,
-    pub rounds: Vec<CpuRoundMetrics>,
+    /// Run totals over every round, in either `CpuRoundRecords` mode.
+    pub totals: CpuRunTotals,
+    /// One record per round, kept only under `CpuRoundRecords::PerRound`.
+    rounds: Option<Vec<CpuRoundMetrics>>,
 }
 
-#[derive(Clone, Copy)]
-enum CpuMetricsRetention {
-    All,
-}
-
-impl CpuMetricsRetention {
-    fn retains(self, _round: usize) -> bool {
-        match self {
-            Self::All => true,
-        }
-    }
-
-    fn retained_index(self, round: usize) -> Option<usize> {
-        if !self.retains(round) {
-            return None;
-        }
-        match self {
-            Self::All => Some(round),
-        }
+impl CpuRun {
+    /// The per-round records.
+    ///
+    /// # Panics
+    ///
+    /// When the run was configured with `CpuRoundRecords::Totals`, which keeps none: a caller that
+    /// reads rounds must ask for them, rather than read an empty list as "no rounds".
+    pub fn rounds(&self) -> &[CpuRoundMetrics] {
+        self.rounds
+            .as_deref()
+            .expect("per-round records need `CpuRoundRecords::PerRound`")
     }
 }
 
+/// Totals over every round of a CPU run: the sums, maxima and round-ordered f64 sums from which
+/// the `days` CLI prints its `days_cpu` record.
+///
+/// Each round is folded once its late attribution (the owner-merge timings its batches cause on
+/// the next wake) has been applied, in round order, so every field equals the fold of the
+/// `PerRound` records over `CpuRun::rounds` bit for bit; the wall-clock fields are, as always,
+/// whatever this run measured.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CpuRunTotals {
+    pub rounds: u64,
+    pub events: u128,
+    pub active_lps: u128,
+    pub horizon_advance_ns: u128,
+    pub max_events_per_round: u64,
+    pub max_active_lps: usize,
+    pub max_lp_events: u64,
+    /// Sum, in round order, of `RoundMetrics::parallel_efficiency`.
+    pub parallel_efficiency_sum: f64,
+    /// The smallest `RoundMetrics::parallel_efficiency`, or `None` for a run of no rounds.
+    pub min_parallel_efficiency: Option<f64>,
+    pub remote_events: u128,
+    pub same_time_continuations: u128,
+    pub physical_lp_probes: u128,
+    /// Sums, in round order, of the per-round f64 efficiencies.
+    pub lp_time_parallel_efficiency_sum: f64,
+    pub worker_parallel_efficiency_sum: f64,
+    pub worker_utilization_sum: f64,
+    pub straggler_lps: u128,
+    pub bulk_chunks: u128,
+    pub owner_batch_messages: u128,
+    pub worker_wake_messages: u128,
+    pub worker_completion_messages: u128,
+    pub chunk_request_messages: u128,
+    pub classification_presence_messages: u128,
+    pub classification_work_messages: u128,
+    pub classification_return_messages: u128,
+    pub owner_delivery_messages: u128,
+    pub owner_batches_merged: u128,
+    pub early_owner_batches_merged: u128,
+    pub owner_merge_ns: u128,
+    pub early_owner_merge_ns: u128,
+    pub pool_messages: u128,
+    pub worker_busy_ns: u128,
+    pub worker_idle_ns: u128,
+    /// Rounds whose LP wall clocks were sampled (every 64th round in summary observation).
+    pub timed_rounds: u64,
+    pub timed_active_lps: u128,
+    pub timed_physical_lp_probes: u128,
+    pub timed_worker_busy_ns: u128,
+    pub lp_busy_ns: u128,
+    pub coordinator_partition_ns: u128,
+    pub worker_wait_ns: u128,
+    pub coordinator_exchange_ns: u128,
+    pub round_wall_time_ns: u128,
+}
+
+impl CpuRunTotals {
+    fn add_round(&mut self, round: &CpuRoundMetrics, lists: RoundLists) {
+        let semantic = &round.semantic;
+        self.rounds += 1;
+        self.events += u128::from(semantic.events_processed);
+        self.active_lps += semantic.active_lp_count as u128;
+        self.horizon_advance_ns += semantic.horizon_advance_ns;
+        self.max_events_per_round = self.max_events_per_round.max(semantic.events_processed);
+        self.max_active_lps = self.max_active_lps.max(semantic.active_lp_count);
+        self.max_lp_events = self.max_lp_events.max(lists.max_lp_events);
+        self.parallel_efficiency_sum += semantic.parallel_efficiency;
+        self.min_parallel_efficiency = Some(match self.min_parallel_efficiency {
+            Some(minimum) => minimum.min(semantic.parallel_efficiency),
+            None => semantic.parallel_efficiency,
+        });
+        self.remote_events += u128::from(semantic.messages_exchanged);
+        self.same_time_continuations += lists.same_time_continuations;
+        self.physical_lp_probes += u128::from(semantic.physical_lp_probes);
+        self.lp_time_parallel_efficiency_sum += round.lp_time_parallel_efficiency;
+        self.worker_parallel_efficiency_sum += round.worker_parallel_efficiency;
+        self.worker_utilization_sum += round.worker_utilization;
+        self.straggler_lps += u128::from(lists.straggler_lps);
+        self.bulk_chunks += u128::from(lists.bulk_chunks);
+        self.owner_batch_messages += u128::from(round.owner_batch_messages);
+        self.worker_wake_messages += u128::from(round.worker_wake_messages);
+        self.worker_completion_messages += u128::from(round.worker_completion_messages);
+        self.chunk_request_messages += u128::from(round.chunk_request_messages);
+        self.classification_presence_messages += u128::from(round.classification_presence_messages);
+        self.classification_work_messages += u128::from(round.classification_work_messages);
+        self.classification_return_messages += u128::from(round.classification_return_messages);
+        self.owner_delivery_messages += u128::from(round.owner_delivery_messages);
+        self.owner_batches_merged += u128::from(round.owner_batches_merged);
+        self.early_owner_batches_merged += u128::from(round.early_owner_batches_merged);
+        self.owner_merge_ns += u128::from(round.owner_merge_ns);
+        self.early_owner_merge_ns += u128::from(round.early_owner_merge_ns);
+        self.pool_messages += u128::from(round.pool_messages());
+        let busy = round
+            .worker_timings
+            .iter()
+            .map(|worker| u128::from(worker.busy_ns))
+            .sum::<u128>();
+        self.worker_busy_ns += busy;
+        self.worker_idle_ns += round
+            .worker_timings
+            .iter()
+            .map(|worker| u128::from(worker.idle_ns))
+            .sum::<u128>();
+        if lists.timed_lps > 0 {
+            self.timed_rounds += 1;
+            self.timed_active_lps += u128::from(lists.timed_lps);
+            self.timed_physical_lp_probes += u128::from(semantic.physical_lp_probes);
+            self.timed_worker_busy_ns += busy;
+            self.lp_busy_ns += lists.lp_busy_ns;
+        }
+        self.coordinator_partition_ns += u128::from(round.coordinator_partition_ns);
+        self.worker_wait_ns += u128::from(round.worker_wait_ns);
+        self.coordinator_exchange_ns += u128::from(round.coordinator_exchange_ns);
+        self.round_wall_time_ns += u128::from(round.round_wall_time_ns);
+    }
+}
+
+/// The per-LP facts of one round that `CpuRunTotals` folds: read from a `PerRound` record's lists,
+/// or carried by the workers' tallies under `Totals`.
+#[derive(Clone, Copy, Debug, Default)]
+struct RoundLists {
+    max_lp_events: u64,
+    same_time_continuations: u128,
+    /// LPs whose wall clock was sampled this round.
+    timed_lps: u64,
+    lp_busy_ns: u128,
+    straggler_lps: u64,
+    bulk_chunks: u64,
+}
+
+impl RoundLists {
+    fn of(round: &CpuRoundMetrics) -> Self {
+        Self {
+            max_lp_events: round
+                .semantic
+                .lp_work
+                .iter()
+                .map(|work| work.events_processed)
+                .max()
+                .unwrap_or(0),
+            same_time_continuations: round
+                .semantic
+                .lp_work
+                .iter()
+                .map(|work| u128::from(work.same_time_continuations))
+                .sum(),
+            timed_lps: round.lp_timings.len() as u64,
+            lp_busy_ns: round
+                .lp_timings
+                .iter()
+                .map(|timing| u128::from(timing.busy_ns))
+                .sum(),
+            straggler_lps: round.partition.stragglers.len() as u64,
+            bulk_chunks: round.partition.bulk_chunks.len() as u64,
+        }
+    }
+}
+
+/// One worker's per-LP facts of one round, folded as it drains (`CpuRoundRecords::Totals`).
+#[derive(Clone, Copy, Debug, Default)]
+struct RoundTally {
+    active_lps: usize,
+    events: u64,
+    messages: u64,
+    max_lp_events: u64,
+    same_time_continuations: u128,
+    timed_lps: u64,
+    lp_busy_ns: u128,
+    lp_busy_max_ns: u64,
+    straggler_lps: u64,
+    bulk_lps: u64,
+}
+
+impl RoundTally {
+    fn add(&mut self, executed: &ExecutedLp) -> Result<(), ExecutionError> {
+        let node = executed.work.node;
+        self.active_lps = self
+            .active_lps
+            .checked_add(1)
+            .ok_or(ExecutionError::CounterOverflow(node))?;
+        self.events = self
+            .events
+            .checked_add(executed.work.events_processed)
+            .ok_or(ExecutionError::CounterOverflow(node))?;
+        self.messages = self
+            .messages
+            .checked_add(executed.messages_exchanged)
+            .ok_or(ExecutionError::CounterOverflow(node))?;
+        self.max_lp_events = self.max_lp_events.max(executed.work.events_processed);
+        self.same_time_continuations += u128::from(executed.work.same_time_continuations);
+        if executed.timing_sampled {
+            self.timed_lps += 1;
+            self.lp_busy_ns += u128::from(executed.timing.busy_ns);
+            self.lp_busy_max_ns = self.lp_busy_max_ns.max(executed.timing.busy_ns);
+        }
+        match executed.timing.class {
+            WorkClass::Straggler => self.straggler_lps += 1,
+            WorkClass::Bulk => self.bulk_lps += 1,
+        }
+        Ok(())
+    }
+
+    /// Folds another worker's tally into this round's.
+    fn merge(&mut self, other: &Self) -> Result<(), ExecutionError> {
+        let overflow = ExecutionError::CounterOverflow(NodeId(0));
+        self.active_lps = self
+            .active_lps
+            .checked_add(other.active_lps)
+            .ok_or(overflow)?;
+        self.events = self.events.checked_add(other.events).ok_or(overflow)?;
+        self.messages = self.messages.checked_add(other.messages).ok_or(overflow)?;
+        self.max_lp_events = self.max_lp_events.max(other.max_lp_events);
+        self.same_time_continuations += other.same_time_continuations;
+        self.timed_lps += other.timed_lps;
+        self.lp_busy_ns += other.lp_busy_ns;
+        self.lp_busy_max_ns = self.lp_busy_max_ns.max(other.lp_busy_max_ns);
+        self.straggler_lps += other.straggler_lps;
+        Ok(())
+    }
+}
+
+/// The LPs one worker executed in a round, as it reports them: every record (`PerRound`), or a
+/// fixed-size tally (`Totals`).
+enum ExecutedLps {
+    PerLp(Vec<ExecutedLp>),
+    Tally(RoundTally),
+}
+
+impl ExecutedLps {
+    fn new(records: CpuRoundRecords) -> Self {
+        match records {
+            CpuRoundRecords::PerRound => Self::PerLp(Vec::new()),
+            CpuRoundRecords::Totals => Self::Tally(RoundTally::default()),
+        }
+    }
+
+    fn record(&mut self, executed: ExecutedLp) -> Result<(), ExecutionError> {
+        match self {
+            Self::PerLp(records) => {
+                records.push(executed);
+                Ok(())
+            }
+            Self::Tally(tally) => tally.add(&executed),
+        }
+    }
+}
+
+/// The coordinator's view of one round's executed LPs, gathered from every worker's reply.
+struct RoundLpsGathered {
+    per_lp: Vec<ExecutedLp>,
+    tally: RoundTally,
+    /// Workers that executed at least one bulk LP (the classified path's bulk chunk count).
+    bulk_workers: u64,
+}
+
+impl RoundLpsGathered {
+    fn new() -> Self {
+        Self {
+            per_lp: Vec::new(),
+            tally: RoundTally::default(),
+            bulk_workers: 0,
+        }
+    }
+
+    fn gather(&mut self, executed: ExecutedLps) -> Result<(), ExecutionError> {
+        match executed {
+            ExecutedLps::PerLp(records) => self.per_lp.extend(records),
+            ExecutedLps::Tally(tally) => {
+                if tally.bulk_lps > 0 {
+                    self.bulk_workers += 1;
+                }
+                self.tally.merge(&tally)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Collects round records: keeps every one (`PerRound`), or folds each into the totals once the
+/// next round's late attribution has been applied to it (`Totals`), keeping only that one round.
 struct CpuMetricsCollector {
-    retention: CpuMetricsRetention,
+    records: CpuRoundRecords,
     rounds: Vec<CpuRoundMetrics>,
+    /// `Totals`: the latest round, still open to attribution, with its index and per-LP facts.
+    pending: Option<(usize, CpuRoundMetrics, RoundLists)>,
+    totals: CpuRunTotals,
     total_rounds: usize,
+    /// `Totals`: the folded round's worker-timing buffer, reused by the next round.
+    spare_worker_timings: Vec<WorkerRoundTiming>,
 }
 
 impl CpuMetricsCollector {
-    fn new(retention: CpuMetricsRetention) -> Self {
+    fn new(records: CpuRoundRecords) -> Self {
         Self {
-            retention,
+            records,
             rounds: Vec::new(),
+            pending: None,
+            totals: CpuRunTotals::default(),
             total_rounds: 0,
+            spare_worker_timings: Vec::new(),
         }
     }
 
-    fn push(&mut self, round: u64, metrics: CpuRoundMetrics) -> Result<(), ExecutionError> {
+    fn records(&self) -> CpuRoundRecords {
+        self.records
+    }
+
+    /// An empty worker-timing buffer for the next round (`Totals` reuses the folded round's).
+    fn worker_timings_buffer(&mut self, workers: usize) -> Vec<WorkerRoundTiming> {
+        let mut buffer = std::mem::take(&mut self.spare_worker_timings);
+        buffer.clear();
+        buffer.reserve(workers);
+        buffer
+    }
+
+    /// Adds round `round`. `lists` carries its per-LP facts under `Totals`; a `PerRound` record
+    /// carries its own lists.
+    fn push(
+        &mut self,
+        round: u64,
+        metrics: CpuRoundMetrics,
+        lists: RoundLists,
+    ) -> Result<(), ExecutionError> {
         let round =
             usize::try_from(round).map_err(|_| ExecutionError::CounterOverflow(NodeId(0)))?;
         if round != self.total_rounds {
             return Err(ExecutionError::WorkerChannelDisconnected);
         }
-        if self.retention.retains(round) {
-            self.rounds.push(metrics);
+        match self.records {
+            CpuRoundRecords::PerRound => self.rounds.push(metrics),
+            CpuRoundRecords::Totals => {
+                self.fold_pending();
+                self.pending = Some((round, metrics, lists));
+            }
         }
         self.total_rounds = self
             .total_rounds
@@ -257,10 +582,39 @@ impl CpuMetricsCollector {
         Ok(())
     }
 
+    fn fold_pending(&mut self) {
+        if let Some((_, metrics, lists)) = self.pending.take() {
+            self.totals.add_round(&metrics, lists);
+            self.spare_worker_timings = metrics.worker_timings;
+        }
+    }
+
+    /// The record of `round`, while it can still take late attribution.
     fn retained_mut(&mut self, round: u64) -> Option<&mut CpuRoundMetrics> {
         let round = usize::try_from(round).ok()?;
-        let retained = self.retention.retained_index(round)?;
-        self.rounds.get_mut(retained)
+        match self.records {
+            CpuRoundRecords::PerRound => self.rounds.get_mut(round),
+            CpuRoundRecords::Totals => match &mut self.pending {
+                Some((pending, metrics, _)) if *pending == round => Some(metrics),
+                _ => None,
+            },
+        }
+    }
+
+    /// The run totals, and the per-round records under `PerRound`.
+    fn finish(mut self) -> (CpuRunTotals, Option<Vec<CpuRoundMetrics>>) {
+        match self.records {
+            CpuRoundRecords::PerRound => {
+                for round in &self.rounds {
+                    self.totals.add_round(round, RoundLists::of(round));
+                }
+                (self.totals, Some(self.rounds))
+            }
+            CpuRoundRecords::Totals => {
+                self.fold_pending();
+                (self.totals, None)
+            }
+        }
     }
 }
 
@@ -295,11 +649,13 @@ pub fn run_cpu_with_observations(
         exclusive_horizon_ns,
         config,
         observation_mode,
-        CpuMetricsRetention::All,
+        config.round_records,
     )?;
+    let (totals, rounds) = run.metrics.finish();
     Ok(CpuRun {
         result: run.result,
-        rounds: run.metrics.rounds,
+        totals,
+        rounds,
     })
 }
 
@@ -308,7 +664,7 @@ fn run_cpu_collecting_metrics(
     exclusive_horizon_ns: Option<u64>,
     config: CpuConfig,
     observation_mode: ObservationMode,
-    retention: CpuMetricsRetention,
+    retention: CpuRoundRecords,
 ) -> Result<CollectedCpuRun, ExecutionError> {
     validate_config(config)?;
     if config.granularity == ChunkGranularity::Static && config.straggler_threshold_events.is_some()
@@ -450,7 +806,7 @@ fn run_owned_static_cpu_with_observations(
     exclusive_horizon_ns: Option<u64>,
     config: CpuConfig,
     observation_mode: ObservationMode,
-    retention: CpuMetricsRetention,
+    retention: CpuRoundRecords,
 ) -> Result<CollectedCpuRun, ExecutionError> {
     let lps = build_lps(image, observation_mode)?;
     let (shards, placement) = partition_static_ownership(lps, image, config)?;
@@ -545,7 +901,7 @@ fn run_classified_static_cpu_with_observations(
     exclusive_horizon_ns: Option<u64>,
     config: CpuConfig,
     observation_mode: ObservationMode,
-    retention: CpuMetricsRetention,
+    retention: CpuRoundRecords,
 ) -> Result<CollectedCpuRun, ExecutionError> {
     let lps = build_lps(image, observation_mode)?;
     let ownership_config = CpuConfig {
@@ -1135,7 +1491,7 @@ enum OwnedWorkerReply<'image> {
     RoundComplete {
         worker: usize,
         round: u64,
-        executed: Vec<ExecutedLp>,
+        executed: ExecutedLps,
         outbox_metadata: Vec<OwnerBatchMetadata>,
         inbound_frontier_updates: u64,
         inbound_heap_pops: u64,
@@ -1513,7 +1869,7 @@ fn classified_worker_loop<'image>(
                 }
                 radix_order_lpt(&mut assigned);
 
-                let mut executed = Vec::with_capacity(assigned.len());
+                let mut executed = ExecutedLps::new(config.round_records);
                 let mut returned_by_owner = (0..config.workers)
                     .map(|_| Vec::new())
                     .collect::<Vec<Vec<ReturnedLp<'image>>>>();
@@ -1576,7 +1932,7 @@ fn classified_worker_loop<'image>(
                         owner_slot: active.owner_slot,
                         lp: active.lp,
                     });
-                    executed.push(ExecutedLp {
+                    if let Err(error) = executed.record(ExecutedLp {
                         work,
                         estimated_events: active.estimated_events,
                         messages_exchanged,
@@ -1589,7 +1945,10 @@ fn classified_worker_loop<'image>(
                             busy_ns: elapsed_ns(lp_started),
                         },
                         timing_sampled: true,
-                    });
+                    }) {
+                        let _ = replies.send(OwnedWorkerReply::Failed { error });
+                        return;
+                    }
                 }
                 for owner in 0..config.workers {
                     if !remote_by_owner[owner].is_empty() {
@@ -1792,6 +2151,7 @@ fn owned_worker_loop<'image>(
                     placement,
                     config.straggler_threshold_events,
                     measure_lp_wall,
+                    config.round_records,
                 );
                 let OwnedRoundDrain {
                     executed,
@@ -1905,7 +2265,7 @@ struct InboundMergeMetrics {
 }
 
 struct OwnedRoundDrain {
-    executed: Vec<ExecutedLp>,
+    executed: ExecutedLps,
     remote_by_owner: Vec<Vec<RemoteEnvelope>>,
     frontier_updates: u64,
     heap_pops: u64,
@@ -2112,7 +2472,7 @@ fn run_coordinator<'image>(
     replies: &Receiver<WorkerReply<'image>>,
     routes: &[OwnerRoutes],
     observation_mode: ObservationMode,
-    retention: CpuMetricsRetention,
+    retention: CpuRoundRecords,
 ) -> Result<CollectedCpuRun, ExecutionError> {
     let mut previous_horizon = None;
     let mut metrics = CpuMetricsCollector::new(retention);
@@ -2197,22 +2557,24 @@ fn run_coordinator<'image>(
             &mut worker_busy_ns,
         )?;
 
-        let mut lp_work = Vec::with_capacity(execution.executed.len());
-        let mut lp_timings = Vec::with_capacity(execution.executed.len());
-        let mut events_processed = 0_u64;
-        let mut messages_exchanged = 0_u64;
-        for executed in execution.executed {
-            events_processed = events_processed
-                .checked_add(executed.work.events_processed)
-                .ok_or(ExecutionError::CounterOverflow(executed.work.node))?;
-            messages_exchanged = messages_exchanged
-                .checked_add(executed.messages_exchanged)
-                .ok_or(ExecutionError::CounterOverflow(executed.work.node))?;
-            lp_work.push(executed.work);
-            if executed.timing_sampled {
-                lp_timings.push(executed.timing);
+        let executed_lps = std::mem::take(&mut execution.executed);
+        let round_lps = match metrics.records() {
+            CpuRoundRecords::PerRound => {
+                let mut round_lps = per_round_lps(executed_lps, false, config.workers)?;
+                round_lps.partition = partition;
+                round_lps
             }
-        }
+            CpuRoundRecords::Totals => {
+                let mut gathered = RoundLpsGathered::new();
+                for executed in &executed_lps {
+                    gathered.tally.add(executed)?;
+                }
+                let mut round_lps = tallied_round_lps(&gathered, false);
+                round_lps.lists.straggler_lps = partition.stragglers.len() as u64;
+                round_lps.lists.bulk_chunks = partition.bulk_chunks.len() as u64;
+                round_lps
+            }
+        };
 
         let mut owner_batch_messages = 0_u64;
         for batches_by_owner in execution.remote_by_source_and_owner {
@@ -2263,35 +2625,32 @@ fn run_coordinator<'image>(
         }
         minima = next_minima;
 
-        radix_sort_by_node(&mut lp_work, |work| work.node);
-        radix_sort_by_node(&mut lp_timings, |timing| timing.node);
-        let active_lp_count = lp_work.len();
-        let max_work = lp_work
-            .iter()
-            .map(|work| work.events_processed)
-            .max()
-            .unwrap_or(0);
+        let RoundLps {
+            partition,
+            lp_work,
+            lp_timings,
+            events_processed,
+            active_lp_count,
+            max_work,
+            messages_exchanged,
+            lp_time_parallel_efficiency,
+            lists,
+        } = round_lps;
         let parallel_efficiency = if active_lp_count == 0 || max_work == 0 {
             1.0
         } else {
             events_processed as f64 / (active_lp_count as f64 * max_work as f64)
         };
-        let lp_time_parallel_efficiency = efficiency(
-            lp_timings.iter().map(|timing| timing.busy_ns),
-            active_lp_count,
-        );
         let worker_parallel_efficiency = efficiency(worker_busy_ns.iter().copied(), config.workers);
         let round_wall_time_ns = elapsed_ns(round_start);
-        let worker_timings = worker_busy_ns
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(worker, busy_ns)| WorkerRoundTiming {
+        let mut worker_timings = metrics.worker_timings_buffer(config.workers);
+        worker_timings.extend(worker_busy_ns.iter().copied().enumerate().map(
+            |(worker, busy_ns)| WorkerRoundTiming {
                 worker,
                 busy_ns,
                 idle_ns: round_wall_time_ns.saturating_sub(busy_ns),
-            })
-            .collect::<Vec<_>>();
+            },
+        ));
         let total_worker_busy = worker_busy_ns
             .iter()
             .copied()
@@ -2354,6 +2713,7 @@ fn run_coordinator<'image>(
                 coordinator_exchange_ns: 0,
                 round_wall_time_ns,
             },
+            lists,
         )?;
         previous_horizon = Some(exclusive_horizon_ns);
         round_number = round_number
@@ -2373,7 +2733,7 @@ fn run_owned_static_coordinator<'image>(
     commands: &[Sender<OwnedWorkerCommand>],
     replies: &Receiver<OwnedWorkerReply<'image>>,
     observation_mode: ObservationMode,
-    retention: CpuMetricsRetention,
+    retention: CpuRoundRecords,
 ) -> Result<CollectedCpuRun, ExecutionError> {
     let mut minima = vec![None; config.workers];
     let mut ready = vec![false; config.workers];
@@ -2419,7 +2779,7 @@ fn run_owned_static_coordinator<'image>(
         let mut completed = vec![false; config.workers];
         let mut next_local_minima = vec![None; config.workers];
         let mut worker_busy_ns = vec![0_u64; config.workers];
-        let mut executed_lps = Vec::new();
+        let mut executed_lps = RoundLpsGathered::new();
         let mut outbox_metadata_by_worker = (0..config.workers)
             .map(|_| None)
             .collect::<Vec<Option<Vec<OwnerBatchMetadata>>>>();
@@ -2457,7 +2817,7 @@ fn run_owned_static_coordinator<'image>(
                     completed[worker] = true;
                     next_local_minima[worker] = minimum_ns;
                     worker_busy_ns[worker] = busy_ns;
-                    executed_lps.extend(executed);
+                    executed_lps.gather(executed)?;
                     outbox_metadata_by_worker[worker] = Some(outbox_metadata);
                     inbound_frontier_updates =
                         inbound_frontier_updates.saturating_add(inbound_updates);
@@ -2557,56 +2917,38 @@ fn run_owned_static_coordinator<'image>(
         expected_inbound_batches = next_expected_inbound_batches;
         let coordinator_exchange_ns = elapsed_ns(exchange_started);
 
-        let partition = static_work_partition(
-            &executed_lps,
-            config.straggler_threshold_events.is_some(),
-            config.workers,
-        );
-        let mut lp_work = Vec::with_capacity(executed_lps.len());
-        let mut lp_timings = Vec::with_capacity(executed_lps.len());
-        let mut events_processed = 0_u64;
-        let mut messages_exchanged = 0_u64;
-        for executed in executed_lps {
-            events_processed = events_processed
-                .checked_add(executed.work.events_processed)
-                .ok_or(ExecutionError::CounterOverflow(executed.work.node))?;
-            messages_exchanged = messages_exchanged
-                .checked_add(executed.messages_exchanged)
-                .ok_or(ExecutionError::CounterOverflow(executed.work.node))?;
-            lp_work.push(executed.work);
-            if executed.timing_sampled {
-                lp_timings.push(executed.timing);
+        let round_lps = match metrics.records() {
+            CpuRoundRecords::PerRound => {
+                per_round_lps(executed_lps.per_lp, classified, config.workers)?
             }
-        }
-        radix_sort_by_node(&mut lp_work, |work| work.node);
-        radix_sort_by_node(&mut lp_timings, |timing| timing.node);
-        let active_lp_count = lp_work.len();
-        let max_work = lp_work
-            .iter()
-            .map(|work| work.events_processed)
-            .max()
-            .unwrap_or(0);
+            CpuRoundRecords::Totals => tallied_round_lps(&executed_lps, classified),
+        };
+        let RoundLps {
+            partition,
+            lp_work,
+            lp_timings,
+            events_processed,
+            active_lp_count,
+            max_work,
+            messages_exchanged,
+            lp_time_parallel_efficiency,
+            lists,
+        } = round_lps;
         let parallel_efficiency = if active_lp_count == 0 || max_work == 0 {
             1.0
         } else {
             events_processed as f64 / (active_lp_count as f64 * max_work as f64)
         };
-        let lp_time_parallel_efficiency = efficiency(
-            lp_timings.iter().map(|timing| timing.busy_ns),
-            active_lp_count,
-        );
         let worker_parallel_efficiency = efficiency(worker_busy_ns.iter().copied(), config.workers);
         let round_wall_time_ns = elapsed_ns(round_start);
-        let worker_timings = worker_busy_ns
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(worker, busy_ns)| WorkerRoundTiming {
+        let mut worker_timings = metrics.worker_timings_buffer(config.workers);
+        worker_timings.extend(worker_busy_ns.iter().copied().enumerate().map(
+            |(worker, busy_ns)| WorkerRoundTiming {
                 worker,
                 busy_ns,
                 idle_ns: round_wall_time_ns.saturating_sub(busy_ns),
-            })
-            .collect::<Vec<_>>();
+            },
+        ));
         let total_worker_busy = worker_busy_ns
             .iter()
             .copied()
@@ -2669,6 +3011,7 @@ fn run_owned_static_coordinator<'image>(
                 coordinator_exchange_ns,
                 round_wall_time_ns,
             },
+            lists,
         )?;
         previous_horizon = Some(exclusive_horizon_ns);
         round_number = round_number
@@ -2760,6 +3103,94 @@ fn run_owned_static_coordinator<'image>(
         result: assemble_result(image, lps, observation_mode)?,
         metrics,
     })
+}
+
+/// One round's per-LP outcome as the coordinator records it.
+struct RoundLps {
+    partition: WorkPartition,
+    lp_work: Vec<LpRoundWork>,
+    lp_timings: Vec<LpExecutionTiming>,
+    events_processed: u64,
+    active_lp_count: usize,
+    max_work: u64,
+    messages_exchanged: u64,
+    lp_time_parallel_efficiency: f64,
+    lists: RoundLists,
+}
+
+/// `PerRound`: every executed LP's record, sorted by node.
+fn per_round_lps(
+    executed_lps: Vec<ExecutedLp>,
+    classified: bool,
+    workers: usize,
+) -> Result<RoundLps, ExecutionError> {
+    let partition = static_work_partition(&executed_lps, classified, workers);
+    let mut lp_work = Vec::with_capacity(executed_lps.len());
+    let mut lp_timings = Vec::new();
+    let mut events_processed = 0_u64;
+    let mut messages_exchanged = 0_u64;
+    for executed in executed_lps {
+        events_processed = events_processed
+            .checked_add(executed.work.events_processed)
+            .ok_or(ExecutionError::CounterOverflow(executed.work.node))?;
+        messages_exchanged = messages_exchanged
+            .checked_add(executed.messages_exchanged)
+            .ok_or(ExecutionError::CounterOverflow(executed.work.node))?;
+        lp_work.push(executed.work);
+        if executed.timing_sampled {
+            lp_timings.push(executed.timing);
+        }
+    }
+    radix_sort_by_node(&mut lp_work, |work| work.node);
+    radix_sort_by_node(&mut lp_timings, |timing| timing.node);
+    let active_lp_count = lp_work.len();
+    let max_work = lp_work
+        .iter()
+        .map(|work| work.events_processed)
+        .max()
+        .unwrap_or(0);
+    let lp_time_parallel_efficiency = efficiency(
+        lp_timings.iter().map(|timing| timing.busy_ns),
+        active_lp_count,
+    );
+    Ok(RoundLps {
+        partition,
+        lp_work,
+        lp_timings,
+        events_processed,
+        active_lp_count,
+        max_work,
+        messages_exchanged,
+        lp_time_parallel_efficiency,
+        lists: RoundLists::default(),
+    })
+}
+
+/// `Totals`: the workers' tallies, folded; no per-LP list.
+fn tallied_round_lps(gathered: &RoundLpsGathered, classified: bool) -> RoundLps {
+    let tally = gathered.tally;
+    RoundLps {
+        partition: WorkPartition::default(),
+        lp_work: Vec::new(),
+        lp_timings: Vec::new(),
+        events_processed: tally.events,
+        active_lp_count: tally.active_lps,
+        max_work: tally.max_lp_events,
+        messages_exchanged: tally.messages,
+        lp_time_parallel_efficiency: efficiency_of(
+            tally.lp_busy_ns,
+            tally.lp_busy_max_ns,
+            tally.active_lps,
+        ),
+        lists: RoundLists {
+            max_lp_events: tally.max_lp_events,
+            same_time_continuations: tally.same_time_continuations,
+            timed_lps: tally.timed_lps,
+            lp_busy_ns: tally.lp_busy_ns,
+            straggler_lps: if classified { tally.straggler_lps } else { 0 },
+            bulk_chunks: if classified { gathered.bulk_workers } else { 0 },
+        },
+    }
 }
 
 fn add_worker_merge_timing(round: &mut CpuRoundMetrics, worker: usize, busy_ns: u64) {
@@ -3883,6 +4314,11 @@ fn efficiency(values: impl Iterator<Item = u64>, count: usize) -> f64 {
     let (total, maximum) = values.fold((0_u128, 0_u64), |(total, maximum), value| {
         (total + u128::from(value), maximum.max(value))
     });
+    efficiency_of(total, maximum, count)
+}
+
+/// `efficiency` of values with this sum and maximum.
+fn efficiency_of(total: u128, maximum: u64, count: usize) -> f64 {
     if count == 0 || maximum == 0 {
         1.0
     } else {
@@ -4538,9 +4974,10 @@ impl<'image> WorkerShard<'image> {
         placement: &StaticPlacement,
         straggler_threshold_events: Option<u64>,
         measure_lp_wall: bool,
+        records: CpuRoundRecords,
     ) -> Result<OwnedRoundDrain, ExecutionError> {
         let round_started = measure_lp_wall.then(Instant::now);
-        let mut executed = Vec::new();
+        let mut executed = ExecutedLps::new(records);
         let mut remote_by_owner = (0..placement.workers)
             .map(|_| Vec::new())
             .collect::<Vec<_>>();
@@ -4606,13 +5043,13 @@ impl<'image> WorkerShard<'image> {
             dispatch_order = dispatch_order
                 .checked_add(1)
                 .ok_or(ExecutionError::CounterOverflow(node))?;
-            executed.push(ExecutedLp {
+            executed.record(ExecutedLp {
                 work,
                 estimated_events,
                 messages_exchanged,
                 timing,
                 timing_sampled: measure_lp_wall,
-            });
+            })?;
             self.frontier
                 .update(entry.owner_slot, node, next, &mut physical_lp_probes)?;
             frontier_updates = frontier_updates.saturating_add(1);

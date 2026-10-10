@@ -3,8 +3,8 @@ use std::time::Instant;
 
 use days::scenario::compile_config;
 use days_executor::{
-    CpuConfig, CudaConfig, CudaExecutor, RunResult, RunSummary, SimulationImage, run_cpu,
-    run_scalar_rounds,
+    CpuConfig, CpuRoundRecords, CudaConfig, CudaExecutor, RunResult, RunSummary, SimulationImage,
+    run_cpu, run_scalar_rounds,
 };
 
 use super::{
@@ -147,6 +147,7 @@ fn cpu(
         image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers,
             ..CpuConfig::default()
         },
@@ -157,18 +158,18 @@ fn cpu(
         &run.result, expected_result,
         "{engine} W{workers} benchmark RunResult must match the oracle"
     );
-    let rounds = u64::try_from(run.rounds.len()).expect("CPU round count must fit in u64");
-    let transitions = run.rounds.iter().fold(0_u64, |total, round| {
+    let rounds = u64::try_from(run.rounds().len()).expect("CPU round count must fit in u64");
+    let transitions = run.rounds().iter().fold(0_u64, |total, round| {
         total.saturating_add(round.semantic.events_processed)
     });
-    let marginal_ns = run.rounds.iter().fold(0_u128, |total, round| {
+    let marginal_ns = run.rounds().iter().fold(0_u128, |total, round| {
         total.saturating_add(u128::from(round.round_wall_time_ns))
     });
     let outcome = Outcome {
         rounds,
         transitions,
         active_lps: active_lp_stats(
-            run.rounds
+            run.rounds()
                 .iter()
                 .map(|round| round.semantic.active_lp_count),
         ),
@@ -527,6 +528,7 @@ fn run_worker_sweep(
             image,
             None,
             CpuConfig {
+                round_records: CpuRoundRecords::PerRound,
                 workers: worker_count,
                 ..CpuConfig::default()
             },
@@ -542,16 +544,16 @@ fn run_worker_sweep(
             expected_result = Some(run.result.clone());
         }
         let rounds =
-            u64::try_from(run.rounds.len()).expect("worker sweep round count must fit in u64");
-        let transitions = run.rounds.iter().fold(0_u64, |total, round| {
+            u64::try_from(run.rounds().len()).expect("worker sweep round count must fit in u64");
+        let transitions = run.rounds().iter().fold(0_u64, |total, round| {
             total.saturating_add(round.semantic.events_processed)
         });
         let active_lps = active_lp_stats(
-            run.rounds
+            run.rounds()
                 .iter()
                 .map(|round| round.semantic.active_lp_count),
         );
-        let marginal_ns = run.rounds.iter().fold(0_u128, |total, round| {
+        let marginal_ns = run.rounds().iter().fold(0_u128, |total, round| {
             total.saturating_add(u128::from(round.round_wall_time_ns))
         });
         let (fixed_ns, marginal_ns) = split_fixed(end_to_end_ns, marginal_ns);
@@ -645,6 +647,7 @@ pub fn main() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 4,
             ..CpuConfig::default()
         },
@@ -652,7 +655,7 @@ pub fn main() {
     .expect("W4 benchmark oracle must succeed");
     let oracle_active_lps = active_lp_stats(
         oracle_run
-            .rounds
+            .rounds()
             .iter()
             .map(|round| round.semantic.active_lp_count),
     );

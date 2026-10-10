@@ -63,9 +63,9 @@ pub mod validate;
 
 pub use aqm_trace::{AqmTraceError, aqm_transitions_csv};
 pub use cpu::{
-    ChunkGranularity, CpuConfig, CpuFaultInjection, CpuFaultKind, CpuRoundMetrics, CpuRun,
-    LpExecutionTiming, LpWorkEstimate, StaticPartitionPolicy, WorkClass, WorkPartition,
-    WorkerRoundTiming, run_cpu, run_cpu_with_observations,
+    ChunkGranularity, CpuConfig, CpuFaultInjection, CpuFaultKind, CpuRoundMetrics, CpuRoundRecords,
+    CpuRun, CpuRunTotals, LpExecutionTiming, LpWorkEstimate, StaticPartitionPolicy, WorkClass,
+    WorkPartition, WorkerRoundTiming, run_cpu, run_cpu_with_observations,
 };
 #[cfg(all(feature = "cuda", feature = "planner-test-hooks"))]
 #[doc(hidden)]

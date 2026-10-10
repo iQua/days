@@ -395,8 +395,8 @@ fn main() {
 
     use days::scenario::compile_config;
     use days_executor::{
-        CpuConfig, MetalConfig, MetalExecutor, RunResult, RunSummary, SimulationImage, run_cpu,
-        run_scalar_rounds,
+        CpuConfig, CpuRoundRecords, MetalConfig, MetalExecutor, RunResult, RunSummary,
+        SimulationImage, run_cpu, run_scalar_rounds,
     };
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -526,6 +526,7 @@ fn main() {
             image,
             None,
             CpuConfig {
+                round_records: CpuRoundRecords::PerRound,
                 workers,
                 ..CpuConfig::default()
             },
@@ -536,19 +537,19 @@ fn main() {
             &run.result, expected_result,
             "W{workers} benchmark RunResult must match the oracle"
         );
-        let rounds = u64::try_from(run.rounds.len()).expect("CPU round count must fit in u64");
+        let rounds = u64::try_from(run.rounds().len()).expect("CPU round count must fit in u64");
         assert!(rounds > 0, "W{workers} benchmark run produced zero rounds");
-        let transitions = run.rounds.iter().fold(0_u64, |total, round| {
+        let transitions = run.rounds().iter().fold(0_u64, |total, round| {
             total.saturating_add(round.semantic.events_processed)
         });
-        let marginal_ns = run.rounds.iter().fold(0_u128, |total, round| {
+        let marginal_ns = run.rounds().iter().fold(0_u128, |total, round| {
             total.saturating_add(u128::from(round.round_wall_time_ns))
         });
         let outcome = Outcome {
             rounds,
             transitions,
             active_lps: active_lp_stats(
-                run.rounds
+                run.rounds()
                     .iter()
                     .map(|round| round.semantic.active_lp_count),
             ),
@@ -946,6 +947,7 @@ fn main() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 4,
             ..CpuConfig::default()
         },
@@ -953,7 +955,7 @@ fn main() {
     .expect("W4 benchmark oracle must succeed");
     let oracle_active_lps = active_lp_stats(
         oracle_run
-            .rounds
+            .rounds()
             .iter()
             .map(|round| round.semantic.active_lp_count),
     );
