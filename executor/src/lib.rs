@@ -33,6 +33,7 @@ pub mod device_sizing;
 mod device_stage;
 pub mod ecn_ramp;
 pub mod event;
+mod fel;
 pub mod image;
 mod mechanism_trace;
 #[cfg(any(
@@ -43,6 +44,7 @@ mod merge_audit;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub mod metal;
 pub mod model;
+mod packet_store;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 mod planner_capacity;
 mod roce;
