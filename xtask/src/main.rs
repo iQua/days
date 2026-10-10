@@ -124,8 +124,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
-        count: 2,
-        purpose: "shared planner lookup tables exist only when a device planner is built; P14's `RoundKernel` selection type is exported only with a device backend, the only builds with two `days_round` builds to select between",
+        count: 3,
+        purpose: "shared planner lookup tables exist only when a device planner is built; P14's `RoundKernel` selection type is exported only with a device backend, the only builds with two `days_round` builds to select between; P18's shared plane construction (all-zero plane lengths, c2a) exists only for the two device planners",
     },
     AllowedFeatureGate {
         path: "lib.rs",

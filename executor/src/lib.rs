@@ -23,6 +23,8 @@ mod device_event_record;
 ))]
 mod device_mechanism;
 mod device_pfc;
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+mod device_plane;
 mod device_scheduler;
 pub mod device_sizing;
 #[cfg(any(

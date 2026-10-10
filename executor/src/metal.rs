@@ -33,6 +33,7 @@ use crate::device_event_record::{
     stream_event_class,
 };
 use crate::device_mechanism::RoundKernel;
+use crate::device_plane::ZeroPlane;
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -1701,7 +1702,9 @@ impl MetalPlan {
             queue_records: &self.queue_records,
             in_service: &self.in_service,
             stream_state: &self.stream_state,
-            stream_records: &self.stream_records,
+            // P18 c2a: the stream rings are all zero at upload and every stream's count is 0, so
+            // the check reads no record; a count it would read fails closed as a malformed plan.
+            stream_records: &[],
             stream_count: self.stream_layout.stream_count,
             service_stream_base: self.stream_layout.service_stream_base,
             generator_stream_base: self.stream_layout.generator_stream_base,
@@ -1737,21 +1740,21 @@ struct MetalPlan {
     queue_meta: Vec<u64>,
     queue_records: Vec<u64>,
     in_service: Vec<u64>,
-    outbox: Vec<u64>,
-    worklist: Vec<u64>,
-    summary: Vec<u64>,
-    observed: Vec<u64>,
-    departures: Vec<u64>,
-    arrivals: Vec<u64>,
-    lp_state: Vec<u64>,
+    outbox: ZeroPlane,
+    worklist: ZeroPlane,
+    summary: ZeroPlane,
+    observed: ZeroPlane,
+    departures: ZeroPlane,
+    arrivals: ZeroPlane,
+    lp_state: ZeroPlane,
     remote_meta: Vec<u64>,
-    remote_staging: Vec<u64>,
+    remote_staging: ZeroPlane,
     observation_meta: Vec<u64>,
     inbound_meta: Vec<u64>,
     inbound_producers: Vec<u64>,
-    merge_cursors: Vec<u64>,
+    merge_cursors: ZeroPlane,
     stream_state: Vec<u64>,
-    stream_records: Vec<u64>,
+    stream_records: ZeroPlane,
     scheduler_state: Vec<u64>,
     tcp_state: Vec<u64>,
     stream_layout: StreamLayout,
@@ -1781,7 +1784,7 @@ struct StreamLayout {
 
 struct PreparedStreams {
     state: Vec<u64>,
-    records: Vec<u64>,
+    records: ZeroPlane,
     layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
     channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
@@ -2565,15 +2568,15 @@ impl MetalPlan {
             queue_meta,
             queue_records,
             in_service,
-            outbox: zero_words(outbox_records, EVENT_WORDS)?,
-            worklist: vec![0_u64; worklist_capacity],
-            summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
-            observed: zero_words(observation_slots, OBSERVED_WORDS)?,
-            departures: zero_words(observation_slots, DEPARTURE_WORDS)?,
-            arrivals: zero_words(observation_slots, ARRIVAL_WORDS)?,
-            lp_state: vec![0_u64; node_count.max(1) * LP_STATE_WORDS],
+            outbox: zero_plane(outbox_records, EVENT_WORDS)?,
+            worklist: ZeroPlane::words(worklist_capacity),
+            summary: ZeroPlane::words(node_count.max(1) * SUMMARY_COUNTERS * 2),
+            observed: zero_plane(observation_slots, OBSERVED_WORDS)?,
+            departures: zero_plane(observation_slots, DEPARTURE_WORDS)?,
+            arrivals: zero_plane(observation_slots, ARRIVAL_WORDS)?,
+            lp_state: ZeroPlane::words(node_count.max(1) * LP_STATE_WORDS),
             remote_meta,
-            remote_staging: zero_words(
+            remote_staging: zero_plane(
                 remote_staging_slots,
                 if config.streams_enabled {
                     REMOTE_STAGING_EVENT_WORDS
@@ -2583,7 +2586,7 @@ impl MetalPlan {
             )?,
             observation_meta,
             inbound_meta,
-            merge_cursors: vec![0_u64; inbound_producers.len().max(1)],
+            merge_cursors: ZeroPlane::words(inbound_producers.len()),
             inbound_producers,
             stream_state: streams.state,
             stream_records: streams.records,
@@ -3036,7 +3039,7 @@ fn prepare_streams(
             .ok_or_else(|| MetalError::Validation("round scratch size overflows usize".into()))?;
         return Ok(PreparedStreams {
             state: vec![0; round_scratch_words.max(1)],
-            records: vec![0],
+            records: ZeroPlane::words(1),
             layout: StreamLayout {
                 round_scratch_offset: 0,
                 ..StreamLayout::default()
@@ -3258,7 +3261,7 @@ fn prepare_streams(
 
     Ok(PreparedStreams {
         state,
-        records: vec![0; stream_record_words.max(1)],
+        records: ZeroPlane::words(stream_record_words),
         layout: StreamLayout {
             stream_count,
             channel_count,
@@ -3603,6 +3606,12 @@ fn zero_words(records: usize, words: usize) -> Result<Vec<u64>, MetalError> {
         .checked_mul(words)
         .ok_or_else(|| MetalError::Validation("device buffer size overflows usize".into()))?;
     Ok(vec![0; length.max(1)])
+}
+
+/// An all-zero plane of `records` records of `words` words (P18 c2a): its length only.
+fn zero_plane(records: usize, words: usize) -> Result<ZeroPlane, MetalError> {
+    ZeroPlane::records(records, words)
+        .ok_or_else(|| MetalError::Validation("device buffer size overflows usize".into()))
 }
 
 fn encode_tcp_generator(tcp: crate::TcpGenerator, row: &mut [u64]) {
@@ -4063,6 +4072,12 @@ fn queue_push_host(
     Ok(())
 }
 
+/// Where one uploaded plane's words come from (P18 c2a).
+enum PlaneSource {
+    Host(Vec<u64>),
+    Zero(ZeroPlane),
+}
+
 struct SharedBuffer {
     raw: RawMetalBuffer,
     words: usize,
@@ -4092,6 +4107,23 @@ impl SharedBuffer {
             raw,
             words: words.len(),
         })
+    }
+
+    /// Allocates an all-zero plane without staging a host buffer of zeros (P18 c2a). The buffer is
+    /// cleared in place rather than relying on a fresh allocation being zero.
+    fn zeroed(
+        device: &ProtocolObject<dyn MTLDevice>,
+        plane: ZeroPlane,
+    ) -> Result<Self, MetalError> {
+        let buffer = Self::uninitialized(device, plane.len())?;
+        unsafe {
+            std::ptr::write_bytes(
+                buffer.raw.contents().as_ptr().cast::<u64>(),
+                0,
+                buffer.words,
+            );
+        }
+        Ok(buffer)
     }
 
     /// Allocates `words` device words without staging a host-side zero buffer.
@@ -4260,38 +4292,45 @@ impl MetalBuffers {
             plan.params[14] != 0,
         );
         let tcp_state = SharedBuffer::new(device, plan.tcp_state)?;
-        let planes = vec![
-            plan.control,
-            plan.params,
-            plan.node_state,
-            plan.generators,
-            plan.flows,
-            plan.routes,
-            plan.links,
-            plan.fel_meta,
-            plan.fel_records,
-            plan.queue_meta,
-            plan.queue_records,
-            plan.in_service,
-            plan.outbox,
-            plan.worklist,
-            plan.summary,
-            plan.observed,
-            plan.departures,
-            plan.arrivals,
-            plan.lp_state,
-            plan.remote_meta,
-            plan.remote_staging,
-            plan.observation_meta,
-            plan.inbound_meta,
-            plan.inbound_producers,
-            plan.merge_cursors,
-            plan.stream_state,
-            plan.stream_records,
-            plan.scheduler_state,
+        // P18 c2a: an all-zero plane is allocated and zeroed on the device; only the planes the
+        // planner wrote cross from the host.
+        let host = PlaneSource::Host;
+        let zero = PlaneSource::Zero;
+        let planes = [
+            host(plan.control),
+            host(plan.params),
+            host(plan.node_state),
+            host(plan.generators),
+            host(plan.flows),
+            host(plan.routes),
+            host(plan.links),
+            host(plan.fel_meta),
+            host(plan.fel_records),
+            host(plan.queue_meta),
+            host(plan.queue_records),
+            host(plan.in_service),
+            zero(plan.outbox),
+            zero(plan.worklist),
+            zero(plan.summary),
+            zero(plan.observed),
+            zero(plan.departures),
+            zero(plan.arrivals),
+            zero(plan.lp_state),
+            host(plan.remote_meta),
+            zero(plan.remote_staging),
+            host(plan.observation_meta),
+            host(plan.inbound_meta),
+            host(plan.inbound_producers),
+            zero(plan.merge_cursors),
+            host(plan.stream_state),
+            zero(plan.stream_records),
+            host(plan.scheduler_state),
         ]
         .into_iter()
-        .map(|words| SharedBuffer::new(device, words))
+        .map(|source| match source {
+            PlaneSource::Host(words) => SharedBuffer::new(device, words),
+            PlaneSource::Zero(plane) => SharedBuffer::zeroed(device, plane),
+        })
         .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             planes,
