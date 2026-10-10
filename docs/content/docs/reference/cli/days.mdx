@@ -65,7 +65,7 @@ error: --workers is a CPU-engine option and does not apply to --engine scalar
 - `--max-capacity-retries <N>`: capacity retry budget; default `16`. `0` selects strict single-shot execution.
 - `--capacity-warm-start <PATH>`: plan the first attempt from a snapshot that `--dump-capacity-warm-start` wrote for the same fixture.
 - `--dump-capacity-warm-start <PATH>`: after a successful run, write the capacities the run converged on.
-- `--channel-events-per-stream <N>`: override the plane-wide channel-stream starting cap (stock: 2,048 events).
+- `--channel-events-per-stream <N>`: override the plane-wide data-ring starting cap (stock: 512 events; stage-notify lanes keep their notify count).
 - `--round-threads-per-block <N>`: override the round and exchange launch width; default `256`.
 
 Device capacity is refuse-or-run. An attempt that runs out of capacity is discarded, the host raises the relevant floor, and the run retries. A warm-start snapshot holds capacities only, not simulation state or compiled kernels, so retries, cap overrides, and warm starts change memory use and the number of attempts, never the result bytes. The snapshot file starts with the header `days-capacity-warm-start v2` and ends with a record count; a truncated or corrupt snapshot is refused.

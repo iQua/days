@@ -3077,13 +3077,24 @@ fn prepare_streams(
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity.max(config.capacity_floors.channel_events_per_stream));
     } else {
+        // P18 c1: the cap bounds the data rings. A notify lane holds at most its host pair's
+        // unfired notifies, a count lowering fixes, so it keeps that exact capacity.
+        let floor = config.capacity_floors.channel_events_per_stream;
+        let lanes = notify
+            .map_or(&[][..], |notify| &notify.lanes)
+            .iter()
+            .map(|&(channel, _)| (channel, channel_caps[channel].max(floor)))
+            .collect::<Vec<_>>();
         for capacity in &mut channel_caps {
             *capacity = crate::device_capacity::bound_derived_capacity(
                 *capacity,
                 config.capacity_caps.channel_events_per_stream,
-                config.capacity_floors.channel_events_per_stream,
+                floor,
                 0,
             );
+        }
+        for (channel, capacity) in lanes {
+            channel_caps[channel] = capacity;
         }
     }
     for (stream, capacity) in channel_caps.iter_mut().enumerate() {
