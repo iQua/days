@@ -417,8 +417,9 @@ mod tests {
         );
     }
 
-    /// Removing every packet of a large store, in insertion order, empties every bucket: the
-    /// backward shift leaves no tombstone and loses no packet on the way.
+    /// Removing all but one packet of a large store, in insertion order, empties every other
+    /// bucket: the backward shift leaves no tombstone and loses no packet on the way. The slab
+    /// keeps its slots on its free list while it holds a packet, and reuses them.
     #[test]
     fn removal_leaves_no_tombstone() {
         let mut store = PacketStore::new();
@@ -431,7 +432,8 @@ mod tests {
                 value: payload,
             });
         }
-        for &payload in &payloads {
+        let (last, rest) = payloads.split_last().expect("2,000 payloads");
+        for &payload in rest {
             assert_eq!(
                 store.remove(&PayloadId(payload)).map(|packet| packet.value),
                 Some(payload)
@@ -440,18 +442,52 @@ mod tests {
         let Repr::Large(slab) = &store.0 else {
             panic!("2,000 packets made the store an indexed slab");
         };
-        assert_eq!(slab.len, 0);
-        assert!(slab.buckets.iter().all(|bucket| bucket.slot == EMPTY));
-        // The slab keeps its high-water slots on its free list, and reuses them.
+        assert_eq!(slab.len, 1);
+        assert_eq!(
+            slab.buckets
+                .iter()
+                .filter(|bucket| bucket.slot != EMPTY)
+                .count(),
+            1
+        );
         let slots = slab.slots.len();
         store.insert(Packet {
             payload: PayloadId(1),
             value: 1,
         });
         let Repr::Large(slab) = &store.0 else {
-            unreachable!()
+            unreachable!("a store that never emptied stays a slab")
         };
         assert_eq!(slab.slots.len(), slots);
+        assert_eq!(
+            store.get(&PayloadId(*last)).map(|packet| packet.value),
+            Some(*last)
+        );
+        assert_eq!(store.into_sorted().len(), 2);
+    }
+
+    /// A large store that empties drops its slab and index: a queue owner that has drained (a
+    /// switch port after a burst) holds nothing until it fills again.
+    #[test]
+    fn a_store_that_empties_drops_its_slab() {
+        let mut store = PacketStore::new();
+        for payload in 0..100_u64 {
+            store.insert(Packet {
+                payload: PayloadId(payload),
+                value: payload,
+            });
+        }
+        for payload in 0..100_u64 {
+            assert!(store.remove(&PayloadId(payload)).is_some());
+        }
+        assert!(
+            matches!(&store.0, Repr::Small(packets) if packets.capacity() == 0),
+            "an empty store holds no slab and no buffer"
+        );
+        store.insert(Packet {
+            payload: PayloadId(7),
+            value: 7,
+        });
         assert_eq!(store.into_sorted().len(), 1);
     }
 
