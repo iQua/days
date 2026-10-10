@@ -25,3 +25,46 @@ impl ZeroPlane {
         self.0
     }
 }
+
+/// The `routes` plane with identical routes stored once (P18 c9).
+///
+/// A flow's two route rows in the `flows` plane are `(offset, length)` pairs into this plane, and
+/// the kernels read only `routes[offset..offset + length]`, so flows with the same route can
+/// share one copy. At the 1,024-GPU flagship, 11.56 M routed flows run over 29,824 ECMP host
+/// pairs, so most routes repeat. A route's first occurrence, in flow order (forward route, then
+/// reverse), places it; the map is keyed by the route itself, so placement depends only on the
+/// image. An empty route reads nothing and takes offset 0.
+pub(crate) struct RoutePlane<'image> {
+    words: Vec<u64>,
+    offsets: std::collections::BTreeMap<&'image [crate::LinkId], u64>,
+}
+
+impl<'image> RoutePlane<'image> {
+    pub(crate) fn new() -> Self {
+        Self {
+            words: Vec::new(),
+            offsets: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// The offset of `route` in the plane, appending it on its first occurrence.
+    pub(crate) fn place(&mut self, route: &'image [crate::LinkId]) -> u64 {
+        if route.is_empty() {
+            return 0;
+        }
+        let words = &mut self.words;
+        *self.offsets.entry(route).or_insert_with(|| {
+            let offset = words.len() as u64;
+            words.extend(route.iter().map(|link| link.0));
+            offset
+        })
+    }
+
+    /// The plane's words: at least one, as every uploaded plane.
+    pub(crate) fn into_words(mut self) -> Vec<u64> {
+        if self.words.is_empty() {
+            self.words.push(0);
+        }
+        self.words
+    }
+}

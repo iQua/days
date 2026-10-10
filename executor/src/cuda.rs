@@ -2889,22 +2889,19 @@ impl CudaPlan {
             )?;
         }
 
-        let mut routes = Vec::new();
+        // P18 c9: identical routes share one copy in the `routes` plane.
+        let mut routes = crate::device_plane::RoutePlane::new();
         let mut flows = vec![0_u64; image.flows.len().max(1) * FLOW_WORDS];
         for flow in &image.flows {
             let offset = flow.id.0 as usize * FLOW_WORDS;
             flows[offset] = flow.source.0;
             flows[offset + 1] = flow.target.0;
-            flows[offset + 2] = routes.len() as u64;
+            flows[offset + 2] = routes.place(&flow.route);
             flows[offset + 3] = flow.route.len() as u64;
-            routes.extend(flow.route.iter().map(|link| link.0));
-            flows[offset + 4] = routes.len() as u64;
+            flows[offset + 4] = routes.place(&flow.reverse_route);
             flows[offset + 5] = flow.reverse_route.len() as u64;
-            routes.extend(flow.reverse_route.iter().map(|link| link.0));
         }
-        if routes.is_empty() {
-            routes.push(0);
-        }
+        let routes = routes.into_words();
         let mut links = vec![0_u64; image.links.len().max(1) * LINK_WORDS];
         for link in &image.links {
             let offset = link.id.0 as usize * LINK_WORDS;
