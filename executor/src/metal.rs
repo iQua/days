@@ -4099,6 +4099,12 @@ struct SharedBuffer {
     words: usize,
 }
 
+impl Drop for SharedBuffer {
+    fn drop(&mut self) {
+        crate::phase_marks::mark("device_free", self.words * std::mem::size_of::<u64>());
+    }
+}
+
 impl SharedBuffer {
     fn new(device: &ProtocolObject<dyn MTLDevice>, words: Vec<u64>) -> Result<Self, MetalError> {
         let words = if words.is_empty() { vec![0] } else { words };
@@ -4219,6 +4225,27 @@ struct DominantArenaDiagnosticLayout {
     resume_scan_offset: usize,
     /// P17 merge: the merge-audit rows in `stream_state`.
     merge_audit_offset: usize,
+}
+
+/// Planes readback never reads (P18 3(b)): control (screened first), flows, routes, links,
+/// outbox, worklist, remote metadata and staging, inbound metadata and producers, merge cursors.
+const UNREAD_PLANES: [usize; 11] = [0, 4, 5, 6, 12, 13, 19, 20, 22, 23, 24];
+
+/// The planes readback reads whole or in a metadata prefix, before the gathered arenas.
+const WHOLE_PLANES: [usize; 11] = [1, 2, 3, 7, 9, 11, 14, 18, 21, 25, 27];
+
+/// A plane readback has not released yet.
+fn live_plane(planes: &[Option<SharedBuffer>], index: usize) -> &SharedBuffer {
+    planes[index]
+        .as_ref()
+        .expect("readback reads only planes it has not released")
+}
+
+/// Releases readback's planes `indices` (P18 3(b)).
+fn release_planes(planes: &mut [Option<SharedBuffer>], indices: &[usize]) {
+    for &index in indices {
+        planes[index] = None;
+    }
 }
 
 impl MetalBuffers {
@@ -4419,7 +4446,7 @@ impl MetalBuffers {
     }
 
     fn finish(
-        &self,
+        self,
         direct: &DirectMetal,
         run_image: &mut RunImage<'_>,
         observation_mode: ObservationMode,
@@ -4496,6 +4523,14 @@ impl MetalBuffers {
             );
         }
 
+        // P18 3(b): readback copies out only what the decode reads and releases each plane as soon
+        // as its words are on the host, so the decode, which builds the result, runs with the
+        // device plan freed rather than beside it. A plane readback never reads is released now;
+        // the rest after their reads below.
+        let tcp_state = self.tcp_state;
+        let mut planes = self.planes.into_iter().map(Some).collect::<Vec<_>>();
+        release_planes(&mut planes, &UNREAD_PLANES);
+
         // T20l fix 2: on a SUCCESSFUL attempt, copy the LIVE regions rather than the arena.
         //
         // T20l phase 1 §4.2 measured this readback at 2,394,309,899 words (19.15 GB) on the RQ9
@@ -4526,22 +4561,22 @@ impl MetalBuffers {
         // Byte-identity: the gather reproduces the decode's own slot arithmetic (see
         // `device_compaction`), so the same records reach the same decoders in the same order.
         // Nothing about WHICH words are decoded changes; only which words cross the bus.
-        let params = self.planes[1].read();
-        let node_state = self.planes[2].read();
-        let generators = self.planes[3].read();
-        let fel_meta = self.planes[7].read();
-        let queue_meta = self.planes[9].read();
-        let in_service = self.planes[11].read();
-        let summary_words = self.planes[14].read();
-        let lp_state = self.planes[18].read();
-        let observation_meta = self.planes[21].read();
+        let params = live_plane(&planes, 1).read();
+        let node_state = live_plane(&planes, 2).read();
+        let generators = live_plane(&planes, 3).read();
+        let fel_meta = live_plane(&planes, 7).read();
+        let queue_meta = live_plane(&planes, 9).read();
+        let in_service = live_plane(&planes, 11).read();
+        let summary_words = live_plane(&planes, 14).read();
+        let lp_state = live_plane(&planes, 18).read();
+        let observation_meta = live_plane(&planes, 21).read();
         // Only the per-stream ring metadata prefix of `stream_state` is decoded; the LP stream
         // lists, outbound metadata, channel batches, staging channels and channel targets that
         // follow it are device scratch. At the frontier that prefix is 1,667,976 of the plane's
         // 52,426,754 words. The extent is the planner's own `stream_count` — the same bound the
         // decode loop below already walks — not an inferred one.
         let stream_meta_range = metadata_region(
-            self.planes[25].words,
+            live_plane(&planes, 25).words,
             0,
             self.stream_layout
                 .stream_count
@@ -4550,44 +4585,41 @@ impl MetalBuffers {
         )
         .map_err(compaction_error)?;
         let stream_state =
-            self.planes[25].read_range(stream_meta_range.start, stream_meta_range.len());
-        let scheduler_state = self.planes[27].read();
+            live_plane(&planes, 25).read_range(stream_meta_range.start, stream_meta_range.len());
+        let scheduler_state = live_plane(&planes, 27).read();
+        release_planes(&mut planes, &WHOLE_PLANES);
 
         let node_count = image.nodes.len();
         let flow_count = image.flows.len();
         let receiver_base = params[PARAM_RECEIVER_OFFSET] as usize;
         let ledger_meta_offset = params[PARAM_LEDGER_META_OFFSET] as usize;
         let receiver_range = metadata_region(
-            self.tcp_state.words,
+            tcp_state.words,
             receiver_base,
             flow_count.saturating_mul(TCP_RECEIVER_WORDS),
             "per-flow TCP receiver state",
         )
         .map_err(compaction_error)?;
-        let receiver_state = self
-            .tcp_state
-            .read_range(receiver_range.start, receiver_range.len());
+        let receiver_state = tcp_state.read_range(receiver_range.start, receiver_range.len());
         let ledger_meta_range = metadata_region(
-            self.tcp_state.words,
+            tcp_state.words,
             ledger_meta_offset,
             flow_count.saturating_mul(TCP_LEDGER_META_WORDS),
             "per-flow TCP ledger metadata",
         )
         .map_err(compaction_error)?;
-        let ledger_meta = self
-            .tcp_state
-            .read_range(ledger_meta_range.start, ledger_meta_range.len());
+        let ledger_meta = tcp_state.read_range(ledger_meta_range.start, ledger_meta_range.len());
         // P16 G1: the stage rows, read only when the plan holds a stage region (a stageless image
         // issues the same reads as before).
         let stage_rows = if params[PARAM_STAGE_OFFSET] != NONE {
             let range = metadata_region(
-                self.tcp_state.words,
+                tcp_state.words,
                 params[PARAM_STAGE_OFFSET] as usize,
                 crate::device_stage::stage_row_words(image),
                 "stage region rows",
             )
             .map_err(compaction_error)?;
-            Some(self.tcp_state.read_range(range.start, range.len()))
+            Some(tcp_state.read_range(range.start, range.len()))
         } else {
             None
         };
@@ -4595,13 +4627,13 @@ impl MetalBuffers {
         // the same reads as before).
         let roce_region = if params[PARAM_ROCE_OFFSET] != NONE {
             let range = metadata_region(
-                self.tcp_state.words,
+                tcp_state.words,
                 params[PARAM_ROCE_OFFSET] as usize,
                 crate::device_mechanism::roce_region_words(image),
                 "RoCE receiver region",
             )
             .map_err(compaction_error)?;
-            Some(self.tcp_state.read_range(range.start, range.len()))
+            Some(tcp_state.read_range(range.start, range.len()))
         } else {
             None
         };
@@ -4610,7 +4642,7 @@ impl MetalBuffers {
             "FEL record",
             CompactionShape::Linear,
             EVENT_WORDS,
-            self.planes[8].words,
+            live_plane(&planes, 8).words,
             node_count,
             |lp| {
                 let base = lp * ARENA_META_WORDS;
@@ -4626,7 +4658,7 @@ impl MetalBuffers {
             "queue record",
             CompactionShape::Ring,
             EVENT_WORDS,
-            self.planes[10].words,
+            live_plane(&planes, 10).words,
             node_count,
             |lp| {
                 let base = lp * QUEUE_META_WORDS;
@@ -4641,21 +4673,21 @@ impl MetalBuffers {
         let channel_stream_plan = stream_compaction_plan(
             "channel stream record",
             CHANNEL_EVENT_WORDS,
-            self.planes[26].words,
+            live_plane(&planes, 26).words,
             0..self.stream_layout.service_stream_base,
             &stream_state,
         )?;
         let service_stream_plan = stream_compaction_plan(
             "service stream record",
             SERVICE_EVENT_WORDS,
-            self.planes[26].words,
+            live_plane(&planes, 26).words,
             self.stream_layout.service_stream_base..self.stream_layout.generator_stream_base,
             &stream_state,
         )?;
         let generator_stream_plan = stream_compaction_plan(
             "generator stream record",
             GENERATOR_EVENT_WORDS,
-            self.planes[26].words,
+            live_plane(&planes, 26).words,
             self.stream_layout.generator_stream_base..self.stream_layout.stream_count,
             &stream_state,
         )?;
@@ -4676,7 +4708,7 @@ impl MetalBuffers {
                     }
                 })
                 .collect(),
-            self.tcp_state.words,
+            tcp_state.words,
         )
         .map_err(compaction_error)?;
         let receiver_range_plan = CompactionPlan::new(
@@ -4694,7 +4726,7 @@ impl MetalBuffers {
                     }
                 })
                 .collect(),
-            self.tcp_state.words,
+            tcp_state.words,
         )
         .map_err(compaction_error)?;
         let observation_plans = [
@@ -4707,7 +4739,7 @@ impl MetalBuffers {
                 arena,
                 CompactionShape::Linear,
                 record_words,
-                self.planes[plane].words,
+                live_plane(&planes, plane).words,
                 if observation_mode == ObservationMode::Full {
                     node_count
                 } else {
@@ -4730,16 +4762,16 @@ impl MetalBuffers {
         };
 
         let gathered = direct.compact(&[
-            (&self.planes[8], &fel_plan),
-            (&self.planes[10], &queue_plan),
-            (&self.planes[26], &channel_stream_plan),
-            (&self.planes[26], &service_stream_plan),
-            (&self.planes[26], &generator_stream_plan),
-            (&self.tcp_state, &ledger_plan),
-            (&self.tcp_state, &receiver_range_plan),
-            (&self.planes[15], &observed_plan),
-            (&self.planes[16], &departure_plan),
-            (&self.planes[17], &arrival_plan),
+            (live_plane(&planes, 8), &fel_plan),
+            (live_plane(&planes, 10), &queue_plan),
+            (live_plane(&planes, 26), &channel_stream_plan),
+            (live_plane(&planes, 26), &service_stream_plan),
+            (live_plane(&planes, 26), &generator_stream_plan),
+            (&tcp_state, &ledger_plan),
+            (&tcp_state, &receiver_range_plan),
+            (live_plane(&planes, 15), &observed_plan),
+            (live_plane(&planes, 16), &departure_plan),
+            (live_plane(&planes, 17), &arrival_plan),
         ])?;
         let [
             fel_records,
@@ -4755,6 +4787,9 @@ impl MetalBuffers {
         ]: [Vec<u64>; 10] = gathered
             .try_into()
             .expect("compaction returns one buffer per request");
+        // Every word the decode reads is on the host: the device plan is released before it.
+        drop(planes);
+        drop(tcp_state);
 
         // P18 c5: the result's host and switch states are the run image's own, moved out of a
         // validated image the run consumes, or a clone of a borrowed one; the decoders below read

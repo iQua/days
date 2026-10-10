@@ -4625,6 +4625,7 @@ impl Drop for CudaBuffer {
         if matches!(&self.storage, CudaBufferStorage::Managed(_)) {
             self.stream.context().record_err(self.stream.synchronize());
         }
+        crate::phase_marks::mark("device_free", self.len * std::mem::size_of::<u64>());
     }
 }
 
@@ -4684,6 +4685,27 @@ struct CudaBuffers {
     channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
     round_capacity: usize,
     dispatch_capacity: usize,
+}
+
+/// Planes readback never reads (P18 3(b)): control (screened first), flows, routes, links,
+/// outbox, worklist, remote metadata and staging, inbound metadata and producers, merge cursors.
+const UNREAD_PLANES: [usize; 11] = [0, 4, 5, 6, 12, 13, 19, 20, 22, 23, 24];
+
+/// The planes readback copies whole, in its first wave.
+const WHOLE_PLANES: [usize; 10] = [1, 2, 3, 7, 9, 11, 14, 18, 21, 27];
+
+/// A plane readback has not released yet.
+fn live_plane(planes: &[Option<CudaBuffer>], index: usize) -> &CudaBuffer {
+    planes[index]
+        .as_ref()
+        .expect("readback reads only planes it has not released")
+}
+
+/// Releases readback's device planes `indices` (P18 3(b)).
+fn release_planes(planes: &mut [Option<CudaBuffer>], indices: &[usize]) {
+    for &index in indices {
+        planes[index] = None;
+    }
 }
 
 impl CudaBuffers {
@@ -4785,7 +4807,7 @@ impl CudaBuffers {
     }
 
     fn finish(
-        &self,
+        self,
         direct: &DirectCuda,
         module: &RoundModule,
         run_image: &mut RunImage<'_>,
@@ -4850,6 +4872,13 @@ impl CudaBuffers {
             .into());
         }
 
+        // P18 3(b): readback copies out only what the decode reads and releases each device plane
+        // as soon as its words are on the host, so the decode, which builds the result, runs with
+        // the device plan freed rather than beside it. A plane readback never reads is released
+        // now; the rest after their wave below.
+        let mut planes = self.planes.into_iter().map(Some).collect::<Vec<_>>();
+        release_planes(&mut planes, &UNREAD_PLANES);
+
         // T20l fix 2: on a SUCCESSFUL attempt, copy the LIVE regions rather than the arena.
         //
         // Transliteration of `MetalBuffers::finish`; see that function's comment for the three
@@ -4859,11 +4888,10 @@ impl CudaBuffers {
         // The copies are batched behind one synchronization each, exactly as the pre-fix readback
         // batched its 29 planes: three waves — the fixed-width planes, the three bounded metadata
         // regions that need `params` first, then the gathered arenas inside `DirectCuda::compact`.
-        const WHOLE_PLANES: [usize; 10] = [1, 2, 3, 7, 9, 11, 14, 18, 21, 27];
         let mut whole = Vec::with_capacity(WHOLE_PLANES.len());
         let mut readback_error = None;
         for index in WHOLE_PLANES {
-            let plane = &self.planes[index];
+            let plane = live_plane(&planes, index);
             match stream.clone_dtoh(plane) {
                 Ok(words) => whole.push(words),
                 Err(error) => {
@@ -4908,7 +4936,7 @@ impl CudaBuffers {
             let [rows] = bounded_plane_words(
                 stream,
                 [(
-                    &self.planes[25],
+                    live_plane(&planes, 25),
                     params[PARAM_MERGE_AUDIT_OFFSET] as usize,
                     self.node_count
                         .saturating_mul(crate::merge_audit::MERGE_AUDIT_WORDS),
@@ -4917,10 +4945,10 @@ impl CudaBuffers {
             )?;
             crate::merge_audit::record(&rows);
         }
+        release_planes(&mut planes, &WHOLE_PLANES);
 
         let node_count = image.nodes.len();
         let flow_count = image.flows.len();
-        let tcp_plane = &self.planes[28];
         // Only the per-stream ring metadata prefix of `stream_state` is decoded; the LP stream
         // lists, outbound metadata, channel batches, staging channels and channel targets that
         // follow it are device scratch. At the frontier that prefix is 1,667,976 of the plane's
@@ -4930,19 +4958,19 @@ impl CudaBuffers {
             stream,
             [
                 (
-                    tcp_plane,
+                    live_plane(&planes, 28),
                     params[PARAM_RECEIVER_OFFSET] as usize,
                     flow_count.saturating_mul(TCP_RECEIVER_WORDS),
                     "per-flow TCP receiver state",
                 ),
                 (
-                    tcp_plane,
+                    live_plane(&planes, 28),
                     params[PARAM_LEDGER_META_OFFSET] as usize,
                     flow_count.saturating_mul(TCP_LEDGER_META_WORDS),
                     "per-flow TCP ledger metadata",
                 ),
                 (
-                    &self.planes[25],
+                    live_plane(&planes, 25),
                     0,
                     self.stream_layout
                         .stream_count
@@ -4957,7 +4985,7 @@ impl CudaBuffers {
             let [rows] = bounded_plane_words(
                 stream,
                 [(
-                    tcp_plane,
+                    live_plane(&planes, 28),
                     params[PARAM_STAGE_OFFSET] as usize,
                     crate::device_stage::stage_row_words(image),
                     "stage region rows",
@@ -4973,7 +5001,7 @@ impl CudaBuffers {
             let [region] = bounded_plane_words(
                 stream,
                 [(
-                    tcp_plane,
+                    live_plane(&planes, 28),
                     params[PARAM_ROCE_OFFSET] as usize,
                     crate::device_mechanism::roce_region_words(image),
                     "RoCE receiver region",
@@ -4984,11 +5012,14 @@ impl CudaBuffers {
             None
         };
 
+        // `stream_state`'s ring metadata is on the host; the rest of the plane is device scratch.
+        release_planes(&mut planes, &[25]);
+
         let fel_plan = arena_compaction_plan(
             "FEL record",
             CompactionShape::Linear,
             EVENT_WORDS,
-            self.planes[8].len(),
+            live_plane(&planes, 8).len(),
             node_count,
             |lp| {
                 let base = lp * ARENA_META_WORDS;
@@ -5004,7 +5035,7 @@ impl CudaBuffers {
             "queue record",
             CompactionShape::Ring,
             EVENT_WORDS,
-            self.planes[10].len(),
+            live_plane(&planes, 10).len(),
             node_count,
             |lp| {
                 let base = lp * QUEUE_META_WORDS;
@@ -5019,21 +5050,21 @@ impl CudaBuffers {
         let channel_stream_plan = stream_compaction_plan(
             "channel stream record",
             CHANNEL_EVENT_WORDS,
-            self.planes[26].len(),
+            live_plane(&planes, 26).len(),
             0..self.stream_layout.service_stream_base,
             &stream_state,
         )?;
         let service_stream_plan = stream_compaction_plan(
             "service stream record",
             SERVICE_EVENT_WORDS,
-            self.planes[26].len(),
+            live_plane(&planes, 26).len(),
             self.stream_layout.service_stream_base..self.stream_layout.generator_stream_base,
             &stream_state,
         )?;
         let generator_stream_plan = stream_compaction_plan(
             "generator stream record",
             GENERATOR_EVENT_WORDS,
-            self.planes[26].len(),
+            live_plane(&planes, 26).len(),
             self.stream_layout.generator_stream_base..self.stream_layout.stream_count,
             &stream_state,
         )?;
@@ -5054,7 +5085,7 @@ impl CudaBuffers {
                     }
                 })
                 .collect(),
-            tcp_plane.len(),
+            live_plane(&planes, 28).len(),
         )
         .map_err(compaction_error)?;
         let receiver_range_plan = CompactionPlan::new(
@@ -5072,7 +5103,7 @@ impl CudaBuffers {
                     }
                 })
                 .collect(),
-            tcp_plane.len(),
+            live_plane(&planes, 28).len(),
         )
         .map_err(compaction_error)?;
         let observation_plans = [
@@ -5085,7 +5116,7 @@ impl CudaBuffers {
                 arena,
                 CompactionShape::Linear,
                 record_words,
-                self.planes[plane].len(),
+                live_plane(&planes, plane).len(),
                 if observation_mode == ObservationMode::Full {
                     node_count
                 } else {
@@ -5110,16 +5141,16 @@ impl CudaBuffers {
         let (gathered, _launched_gather) = direct.compact(
             module,
             &[
-                (&self.planes[8], &fel_plan),
-                (&self.planes[10], &queue_plan),
-                (&self.planes[26], &channel_stream_plan),
-                (&self.planes[26], &service_stream_plan),
-                (&self.planes[26], &generator_stream_plan),
-                (tcp_plane, &ledger_plan),
-                (tcp_plane, &receiver_range_plan),
-                (&self.planes[15], &observed_plan),
-                (&self.planes[16], &departure_plan),
-                (&self.planes[17], &arrival_plan),
+                (live_plane(&planes, 8), &fel_plan),
+                (live_plane(&planes, 10), &queue_plan),
+                (live_plane(&planes, 26), &channel_stream_plan),
+                (live_plane(&planes, 26), &service_stream_plan),
+                (live_plane(&planes, 26), &generator_stream_plan),
+                (live_plane(&planes, 28), &ledger_plan),
+                (live_plane(&planes, 28), &receiver_range_plan),
+                (live_plane(&planes, 15), &observed_plan),
+                (live_plane(&planes, 16), &departure_plan),
+                (live_plane(&planes, 17), &arrival_plan),
             ],
         )?;
         let [
@@ -5136,6 +5167,8 @@ impl CudaBuffers {
         ]: [Vec<u64>; 10] = gathered
             .try_into()
             .expect("compaction returns one buffer per request");
+        // Every word the decode reads is on the host: the device plan is released before it.
+        drop(planes);
 
         // P18 c5: the result's host and switch states are the run image's own, moved out of a
         // validated image the run consumes, or a clone of a borrowed one; the decoders below read
@@ -5954,6 +5987,10 @@ impl DirectCuda {
                     .map_err(|error| {
                         driver_error(format!("{} compaction destination", plan.arena), error)
                     })?;
+            crate::phase_marks::mark(
+                "device_alloc",
+                plan.total_words() * std::mem::size_of::<u64>(),
+            );
             let plan_buffer =
                 CudaBuffer::from_host(&self.stream, plan.plan_words(), self.provisioning).map_err(
                     |error| driver_error(format!("{} compaction plan", plan.arena), error),
@@ -6018,6 +6055,13 @@ impl DirectCuda {
             .synchronize()
             .map_err(|error| driver_error("compaction synchronization", error))?;
         drop(retained);
+        let destination_bytes = destinations
+            .iter()
+            .flatten()
+            .map(|destination| destination.len() * std::mem::size_of::<u64>())
+            .sum();
+        drop(destinations);
+        crate::phase_marks::mark("device_free", destination_bytes);
         if let Some(error) = readback_error {
             return Err(error);
         }

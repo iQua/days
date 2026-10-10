@@ -12,7 +12,9 @@
 //! On the borrowed path the result holds a clone; on the validated path it holds the moved
 //! states: the borrowed growth exceeds the validated growth by at least the states' size. On CUDA
 //! (sim), MoE smoke to 5 ms: states 246,192,128 B; borrowed growth 270,601,240 B both before and
-//! after c5 on the validated path, 21,767,192 B after. (Whether
+//! after c5 on the validated path, 21,767,192 B after. Since readback releases the device plan
+//! (design option 3(b)) it also drops the buffers' host-side tables before returning: 203,489,752
+//! B borrowed, -45,344,296 B validated. (Whether
 //! the clone raised the readback *peak* depends on the image: on the MoE smoke the peak is the
 //! gathered arenas, 644 MB above the run's live heap either way; at the flagship the clone,
 //! 8.2 GB, is part of it.)
