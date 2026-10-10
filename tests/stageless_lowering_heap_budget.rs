@@ -19,19 +19,22 @@
 //! * `FlowInput`, 376 B: the bound `compile.rs` asserts in
 //!   `flow_input_carries_its_stage_sidecars_out_of_line`, and the whole `FlowInput` table is live
 //!   at the peak (slimming it from 1,224 B lowered this marginal by exactly the 848 B difference);
-//! * everything else live at the peak, 597 B: measured as the marginal minus `FlowInput`, and the
-//!   same 597 B before and after the slimming (1,821 - 1,224 and 973 - 376), so it is not a
-//!   by-product of the change. It is the lowered image's own per-flow storage (295 B: descriptor,
-//!   routes, initial packet and event) plus lowering's transients, chiefly the flow-id map's
-//!   `FlowKey` clone (192 B) in its B-tree;
+//! * everything else live at the peak, 713 B: measured as the marginal minus `FlowInput` after P18
+//!   c3 Stage A. It is the lowered image's own per-flow storage (695 B: the generator, descriptor,
+//!   routes, initial packet and event) plus 18 B of lowering transient;
 //! * 128 B of headroom for container-layout drift between toolchains. It is below the 416 B of
 //!   the smaller stage sidecar, so re-inlining either sidecar fails the test.
 //!
-//! Per-host generator vectors do not appear in this marginal: `Vec` allocates at least four slots
-//! for elements of at most 1,024 B, so one and two generators per host occupy the same capacity.
-//!
 //! Before the slimming (6cc395c) the marginal is 1,821 B per flow and this test fails; after it,
-//! 973 B. Raw logs are in `days-gpu/evidence/P14/slim/`.
+//! 973 B. Raw logs are in `days-gpu/evidence/P14/slim/`. Until P18 the rest was 597 B (295 B of
+//! image, the per-host generator vectors hidden in their growth slack: `Vec` allocated at least
+//! four slots, so one and two generators per host occupied the same capacity; and 302 B of
+//! transient, chiefly the flow-id map's 192 B `FlowKey` clone). P18 c3 Stage A dropped the id map
+//! and sized every per-host table exactly, so the 352 B generator now appears in this marginal
+//! while the absolute peaks fell (66.1 to 54.2 MB at one set, 73.9 to 63.1 MB at two; days-gpu
+//! `evidence/P18/diet-host/`): the marginal went from 949 to 1,089 B per flow and the cap from
+//! 1,101 to 1,217 B. `tests/p18_lowering_transient_budget.rs` bounds the absolute per-flow peak of
+//! a stage-heavy lowering.
 //!
 //! # Retained image bytes per flow
 //!
@@ -130,11 +133,11 @@ const FIXTURE_SETS: usize = 32;
 
 /// `FlowInput`'s bound, asserted in `src/scenario/compile.rs`.
 const FLOW_INPUT_BYTES: u64 = 376;
-/// Every other per-flow byte live at the lowering peak, measured before and after the slimming.
-const OTHER_PEAK_BYTES_PER_FLOW: u64 = 597;
+/// Every other per-flow byte live at the lowering peak, measured after P18 c3 Stage A.
+const OTHER_PEAK_BYTES_PER_FLOW: u64 = 713;
 /// Headroom for container-layout drift; below the smaller stage sidecar's 416 B.
 const HEADROOM_BYTES_PER_FLOW: u64 = 128;
-/// The cap on the marginal peak heap per stageless flow: 1,101 B.
+/// The cap on the marginal peak heap per stageless flow: 1,217 B.
 const MAX_PEAK_BYTES_PER_FLOW: u64 =
     FLOW_INPUT_BYTES + OTHER_PEAK_BYTES_PER_FLOW + HEADROOM_BYTES_PER_FLOW;
 
