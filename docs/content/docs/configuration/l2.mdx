@@ -65,7 +65,7 @@ buffer_capacity = [0, 0, 0, 97756, 0, 0, 0, 0]
 
 A paused host keeps queuing what its flows send and transmits the first queued packet whose priority is not paused, as a switch port does. Pause and resume at a host appear in the PFC records with the host as the node and queue `0`.
 
-RoCE queue pairs also stop sending while their data class is paused at their host. The pacer's next tick sends nothing, adds no pacing credit, and parks the pacer. The resume restarts it at its next pacing tick after the resume. An ACK, NACK or timeout during the pause restarts the pacer as usual, and its next tick parks it again. Other flow types keep generating packets into the host queue while paused.
+RoCE queue pairs also stop sending while their data class is paused at their host. The pacer's next tick sends nothing, adds no pacing credit, and parks the pacer. The resume restarts it at its next pacing tick after the resume. An ACK, NACK or timeout during the pause restarts the pacer as usual, and its next tick parks it again. The rule is the same for a queue pair with `congestion_control = "none"` ([Without congestion control](/docs/configuration/flows#without-congestion-control)), whose pacing grid is the link-rate tick. Other flow types keep generating packets into the host queue while paused.
 
 Because the thresholds are per link, a port fed by many links can hold up to the sum of their `buffer_capacity` values before every link is paused. Size `xoff` and `buffer_capacity` so that this sum fits the switch queue (`switch.capacity` packets), or the queue drops before PFC holds it. `host_links` changes the lowered image only when it is `true`. It runs on Scalar, CPU, Metal, and CUDA.
 
