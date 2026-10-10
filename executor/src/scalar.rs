@@ -8,6 +8,7 @@ use num_bigint::BigUint;
 use num_rational::Ratio;
 
 use crate::fel::FutureEvents;
+use crate::packet_store::{PacketStore, Resident};
 use crate::stage_index::{HostStageIndex, HostStageSlot, ProbedTable, StageScanProbe};
 use crate::{
     Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorFeedbackAction,
@@ -1113,7 +1114,7 @@ pub(crate) struct TransitionState<'image> {
     /// queues are never paused carries one empty pointer and nothing else. Never serialized.
     switch_pfc_orders: Option<Box<PfcClassOrders>>,
     local_node: Option<NodeDescriptor>,
-    packets: BTreeMap<PayloadId, ResidentPacket>,
+    packets: PacketStore<ResidentPacket>,
     observation_mode: ObservationMode,
     summary: RunSummary,
     observed_packets: BTreeMap<PayloadId, PacketDescriptor>,
@@ -1202,6 +1203,13 @@ struct ResidentPacket {
     source_time_ns: Option<u64>,
     transmitters: u64,
     terminal: bool,
+}
+
+impl Resident for ResidentPacket {
+    #[inline]
+    fn payload(&self) -> PayloadId {
+        self.descriptor.id
+    }
 }
 
 pub(crate) enum LocalNodeState {
@@ -1522,7 +1530,7 @@ impl<'image> TransitionState<'image> {
         image: &'image SimulationImage,
         observation_mode: ObservationMode,
     ) -> Result<Self, ExecutionError> {
-        let mut packets = BTreeMap::new();
+        let mut packets = PacketStore::new();
         let tcp_sent_segments =
             crate::tcp_ledger::seed_image(image).map_err(tcp_segment_conflict_error)?;
         let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
@@ -1533,15 +1541,12 @@ impl<'image> TransitionState<'image> {
                 continue;
             }
             if packets
-                .insert(
-                    descriptor.id,
-                    ResidentPacket {
-                        descriptor,
-                        source_time_ns: None,
-                        transmitters: 0,
-                        terminal: false,
-                    },
-                )
+                .insert(ResidentPacket {
+                    descriptor,
+                    source_time_ns: None,
+                    transmitters: 0,
+                    terminal: false,
+                })
                 .is_some()
             {
                 return Err(ExecutionError::DuplicatePayload(descriptor.id));
@@ -1636,18 +1641,15 @@ impl<'image> TransitionState<'image> {
             }
         };
 
-        let mut resident = BTreeMap::new();
+        let mut resident = PacketStore::new();
         for descriptor in packets {
             if resident
-                .insert(
-                    descriptor.id,
-                    ResidentPacket {
-                        descriptor,
-                        source_time_ns: None,
-                        transmitters: 0,
-                        terminal: false,
-                    },
-                )
+                .insert(ResidentPacket {
+                    descriptor,
+                    source_time_ns: None,
+                    transmitters: 0,
+                    terminal: false,
+                })
                 .is_some()
             {
                 return Err(ExecutionError::DuplicatePayload(descriptor.id));
@@ -1750,15 +1752,12 @@ impl<'image> TransitionState<'image> {
                 Err(ExecutionError::DuplicatePayload(descriptor.id))
             };
         }
-        self.packets.insert(
-            descriptor.id,
-            ResidentPacket {
-                descriptor,
-                source_time_ns: None,
-                transmitters: 0,
-                terminal: false,
-            },
-        );
+        self.packets.insert(ResidentPacket {
+            descriptor,
+            source_time_ns: None,
+            transmitters: 0,
+            terminal: false,
+        });
         Ok(())
     }
 
@@ -1838,7 +1837,8 @@ impl<'image> TransitionState<'image> {
             summary: self.summary,
             resident_packets: self
                 .packets
-                .into_values()
+                .into_sorted()
+                .into_iter()
                 .map(|packet| packet.descriptor)
                 .collect(),
             tcp_segment_ledger: self
@@ -6673,15 +6673,12 @@ impl<'image> TransitionState<'image> {
         if self.packets.contains_key(&packet.id) {
             return Err(ExecutionError::DuplicatePayload(packet.id));
         }
-        self.packets.insert(
-            packet.id,
-            ResidentPacket {
-                descriptor: packet,
-                source_time_ns,
-                transmitters: 0,
-                terminal: false,
-            },
-        );
+        self.packets.insert(ResidentPacket {
+            descriptor: packet,
+            source_time_ns,
+            transmitters: 0,
+            terminal: false,
+        });
         Ok(())
     }
 
@@ -7202,12 +7199,13 @@ fn tcp_segment_conflict_error(conflict: crate::tcp_ledger::TcpSegmentConflict) -
 }
 
 fn resumable_packets(
-    packets: BTreeMap<PayloadId, ResidentPacket>,
+    packets: PacketStore<ResidentPacket>,
     tcp_sent_segments: &crate::tcp_ledger::TcpSegmentLedger,
 ) -> Vec<PacketDescriptor> {
     let mut descriptors = packets
+        .into_sorted()
         .into_iter()
-        .map(|(payload, packet)| (payload, packet.descriptor))
+        .map(|packet| (packet.descriptor.id, packet.descriptor))
         .collect::<BTreeMap<_, _>>();
     for packet in tcp_sent_segments.values().flat_map(BTreeMap::values) {
         descriptors.entry(packet.id).or_insert(*packet);
@@ -7495,7 +7493,7 @@ fn derive_switch_queue_bytes(
     image: &SimulationImage,
     switch_states: &[SwitchState],
     local_node: Option<NodeDescriptor>,
-    packets: &BTreeMap<PayloadId, ResidentPacket>,
+    packets: &PacketStore<ResidentPacket>,
 ) -> Result<DerivedSwitchQueues, ExecutionError> {
     let mut node_ids = vec![None; switch_states.len()];
     if let Some(node) = local_node {

@@ -44,6 +44,7 @@ mod merge_audit;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub mod metal;
 pub mod model;
+mod packet_store;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 mod planner_capacity;
 mod roce;
