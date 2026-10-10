@@ -7,8 +7,11 @@
 //! holds more slots than the store's high-water packet count) behind an open-addressing index of
 //! 16-B `(PayloadId, slot)` buckets with linear probing. An index growth step moves 16 B per
 //! packet, not the packet. Deletion shifts the rest of the probe run back (no tombstones), so
-//! churn never forces a growth step. The index hashes with a fixed multiply-shift
-//! (`bucket_of`), so even the layout is a pure function of the operations.
+//! churn never forces a growth step. A store that empties drops its slab and index and is an
+//! empty `Vec` again, so a queue owner that has drained (a switch port after a burst) holds
+//! nothing: on a CPU run the LPs' stores peak at different times, and kept slabs would add up.
+//! The index hashes with a fixed multiply-shift (`bucket_of`), so even the layout is a pure
+//! function of the operations.
 //!
 //! **Exactness.** The store answers point lookups only and has no iteration API; the one way out
 //! is `into_sorted`, which consumes it and returns the packets in ascending payload order, the
@@ -291,7 +294,14 @@ impl<V: Resident> PacketStore<V> {
                     .position(|packet| packet.payload() == *payload)?;
                 Some(packets.swap_remove(position))
             }
-            Repr::Large(slab) => slab.remove(payload.0),
+            Repr::Large(slab) => {
+                let removed = slab.remove(payload.0);
+                if slab.len == 0 {
+                    // Release the slab and its index: a queue owner that drained keeps nothing.
+                    self.0 = Repr::Small(Vec::new());
+                }
+                removed
+            }
         }
     }
 
