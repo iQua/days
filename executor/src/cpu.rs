@@ -1223,10 +1223,58 @@ struct ClassifiedReturnBatch<'image> {
     envelopes: Vec<RemoteEnvelope>,
 }
 
-#[derive(Clone, Copy, Default)]
-struct OwnerBatchMetadata {
-    batches: u64,
-    minimum_ns: Option<u64>,
+/// The owners one worker sent a remote batch to in one round: one bit per owner, held inline for
+/// up to 128 workers, so a worker's round reply carries no heap block for the coordinator to free.
+#[derive(Clone, Debug)]
+enum OwnerSet {
+    Inline(u128),
+    Wide(Box<[u64]>),
+}
+
+impl OwnerSet {
+    fn new(workers: usize) -> Self {
+        if workers <= 128 {
+            Self::Inline(0)
+        } else {
+            Self::Wide(vec![0; workers.div_ceil(64)].into_boxed_slice())
+        }
+    }
+
+    fn insert(&mut self, owner: usize) {
+        match self {
+            Self::Inline(bits) => *bits |= 1_u128 << owner,
+            Self::Wide(words) => words[owner / 64] |= 1_u64 << (owner % 64),
+        }
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Self::Inline(bits) => u64::from(bits.count_ones()),
+            Self::Wide(words) => words.iter().map(|word| u64::from(word.count_ones())).sum(),
+        }
+    }
+
+    /// Calls `visit` with every owner in the set, in ascending order.
+    fn for_each(&self, mut visit: impl FnMut(usize)) {
+        match self {
+            Self::Inline(bits) => {
+                let mut rest = *bits;
+                while rest != 0 {
+                    visit(rest.trailing_zeros() as usize);
+                    rest &= rest - 1;
+                }
+            }
+            Self::Wide(words) => {
+                for (index, word) in words.iter().enumerate() {
+                    let mut rest = *word;
+                    while rest != 0 {
+                        visit(index * 64 + rest.trailing_zeros() as usize);
+                        rest &= rest - 1;
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1492,7 +1540,10 @@ enum OwnedWorkerReply<'image> {
         worker: usize,
         round: u64,
         executed: ExecutedLps,
-        outbox_metadata: Vec<OwnerBatchMetadata>,
+        /// Owners this worker sent a remote batch to this round.
+        outbound_owners: OwnerSet,
+        /// The earliest remote event this worker sent this round.
+        outbound_minimum_ns: Option<u64>,
         inbound_frontier_updates: u64,
         inbound_heap_pops: u64,
         inbound_physical_lp_probes: u64,
@@ -1876,7 +1927,8 @@ fn classified_worker_loop<'image>(
                 let mut remote_by_owner = (0..config.workers)
                     .map(|_| Vec::new())
                     .collect::<Vec<Vec<RemoteEnvelope>>>();
-                let mut outbox_metadata = vec![OwnerBatchMetadata::default(); config.workers];
+                let mut outbound_owners = OwnerSet::new(config.workers);
+                let mut outbound_minimum_ns: Option<u64> = None;
                 for (dispatch_order, mut active) in assigned.into_iter().enumerate() {
                     let lp_started = Instant::now();
                     let started_after_ns =
@@ -1952,13 +2004,12 @@ fn classified_worker_loop<'image>(
                 }
                 for owner in 0..config.workers {
                     if !remote_by_owner[owner].is_empty() {
-                        outbox_metadata[owner] = OwnerBatchMetadata {
-                            batches: 1,
-                            minimum_ns: remote_by_owner[owner]
-                                .iter()
-                                .map(|envelope| envelope.event.key.time_ns)
-                                .min(),
-                        };
+                        outbound_owners.insert(owner);
+                        outbound_minimum_ns = remote_by_owner[owner]
+                            .iter()
+                            .map(|envelope| envelope.event.key.time_ns)
+                            .chain(outbound_minimum_ns)
+                            .min();
                     }
                     if return_routes[owner]
                         .send(ClassifiedReturnBatch {
@@ -2014,7 +2065,8 @@ fn classified_worker_loop<'image>(
                         worker: shard.worker,
                         round,
                         executed,
-                        outbox_metadata,
+                        outbound_owners,
+                        outbound_minimum_ns,
                         inbound_frontier_updates: 0,
                         inbound_heap_pops: 0,
                         inbound_physical_lp_probes: 0,
@@ -2167,19 +2219,18 @@ fn owned_worker_loop<'image>(
                         return;
                     }
                 };
-                let mut outbox_metadata = vec![OwnerBatchMetadata::default(); config.workers];
+                let mut outbound_owners = OwnerSet::new(config.workers);
+                let mut outbound_minimum_ns: Option<u64> = None;
                 for (owner, envelopes) in remote_by_owner.into_iter().enumerate() {
                     if envelopes.is_empty() {
                         continue;
                     }
-                    let minimum_ns = envelopes
+                    outbound_owners.insert(owner);
+                    outbound_minimum_ns = envelopes
                         .iter()
                         .map(|envelope| envelope.event.key.time_ns)
+                        .chain(outbound_minimum_ns)
                         .min();
-                    outbox_metadata[owner] = OwnerBatchMetadata {
-                        batches: 1,
-                        minimum_ns,
-                    };
                     if routes[owner]
                         .remote
                         .send(StaticOwnerBatch { round, envelopes })
@@ -2196,7 +2247,8 @@ fn owned_worker_loop<'image>(
                         worker: shard.worker,
                         round,
                         executed,
-                        outbox_metadata,
+                        outbound_owners,
+                        outbound_minimum_ns,
                         inbound_frontier_updates: inbound.frontier_updates,
                         inbound_heap_pops: inbound.heap_pops,
                         inbound_physical_lp_probes: inbound.physical_lp_probes,
@@ -2748,7 +2800,12 @@ fn run_owned_static_coordinator<'image>(
         }
     }
 
+    let classified = config.straggler_threshold_events.is_some();
+    // Per-round scratch, allocated once: the coordinator allocates nothing per round.
     let mut expected_inbound_batches = vec![0_u64; config.workers];
+    let mut completed = vec![false; config.workers];
+    let mut worker_busy_ns = vec![0_u64; config.workers];
+    let mut inbound_busy_by_worker = vec![0_u64; config.workers];
     let mut previous_horizon = None;
     let mut metrics = CpuMetricsCollector::new(retention);
     let mut round_number = 0_u64;
@@ -2775,18 +2832,17 @@ fn run_owned_static_coordinator<'image>(
         }
         let coordinator_partition_ns = elapsed_ns(partition_started);
 
+        // The replies are folded as they arrive. The next round's per-owner batch counts start
+        // from zero now that this round's commands carry the previous counts.
         let wait_started = Instant::now();
-        let mut completed = vec![false; config.workers];
-        let mut next_local_minima = vec![None; config.workers];
-        let mut worker_busy_ns = vec![0_u64; config.workers];
+        expected_inbound_batches.fill(0);
+        completed.fill(false);
+        worker_busy_ns.fill(0);
+        inbound_busy_by_worker.fill(0);
         let mut executed_lps = RoundLpsGathered::new();
-        let mut outbox_metadata_by_worker = (0..config.workers)
-            .map(|_| None)
-            .collect::<Vec<Option<Vec<OwnerBatchMetadata>>>>();
         let mut inbound_frontier_updates = 0_u64;
         let mut inbound_frontier_heap_pops = 0_u64;
         let mut inbound_physical_lp_probes = 0_u64;
-        let mut inbound_busy_by_worker = vec![0_u64; config.workers];
         let mut inbound_batches = 0_u64;
         let mut inbound_early_batches = 0_u64;
         let mut inbound_early_busy_ns = 0_u64;
@@ -2800,7 +2856,8 @@ fn run_owned_static_coordinator<'image>(
                     worker,
                     round,
                     executed,
-                    outbox_metadata,
+                    outbound_owners,
+                    outbound_minimum_ns,
                     inbound_frontier_updates: inbound_updates,
                     inbound_heap_pops,
                     inbound_physical_lp_probes: inbound_probes,
@@ -2815,10 +2872,32 @@ fn run_owned_static_coordinator<'image>(
                     busy_ns,
                 } if round == round_number && !completed[worker] => {
                     completed[worker] = true;
-                    next_local_minima[worker] = minimum_ns;
+                    // The next frontier is the least of every worker's local minimum and every
+                    // remote event sent this round; which owner holds a remote event does not
+                    // change that minimum. A classified round has already merged its remote
+                    // events into their owners.
+                    minima[worker] = if classified {
+                        minimum_ns
+                    } else {
+                        minimum_ns.into_iter().chain(outbound_minimum_ns).min()
+                    };
                     worker_busy_ns[worker] = busy_ns;
                     executed_lps.gather(executed)?;
-                    outbox_metadata_by_worker[worker] = Some(outbox_metadata);
+                    owner_batch_messages = owner_batch_messages
+                        .checked_add(outbound_owners.len())
+                        .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
+                    if !classified {
+                        let mut overflow = false;
+                        outbound_owners.for_each(|owner| {
+                            match expected_inbound_batches[owner].checked_add(1) {
+                                Some(count) => expected_inbound_batches[owner] = count,
+                                None => overflow = true,
+                            }
+                        });
+                        if overflow {
+                            return Err(ExecutionError::CounterOverflow(NodeId(0)));
+                        }
+                    }
                     inbound_frontier_updates =
                         inbound_frontier_updates.saturating_add(inbound_updates);
                     inbound_frontier_heap_pops =
@@ -2873,49 +2952,11 @@ fn run_owned_static_coordinator<'image>(
             previous.early_owner_merge_ns = previous
                 .early_owner_merge_ns
                 .saturating_add(inbound_early_busy_ns);
-            for (worker, busy_ns) in inbound_busy_by_worker.into_iter().enumerate() {
-                add_worker_merge_timing(previous, worker, busy_ns);
-            }
+            add_worker_merge_timings(previous, &inbound_busy_by_worker);
         }
 
-        let exchange_started = Instant::now();
-        let classified = config.straggler_threshold_events.is_some();
-        let mut next_expected_inbound_batches = vec![0_u64; config.workers];
-        let mut inbox_minima: Vec<Option<u64>> = vec![None; config.workers];
-        for metadata in outbox_metadata_by_worker.into_iter().flatten() {
-            for (owner, metadata) in metadata.into_iter().enumerate() {
-                if !classified {
-                    next_expected_inbound_batches[owner] = next_expected_inbound_batches[owner]
-                        .checked_add(metadata.batches)
-                        .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
-                }
-                owner_batch_messages = owner_batch_messages
-                    .checked_add(metadata.batches)
-                    .ok_or(ExecutionError::CounterOverflow(NodeId(0)))?;
-                if !classified {
-                    if let Some(remote) = metadata.minimum_ns {
-                        inbox_minima[owner] = match inbox_minima[owner] {
-                            Some(current) => Some(current.min(remote)),
-                            None => Some(remote),
-                        };
-                    }
-                }
-            }
-        }
-        for worker in 0..config.workers {
-            minima[worker] = if classified {
-                next_local_minima[worker]
-            } else {
-                match (next_local_minima[worker], inbox_minima[worker]) {
-                    (Some(local), Some(remote)) => Some(local.min(remote)),
-                    (Some(local), None) => Some(local),
-                    (None, Some(remote)) => Some(remote),
-                    (None, None) => None,
-                }
-            };
-        }
-        expected_inbound_batches = next_expected_inbound_batches;
-        let coordinator_exchange_ns = elapsed_ns(exchange_started);
+        // The exchange (next minima and per-owner batch counts) was folded into the replies.
+        let coordinator_exchange_ns = 0;
 
         let round_lps = match metrics.records() {
             CpuRoundRecords::PerRound => {
@@ -3095,9 +3136,7 @@ fn run_owned_static_coordinator<'image>(
         last.early_owner_merge_ns = last
             .early_owner_merge_ns
             .saturating_add(inbound_early_busy_ns);
-        for (worker, busy_ns) in inbound_busy_by_worker.into_iter().enumerate() {
-            add_worker_merge_timing(last, worker, busy_ns);
-        }
+        add_worker_merge_timings(last, &inbound_busy_by_worker);
     }
     Ok(CollectedCpuRun {
         result: assemble_result(image, lps, observation_mode)?,
@@ -3193,15 +3232,24 @@ fn tallied_round_lps(gathered: &RoundLpsGathered, classified: bool) -> RoundLps 
     }
 }
 
-fn add_worker_merge_timing(round: &mut CpuRoundMetrics, worker: usize, busy_ns: u64) {
-    if busy_ns == 0 {
+/// Adds each worker's late owner-merge time to `round`'s worker timings, then recomputes the
+/// round's worker efficiency and utilization once, from the final timings.
+fn add_worker_merge_timings(round: &mut CpuRoundMetrics, busy_by_worker: &[u64]) {
+    let mut changed = false;
+    for (worker, busy_ns) in busy_by_worker.iter().copied().enumerate() {
+        if busy_ns == 0 {
+            continue;
+        }
+        let Some(timing) = round.worker_timings.get_mut(worker) else {
+            continue;
+        };
+        timing.busy_ns = timing.busy_ns.saturating_add(busy_ns);
+        timing.idle_ns = round.round_wall_time_ns.saturating_sub(timing.busy_ns);
+        changed = true;
+    }
+    if !changed {
         return;
     }
-    let Some(timing) = round.worker_timings.get_mut(worker) else {
-        return;
-    };
-    timing.busy_ns = timing.busy_ns.saturating_add(busy_ns);
-    timing.idle_ns = round.round_wall_time_ns.saturating_sub(timing.busy_ns);
     round.worker_parallel_efficiency = efficiency(
         round.worker_timings.iter().map(|timing| timing.busy_ns),
         round.worker_timings.len(),
@@ -4926,6 +4974,25 @@ fn route_load_estimator_uses_only_declared_routes_and_generator_rates() {
     assert_eq!(loads[NodeId(2).0 as usize], 2 * scale);
     assert_eq!(loads[NodeId(3).0 as usize], 0);
     assert_eq!(loads[NodeId(4).0 as usize], 0);
+}
+
+#[test]
+fn owner_sets_hold_every_owner_inline_and_wide() {
+    for workers in [1, 2, 64, 128, 129, 200] {
+        let owners = (0..workers)
+            .filter(|owner| owner % 3 != 1)
+            .collect::<Vec<_>>();
+        let mut set = OwnerSet::new(workers);
+        assert_eq!(matches!(set, OwnerSet::Inline(_)), workers <= 128);
+        for owner in owners.iter().rev() {
+            set.insert(*owner);
+            set.insert(*owner);
+        }
+        let mut seen = Vec::new();
+        set.for_each(|owner| seen.push(owner));
+        assert_eq!(seen, owners, "workers={workers}");
+        assert_eq!(set.len(), owners.len() as u64);
+    }
 }
 
 #[test]
