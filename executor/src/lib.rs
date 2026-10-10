@@ -33,6 +33,7 @@ pub mod device_sizing;
 mod device_stage;
 pub mod ecn_ramp;
 pub mod event;
+mod fel;
 pub mod image;
 mod mechanism_trace;
 #[cfg(any(

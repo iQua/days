@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use crossbeam::channel::{Receiver, RecvError, Select, Sender, TryRecvError, bounded, unbounded};
 
 use crate::event::{EventFelClass, event_fel_class, is_same_time_tx_ready_continuation};
+use crate::fel::FutureEvents;
 use crate::safe_horizon::{LpRoundWork, RoundMetrics};
 use crate::scalar::{
     DiagnosticPlanes, ExecutionError, LocalNodeState, LocalTransitionResult, ObservationMode,
@@ -659,23 +660,18 @@ struct CpuLp<'image> {
     lp_slot: usize,
     node: NodeDescriptor,
     transitions: TransitionState<'image>,
-    futures: BTreeMap<EventKey, Event>,
+    futures: FutureEvents,
     pinned_packets: BTreeSet<PayloadId>,
 }
 
 impl CpuLp<'_> {
     fn next_key(&self) -> Option<EventKey> {
-        self.futures.first_key_value().map(|(key, _)| *key)
+        self.futures.peek_key()
     }
 
     fn estimated_work(&self, exclusive_horizon_ns: u128) -> Result<u64, ExecutionError> {
-        u64::try_from(
-            self.futures
-                .values()
-                .take_while(|event| u128::from(event.key.time_ns) < exclusive_horizon_ns)
-                .count(),
-        )
-        .map_err(|_| ExecutionError::CounterOverflow(self.node.id))
+        u64::try_from(self.futures.count_below(exclusive_horizon_ns))
+            .map_err(|_| ExecutionError::CounterOverflow(self.node.id))
     }
 
     fn drain(
@@ -696,8 +692,8 @@ impl CpuLp<'_> {
         while continuation.is_some()
             || self
                 .futures
-                .first_key_value()
-                .is_some_and(|(key, _)| u128::from(key.time_ns) < exclusive_horizon_ns)
+                .peek_key()
+                .is_some_and(|key| u128::from(key.time_ns) < exclusive_horizon_ns)
         {
             if let Some(fault) = fault {
                 if fault.worker == worker
@@ -717,9 +713,8 @@ impl CpuLp<'_> {
                 event
             } else {
                 self.futures
-                    .pop_first()
-                    .expect("first_key_value established a pending event")
-                    .1
+                    .pop()?
+                    .expect("peek_key established a pending event")
             };
             let preserved_packet = if self.pinned_packets.contains(&event.payload) {
                 Some(self.transitions.packet_descriptor(event.payload)?)
@@ -736,7 +731,7 @@ impl CpuLp<'_> {
             self.transitions.take_superseded_timers(&mut superseded);
             for timer in superseded.drain(..) {
                 debug_assert_eq!(timer.target, self.node.id);
-                crate::scalar::remove_superseded_timer(&mut self.futures, timer)?;
+                self.futures.remove_superseded_timer(timer)?;
             }
             let direct_child = match children.as_slice() {
                 [child]
@@ -744,7 +739,7 @@ impl CpuLp<'_> {
                         event,
                         *child,
                         self.node.id,
-                        self.futures.first_key_value().map(|(key, _)| *key),
+                        self.futures.peek_key(),
                     ) =>
                 {
                     Some(*child)
@@ -756,12 +751,13 @@ impl CpuLp<'_> {
                     if direct_child == Some(child) {
                         continuation = Some(child);
                         same_time_continuations = same_time_continuations.saturating_add(1);
-                    } else if self.futures.insert(child.key, child).is_some() {
-                        return Err(ExecutionError::DuplicateEventKey(child.key));
-                    } else if event_fel_class(child.kind) == EventFelClass::FallbackHeap {
-                        fallback_classified_pushes = fallback_classified_pushes
-                            .checked_add(1)
-                            .ok_or(ExecutionError::CounterOverflow(self.node.id))?;
+                    } else {
+                        self.futures.insert(child)?;
+                        if event_fel_class(child.kind) == EventFelClass::FallbackHeap {
+                            fallback_classified_pushes = fallback_classified_pushes
+                                .checked_add(1)
+                                .ok_or(ExecutionError::CounterOverflow(self.node.id))?;
+                        }
                     }
                 } else {
                     if outbox_capacity.is_some_and(|capacity| outbox.len() >= capacity) {
@@ -781,10 +777,10 @@ impl CpuLp<'_> {
                 .ok_or(ExecutionError::CounterOverflow(self.node.id))?;
         }
 
-        if let Some((key, _)) = self.futures.first_key_value() {
+        if let Some(key) = self.futures.peek_key() {
             if u128::from(key.time_ns) < exclusive_horizon_ns {
                 return Err(ExecutionError::EventBelowHorizonAfterDrain {
-                    key: *key,
+                    key,
                     exclusive_horizon_ns,
                 });
             }
@@ -3178,7 +3174,7 @@ fn build_lps<'image>(
         return Err(ExecutionError::DuplicatePayload(duplicate.id));
     }
     let mut futures = (0..image.nodes.len())
-        .map(|_| BTreeMap::new())
+        .map(|_| FutureEvents::new())
         .collect::<Vec<_>>();
     let mut packets = (0..image.nodes.len())
         .map(|_| BTreeMap::new())
@@ -3217,9 +3213,7 @@ fn build_lps<'image>(
         }
         let lp_slot =
             node_slot(image, event.target).ok_or(ExecutionError::UnknownNode(event.target))?;
-        if futures[lp_slot].insert(event.key, event).is_some() {
-            return Err(ExecutionError::DuplicateEventKey(event.key));
-        }
+        futures[lp_slot].insert(event)?;
         if event.kind == crate::EventKind::RetransmissionTimeout {
             continue;
         }
@@ -3569,13 +3563,14 @@ fn assemble_result(
 
     for lp in lps {
         let mut referenced = lp.pinned_packets;
+        let lp_pending = lp.futures.into_sorted_vec()?;
         referenced.extend(
-            lp.futures
-                .values()
+            lp_pending
+                .iter()
                 .filter(|event| event.kind != crate::EventKind::TxReady)
                 .map(|event| event.payload),
         );
-        pending_events.extend(lp.futures.into_values());
+        pending_events.extend(lp_pending);
         let local = lp.transitions.finish_local();
         add_state_payloads(&local, &mut referenced);
         install_local_result(
@@ -4104,13 +4099,7 @@ impl<'image> WorkerShard<'image> {
                     });
                 }
                 lp.transitions.install_packet(envelope.packet)?;
-                if lp
-                    .futures
-                    .insert(envelope.event.key, envelope.event)
-                    .is_some()
-                {
-                    return Err(ExecutionError::DuplicateEventKey(envelope.event.key));
-                }
+                lp.futures.insert(envelope.event)?;
             }
             self.frontier
                 .update(owner_slot, target, lp.next_key(), &mut physical_lp_probes)?;
@@ -4762,13 +4751,7 @@ impl<'image> WorkerShard<'image> {
                     });
                 }
                 lp.transitions.install_packet(envelope.packet)?;
-                if lp
-                    .futures
-                    .insert(envelope.event.key, envelope.event)
-                    .is_some()
-                {
-                    return Err(ExecutionError::DuplicateEventKey(envelope.event.key));
-                }
+                lp.futures.insert(envelope.event)?;
             }
             self.frontier
                 .update(owner_slot, target, lp.next_key(), &mut physical_lp_probes)?;

@@ -1,12 +1,13 @@
 //! Canonical serial priority-queue execution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
 use num_bigint::BigUint;
 use num_rational::Ratio;
 
+use crate::fel::FutureEvents;
 use crate::stage_index::{HostStageIndex, HostStageSlot, ProbedTable, StageScanProbe};
 use crate::{
     Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorFeedbackAction,
@@ -880,27 +881,23 @@ fn run_scalar_events<'image>(
     let mut children = Vec::new();
     let mut superseded = Vec::new();
 
-    while events.first_key_value().is_some_and(|(key, _)| {
+    while events.peek_key().is_some_and(|key| {
         key.time_ns <= image.stop_time_ns
             && exclusive_horizon_ns.is_none_or(|horizon_ns| key.time_ns < horizon_ns)
     }) {
-        let (_, event) = events
-            .pop_first()
-            .expect("first_key_value established a pending event");
+        let event = events.pop()?.expect("peek_key established a pending event");
         transitions.dispatch(event, &mut children)?;
         after_dispatch(&transitions, event);
         transitions.take_superseded_timers(&mut superseded);
         for timer in superseded.drain(..) {
-            remove_superseded_timer(&mut events, timer)?;
+            events.remove_superseded_timer(timer)?;
         }
         for child in children.drain(..) {
-            if events.insert(child.key, child).is_some() {
-                return Err(ExecutionError::DuplicateEventKey(child.key));
-            }
+            events.insert(child)?;
         }
     }
 
-    Ok((transitions, events.into_values().collect()))
+    Ok((transitions, events.into_sorted_vec()?))
 }
 
 /// Test hook: a Scalar run with the number of events it dispatched and the number of
@@ -1174,7 +1171,8 @@ impl SupersededTimer {
     }
 }
 
-/// Removes the event carrying a superseded timer identity from one ordered future-event map.
+/// Removes the event carrying a superseded timer identity from one ordered future-event map: the
+/// retransmission-timeout map of a `FutureEvents`, or a Scalar-rounds LP's whole map.
 ///
 /// The canonical owner of a timer identity is the minimum-`EventKey` event carrying it, which is
 /// also the event the lazy recognition would have consumed first. Removal is therefore exact even
@@ -7639,14 +7637,16 @@ fn indexed_lookup<T>(table: &[T], id: u64, matches_id: impl Fn(&T) -> bool) -> O
     indexed.or_else(|| table.iter().find(|descriptor| matches_id(descriptor)))
 }
 
-fn initial_event_queue(
-    image: &SimulationImage,
-) -> Result<BTreeMap<EventKey, Event>, ExecutionError> {
-    let mut events = BTreeMap::new();
+/// The image's initial events as the run's future-event list. A duplicate key is refused here, at
+/// the first event in image order that repeats an earlier key, as the ordered map refused it.
+fn initial_event_queue(image: &SimulationImage) -> Result<FutureEvents, ExecutionError> {
+    let mut keys = BTreeSet::new();
+    let mut events = FutureEvents::with_capacity(image.initial_events.len());
     for event in image.initial_events.iter().copied() {
-        if events.insert(event.key, event).is_some() {
+        if !keys.insert(event.key) {
             return Err(ExecutionError::DuplicateEventKey(event.key));
         }
+        events.insert(event)?;
     }
     Ok(events)
 }
