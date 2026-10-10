@@ -393,6 +393,8 @@ constexpr uint G_ROCE_SND_UNA = 17;
 constexpr uint G_ROCE_WINDOW = 36;
 constexpr uint G_ROCE_VARIABLE_WINDOW = 37;
 constexpr uint G_ROCE_WINDOW_PARKED = 38;
+// P17 lane nocc: 0 under DCQCN, 1 without congestion control (`RoceCongestionControl`).
+constexpr uint G_ROCE_CONGESTION_CONTROL = 39;
 constexpr uint G_ROCE_PACER_ARMED = 40;
 constexpr uint G_ROCE_RTO_DEADLINE = 41;
 constexpr uint G_ROCE_RTO = 42;
@@ -5136,7 +5138,8 @@ __device__ __forceinline__ bool roce_pacing_tick(
 // rewinds the next PSN to it (Go-back-N). Every advance or rewind restarts the timeout, removing
 // the superseded record in this transition (the live-state contract), and restarts a parked pacer.
 // The controller's due instants before the arrival apply first; the ACK that completes the pair
-// freezes the controller; otherwise an ECN echo is a feedback (P16 rulings D2, D4, D11).
+// freezes the controller; otherwise an ECN echo is a feedback (P16 rulings D2, D4, D11), except for
+// a pair without congestion control, whose sender ignores it (P17).
 __device__ __forceinline__ bool roce_feedback_arrival(
     ulong node,
     const ulong *event,
@@ -5213,8 +5216,12 @@ __device__ __forceinline__ bool roce_feedback_arrival(
     if (snd_una_before < total && row[G_ROCE_SND_UNA] >= total) {
         dcqcn_settle(row, now);
     }
-    // Word 2 of an ACK or NACK: the packet size in bits 0..32, the ECN echo in bit 32.
-    if ((event[PK_META_2] >> 32) != 0 && row[G_ROCE_SND_UNA] < total) {
+    // Word 2 of an ACK or NACK: the packet size in bits 0..32, the ECN echo in bit 32. A pair
+    // without congestion control (P17) ignores the echo; its inert controller is never armed, so
+    // the settle above returns at once for it. The mode is tested last: a DCQCN pair reads it only
+    // on an echoing ACK or NACK.
+    if ((event[PK_META_2] >> 32) != 0 && row[G_ROCE_SND_UNA] < total &&
+        row[G_ROCE_CONGESTION_CONTROL] == 0) {
         dcqcn_on_feedback(row, now);
     }
     roce_settle(row, row[G_STATUS]);

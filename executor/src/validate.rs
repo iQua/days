@@ -1688,6 +1688,19 @@ fn validate_roce_generator(
     // with no pending event, its anchors at zero (ruling C5). Its release arms the pacer.
     let unreleased = generator.stage.is_some_and(|stage| !stage.activated);
     let controller = roce.controller;
+    // P17 (checked first, so its refusal names the mode): a pair without congestion control holds exactly the inert fixed-rate controller at its
+    // configured rate (no transition ever moves it), and no variable window (its rate never
+    // moves, so the window could only be fixed).
+    if roce.congestion_control == crate::RoceCongestionControl::None {
+        if controller != crate::DcqcnController::fixed_rate(controller.config.initial_rate_bps) {
+            return Err(invalid(
+                "without congestion control holds a controller that is not the inert fixed-rate controller",
+            ));
+        }
+        if roce.variable_window {
+            return Err(invalid("without congestion control has a variable window"));
+        }
+    }
     controller
         .config
         .validate()

@@ -56,11 +56,12 @@ pub fn struct_fields<T: for<'de> Deserialize<'de>>() -> &'static [&'static str] 
     }
 }
 
-/// For a TOML error refusing an unknown key, the table it sits in: `` `[header]` `` (the nearest
-/// table header above it, or the header that names the unknown key as its last segment), or
-/// `the root table`. `None` for any other error.
+/// For a TOML error refusing an unknown key, or an unknown value of an enumerated key (P17: the
+/// error's span is then the value, on the key's line), the table it sits in: `` `[header]` ``
+/// (the nearest table header above it, or the header that names the unknown key as its last
+/// segment), or `the root table`. `None` for any other error.
 pub fn unknown_key_table(content: &str, error: &toml::de::Error) -> Option<String> {
-    if !error.message().contains("unknown field") {
+    if !error.message().contains("unknown field") && !error.message().contains("unknown variant") {
         return None;
     }
     Some(table_at(content, error.span()?.start))

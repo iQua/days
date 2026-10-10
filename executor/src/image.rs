@@ -699,15 +699,34 @@ pub struct RocePacer {
     pub credit_quanta: u128,
 }
 
-/// A RoCE queue pair: a reliable DCQCN flow with Go-back-N.
+/// The congestion control of a RoCE queue pair (P17 lane nocc, user ruling Oct 9).
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RoceCongestionControl {
+    /// The Mellanox-form DCQCN reaction point (P16), fed by the ECN echo of ACKs and NACKs.
+    #[default]
+    Dcqcn = 0,
+    /// No congestion control: the pair paces at a fixed rate (its host's line rate, as lowered).
+    /// Its `controller` is [`DcqcnController::fixed_rate`], never armed, and its sender ignores
+    /// the ECN echo, so no controller transition ever runs (switches still mark its data and its
+    /// receiver still echoes the mark).
+    None = 1,
+}
+
+/// A RoCE queue pair: a reliable flow with Go-back-N, under DCQCN or without congestion control.
 ///
 /// The exact Mellanox-form DCQCN reaction point (`controller`, with lazy timers and no timer event)
 /// paces a Go-back-N sender. A PSN is the byte offset of a packet's first byte, and packet `psn`
 /// is `min(mtu_bytes, total_bytes - psn)` bytes, so a retransmission is a pure function of its
 /// PSN and no segment ledger exists. The high-water mark is `FlowGeneratorState::bytes_emitted`,
 /// which counts first transmissions only, as TCP's does.
+///
+/// A pair without congestion control (`congestion_control == None`, P17) holds the inert
+/// fixed-rate controller, whose rate never changes. The mode byte sits in the struct's tail
+/// padding, so the pair stays 240 B, and its `Debug` rendering names it only for such a pair, so
+/// every DCQCN pair renders exactly as before P17.
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub struct RoceGenerator {
     pub pacer: RocePacer,
     pub controller: DcqcnController,
@@ -734,6 +753,32 @@ pub struct RoceGenerator {
     /// Only an ACK or NACK that moves `snd_una`, or a timeout, restarts such a pacer; a host
     /// RESUME does not (it restarts pause-parked pacers), so the bit keeps the two apart.
     pub window_parked: bool,
+    /// P17: DCQCN, or no congestion control.
+    pub congestion_control: RoceCongestionControl,
+}
+
+/// The derived rendering, field for field, with `congestion_control` appended only for a pair
+/// without congestion control: a DCQCN pair's complete-state bytes are those of `main` before P17.
+impl fmt::Debug for RoceGenerator {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut debug = formatter.debug_struct("RoceGenerator");
+        debug
+            .field("pacer", &self.pacer)
+            .field("controller", &self.controller)
+            .field("pacing_timer_payload", &self.pacing_timer_payload)
+            .field("next_psn", &self.next_psn)
+            .field("snd_una", &self.snd_una)
+            .field("rto_deadline_ns", &self.rto_deadline_ns)
+            .field("rto_ns", &self.rto_ns)
+            .field("window_bytes", &self.window_bytes)
+            .field("pacer_armed", &self.pacer_armed)
+            .field("variable_window", &self.variable_window)
+            .field("window_parked", &self.window_parked);
+        if self.congestion_control != RoceCongestionControl::Dcqcn {
+            debug.field("congestion_control", &self.congestion_control);
+        }
+        debug.finish()
+    }
 }
 
 /// Fixed-width result of routing an ordinary feedback packet into a source generator.
@@ -1253,6 +1298,89 @@ mod tests {
     /// feedback priority uses padding after `priority`, and every new packet header fits the
     /// 24 B the TCP headers already reserve. Layout is the compiler's choice, so these are upper
     /// bounds on 64-bit targets.
+    /// P17 lane nocc: the congestion-control mode lives in the queue pair's tail padding, so a
+    /// queue pair stays 240 B, the tagged generator kind 272 B and a generator 352 B, exactly as
+    /// on `main` (3ebb462).
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_queue_pair_mode_costs_no_byte() {
+        assert_eq!(std::mem::size_of::<RoceGenerator>(), 240);
+        assert_eq!(std::mem::size_of::<super::FlowGeneratorKind>(), 272);
+        assert_eq!(std::mem::size_of::<super::FlowGeneratorState>(), 352);
+        assert_eq!(std::mem::size_of::<super::RoceCongestionControl>(), 1);
+    }
+
+    /// P17 lane nocc: a DCQCN queue pair renders exactly as the derived `Debug` of the pre-P17
+    /// struct, so its complete-state bytes do not move; a pair without congestion control appends
+    /// its mode.
+    #[test]
+    fn a_dcqcn_queue_pair_renders_as_the_pre_p17_derive() {
+        mod pre_p17 {
+            #[allow(dead_code)]
+            #[derive(Debug)]
+            pub struct RoceGenerator {
+                pub pacer: crate::RocePacer,
+                pub controller: crate::DcqcnController,
+                pub pacing_timer_payload: crate::PayloadId,
+                pub next_psn: u64,
+                pub snd_una: u64,
+                pub rto_deadline_ns: u64,
+                pub rto_ns: u64,
+                pub window_bytes: u64,
+                pub pacer_armed: bool,
+                pub variable_window: bool,
+                pub window_parked: bool,
+            }
+        }
+        let roce = RoceGenerator {
+            pacer: super::RocePacer {
+                first_pacing_time_ns: 1,
+                pacing_interval_ns: 2,
+                mtu_bytes: 3,
+                total_bytes: 4,
+                credit_quanta: 5,
+            },
+            controller: crate::DcqcnController::fixed_rate(1_000),
+            pacing_timer_payload: super::PayloadId(6),
+            next_psn: 7,
+            snd_una: 8,
+            rto_deadline_ns: 9,
+            rto_ns: 10,
+            window_bytes: 11,
+            pacer_armed: true,
+            variable_window: false,
+            window_parked: true,
+            congestion_control: super::RoceCongestionControl::Dcqcn,
+        };
+        let mirror = pre_p17::RoceGenerator {
+            pacer: roce.pacer,
+            controller: roce.controller,
+            pacing_timer_payload: roce.pacing_timer_payload,
+            next_psn: roce.next_psn,
+            snd_una: roce.snd_una,
+            rto_deadline_ns: roce.rto_deadline_ns,
+            rto_ns: roce.rto_ns,
+            window_bytes: roce.window_bytes,
+            pacer_armed: roce.pacer_armed,
+            variable_window: roce.variable_window,
+            window_parked: roce.window_parked,
+        };
+        assert_eq!(format!("{roce:#?}"), format!("{mirror:#?}"));
+        assert_eq!(format!("{roce:?}"), format!("{mirror:?}"));
+        let none = RoceGenerator {
+            congestion_control: super::RoceCongestionControl::None,
+            ..roce
+        };
+        let expected = format!("{mirror:?}");
+        assert_eq!(
+            format!("{none:?}"),
+            format!(
+                "{}, congestion_control: None }}",
+                expected.trim_end_matches(" }")
+            )
+        );
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn roce_queue_pairs_grow_no_per_flow_record() {

@@ -158,6 +158,15 @@ inductive Status
   | stopped
   deriving DecidableEq, Repr
 
+/-- A queue pair's congestion control (P17 lane nocc, qp-schema Amendment 7). -/
+inductive CongestionControl
+  /-- The Mellanox-form DCQCN controller, joined from the DCQCN log. -/
+  | dcqcn
+  /-- No congestion control: the pair paces at its configured rate and has no controller, so the
+  DCQCN log holds no row of it and an ECN echo changes nothing. -/
+  | none
+  deriving DecidableEq, Repr
+
 structure SenderConfig where
   mtuBytes : Nat
   totalBytes : Nat
@@ -174,6 +183,8 @@ structure SenderConfig where
   /-- The controller's configured initial rate, the pair's rate while its controller is pristine
   (fix round 1, review F3). -/
   initialRateBps : Nat
+  /-- Amendment 7 (P17): DCQCN, or no congestion control. -/
+  congestionControl : CongestionControl
   deriving DecidableEq, Repr
 
 /--
@@ -237,7 +248,10 @@ def validSenderConfig (config : SenderConfig) : Bool :=
     config.rtoNs ≤ maxU64 &&
     config.windowBytes ≤ maxU64 &&
     config.maximumRateBps ≤ maxU64 &&
-    (!config.variableWindow || (config.windowBytes > 0 && config.maximumRateBps > 0))
+    (!config.variableWindow || (config.windowBytes > 0 && config.maximumRateBps > 0)) &&
+    -- Amendment 7: a pair without congestion control has one fixed rate and no variable window.
+    (config.congestionControl = .dcqcn ||
+      (config.initialRateBps = config.maximumRateBps && !config.variableWindow))
 
 /-- §7 invariants 2, 3, 4 and 5, as far as one sender's record shows them. -/
 def validSenderState (config : SenderConfig) (state : SenderState) : Bool :=

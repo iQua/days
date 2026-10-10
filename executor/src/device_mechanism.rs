@@ -644,13 +644,18 @@ pub(crate) fn decode_dcqcn_generator(
 // RoCE queue-pair generator row (P15, `evidence/P15/device-design.md` §1.1). Words 12..15 are the
 // pacer's grid anchor, interval, MTU and total; 18..19 its credit; 20..35 the DCQCN controller,
 // shared with DCQCN rows so the kernel's controller helpers run unchanged; 36..38 the window (P16
-// ruling D7: its size and variable flag, immutable, and the window-park bit). Word 6 (`G_PAYLOAD`)
-// is always the pacing token: validation pins `next_emission.payload` to it.
+// ruling D7: its size and variable flag, immutable, and the window-park bit); 39 the congestion
+// control (P17 lane nocc: 0 for DCQCN, 1 for none; immutable). A DCQCN pair's row is word for word
+// the pre-P17 row. Word 6 (`G_PAYLOAD`) is always the pacing token: validation pins
+// `next_emission.payload` to it.
 pub(crate) const G_ROCE_NEXT_PSN: usize = 16;
 pub(crate) const G_ROCE_SND_UNA: usize = 17;
 pub(crate) const G_ROCE_WINDOW: usize = 36;
 pub(crate) const G_ROCE_VARIABLE_WINDOW: usize = 37;
 pub(crate) const G_ROCE_WINDOW_PARKED: usize = 38;
+/// P17 lane nocc: the pair's congestion control, `RoceCongestionControl as u8`. The kernels skip
+/// the controller's feedback when it is nonzero.
+pub(crate) const G_ROCE_CONGESTION_CONTROL: usize = 39;
 pub(crate) const G_ROCE_PACER_ARMED: usize = 40;
 pub(crate) const G_ROCE_RTO_DEADLINE: usize = 41;
 pub(crate) const G_ROCE_RTO: usize = 42;
@@ -671,6 +676,7 @@ pub(crate) fn encode_roce_generator(roce: &crate::RoceGenerator, row: &mut [u64]
     row[G_ROCE_WINDOW] = roce.window_bytes;
     row[G_ROCE_VARIABLE_WINDOW] = u64::from(roce.variable_window);
     row[G_ROCE_WINDOW_PARKED] = u64::from(roce.window_parked);
+    row[G_ROCE_CONGESTION_CONTROL] = roce.congestion_control as u64;
     row[G_ROCE_PACER_ARMED] = u64::from(roce.pacer_armed);
     row[G_ROCE_RTO_DEADLINE] = roce.rto_deadline_ns;
     row[G_ROCE_RTO] = roce.rto_ns;
@@ -702,7 +708,7 @@ pub(crate) fn decode_roce_generator(
         G_ROCE_RTO,
         G_ROCE_WINDOW,
         G_ROCE_VARIABLE_WINDOW,
-        39,
+        G_ROCE_CONGESTION_CONTROL,
     ];
     if row[11] != GENERATOR_KIND_ROCE
         || row[6] != roce.pacing_timer_payload.0
@@ -715,6 +721,12 @@ pub(crate) fn decode_roce_generator(
     }
     let mut controller = roce.controller;
     decode_dcqcn_controller(row, &mut controller)?;
+    // P17: no transition moves the inert controller of a pair without congestion control.
+    if roce.congestion_control == crate::RoceCongestionControl::None
+        && controller != roce.controller
+    {
+        return Err("RoCE row without congestion control changed its controller");
+    }
     roce.controller = controller;
     roce.next_psn = row[G_ROCE_NEXT_PSN];
     roce.snd_una = row[G_ROCE_SND_UNA];
@@ -1901,6 +1913,7 @@ mod tests {
                 ("uint G_ROCE_WINDOW", G_ROCE_WINDOW),
                 ("uint G_ROCE_VARIABLE_WINDOW", G_ROCE_VARIABLE_WINDOW),
                 ("uint G_ROCE_WINDOW_PARKED", G_ROCE_WINDOW_PARKED),
+                ("uint G_ROCE_CONGESTION_CONTROL", G_ROCE_CONGESTION_CONTROL),
                 ("uint G_ROCE_PACER_ARMED", G_ROCE_PACER_ARMED),
                 ("uint G_ROCE_RTO_DEADLINE", G_ROCE_RTO_DEADLINE),
                 ("uint G_ROCE_RTO", G_ROCE_RTO),
@@ -2035,6 +2048,7 @@ mod tests {
             window_bytes: 8_000,
             variable_window: true,
             window_parked: false,
+            congestion_control: crate::RoceCongestionControl::Dcqcn,
         }
     }
 
@@ -2064,6 +2078,45 @@ mod tests {
         assert_eq!(decoded, released);
         let mut ordinary = gated;
         assert!(decode_roce_generator(&row, &mut ordinary, false).is_err());
+    }
+
+    /// P17 lane nocc: a pair without congestion control writes its mode in word 39, which a row
+    /// may not change, and its inert controller, which no device transition may move. A DCQCN
+    /// pair's word 39 stays zero, so its row is the pre-P17 row.
+    #[test]
+    fn nocc_roce_rows_pin_their_mode_and_their_controller() {
+        let dcqcn = roce_generator();
+        let mut row = [0_u64; 43];
+        row[6] = dcqcn.pacing_timer_payload.0;
+        encode_roce_generator(&dcqcn, &mut row);
+        assert_eq!(row[G_ROCE_CONGESTION_CONTROL], 0);
+        let nocc = crate::RoceGenerator {
+            controller: crate::DcqcnController::fixed_rate(1_000_000_000),
+            variable_window: false,
+            congestion_control: crate::RoceCongestionControl::None,
+            ..dcqcn
+        };
+        let mut row = [0_u64; 43];
+        row[6] = nocc.pacing_timer_payload.0;
+        encode_roce_generator(&nocc, &mut row);
+        assert_eq!(row[G_ROCE_CONGESTION_CONTROL], 1);
+        let mut decoded = nocc;
+        decode_roce_generator(&row, &mut decoded, false).expect("an untouched row decodes");
+        assert_eq!(decoded, nocc);
+        let mut flipped = row;
+        flipped[G_ROCE_CONGESTION_CONTROL] = 0;
+        assert!(decode_roce_generator(&flipped, &mut decoded, false).is_err());
+        // An armed controller is a valid DCQCN state, but not for a pair without congestion
+        // control: the device must never have fed it.
+        let mut armed = nocc;
+        armed.controller.on_feedback(10);
+        let mut moved = row;
+        encode_roce_generator(&armed, &mut moved);
+        let mut decoded = nocc;
+        assert_eq!(
+            decode_roce_generator(&moved, &mut decoded, false),
+            Err("RoCE row without congestion control changed its controller")
+        );
     }
 
     #[test]

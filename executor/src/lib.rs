@@ -105,11 +105,11 @@ pub use image::{
     FlowGeneratorState, GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus,
     GeneratorTermination, HostPfcState, HostState, LinkDescriptor, NodeDescriptor,
     PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator,
-    RemoteChannel, RoceAckHeader, RoceDataHeader, RoceGenerator, RoceNackMark, RocePacer,
-    RoceReceiverState, ScheduledEmission, SeededCollective, SimulationImage, StageDependencies,
-    StageOperation, StagePredecessors, StageRole, StageStream, SwitchQueueState, SwitchState,
-    TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState,
-    default_propagation_ns,
+    RemoteChannel, RoceAckHeader, RoceCongestionControl, RoceDataHeader, RoceGenerator,
+    RoceNackMark, RocePacer, RoceReceiverState, ScheduledEmission, SeededCollective,
+    SimulationImage, StageDependencies, StageOperation, StagePredecessors, StageRole, StageStream,
+    SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange,
+    TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, CollectiveTraceError,
