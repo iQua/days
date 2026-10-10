@@ -241,11 +241,11 @@ fn plan_memory_limit(
 }
 
 /// The host heap a device run holds beside its plan's device bytes (P18 c6): the image, plus the
-/// larger of the plan's host planes (alive until they are uploaded) and the readback's copy of
-/// the image's host and switch states. A deterministic lower bound: table lengths times element
-/// sizes, so whether a plan is admitted depends on the image and the plan, not on allocator
-/// state.
-fn run_host_bytes(image: &SimulationImage, plan_host_bytes: usize) -> usize {
+/// larger of the plan's host planes (alive until they are uploaded) and, when readback clones
+/// them (a borrowed image; P18 c5 moves a validated image's), a copy of the image's host and
+/// switch states. A deterministic lower bound: table lengths times element sizes, so whether a
+/// plan is admitted depends on the image and the plan, not on allocator state.
+fn run_host_bytes(image: &SimulationImage, plan_host_bytes: usize, readback_clones: bool) -> usize {
     use std::mem::size_of;
     let states = image
         .host_states
@@ -289,9 +289,10 @@ fn run_host_bytes(image: &SimulationImage, plan_host_bytes: usize) -> usize {
         + image.channels.len() * size_of::<crate::RemoteChannel>()
         + image.initial_events.len() * size_of::<Event>()
         + image.stage_joins.len() * size_of::<crate::FlowId>();
+    let readback_copy = if readback_clones { states } else { 0 };
     states
         .saturating_add(rest)
-        .saturating_add(plan_host_bytes.max(states))
+        .saturating_add(plan_host_bytes.max(readback_copy))
 }
 
 #[cfg(feature = "cuda-test-hooks")]
@@ -1633,7 +1634,11 @@ impl CudaExecutor {
                 // synchronizes so their memory counts as free.
                 let limit_bytes = direct.device_memory_limit(
                     attempt_config.max_device_bytes,
-                    run_host_bytes(image, plan.host_bytes()),
+                    run_host_bytes(
+                        image,
+                        plan.host_bytes(),
+                        matches!(run_image, RunImage::Borrowed(_)),
+                    ),
                 )?;
                 let planned_bytes = plan.device_bytes();
                 if planned_bytes > limit_bytes {
@@ -6338,9 +6343,42 @@ fn duration_ns(duration: Duration) -> u64 {
 mod tests {
     use super::{
         CudaArena, CudaError, CudaProvisioning, decode_arena, decode_device_error,
-        plan_memory_limit, select_cuda_provisioning,
+        plan_memory_limit, run_host_bytes, select_cuda_provisioning,
     };
     use crate::CapacityRetryRecord;
+
+    /// P18 c6 after c5: the admission's host heap counts the readback's copy of the states only
+    /// when readback makes one (a borrowed image), and the plan's host planes when they are larger.
+    #[test]
+    fn the_host_heap_counts_a_readback_copy_only_when_readback_clones() {
+        let switch = crate::SwitchState {
+            physical_switch: 0,
+            queues: Vec::new(),
+            next_origin_seq: 0,
+            arrived_packets: 0,
+            dropped_packets: 0,
+            departed_packets: 0,
+        };
+        let image = crate::SimulationImage {
+            stop_time_ns: 0,
+            nodes: Vec::new(),
+            host_states: Vec::new(),
+            switch_states: vec![switch; 4],
+            flows: Vec::new(),
+            initial_packets: Vec::new(),
+            links: Vec::new(),
+            channels: Vec::new(),
+            initial_events: Vec::new(),
+            seed: 0,
+            stage_joins: Vec::new(),
+            seeded_all_to_alls: Vec::new(),
+            stage_streams: Vec::new(),
+        };
+        let states = 4 * std::mem::size_of::<crate::SwitchState>();
+        assert_eq!(run_host_bytes(&image, 0, false), states);
+        assert_eq!(run_host_bytes(&image, 0, true), 2 * states);
+        assert_eq!(run_host_bytes(&image, 1 << 20, true), states + (1 << 20));
+    }
 
     #[test]
     fn integrated_managed_device_selects_managed_provisioning() {
