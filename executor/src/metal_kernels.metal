@@ -7761,16 +7761,10 @@ kernel void days_round_reset(
                 params[P_CHANNEL_BATCH_OFFSET] +
                 channel * CHANNEL_BATCH_WORDS;
             ulong stream_base = channel * META_WORDS;
-            ulong capacity = stream_state[stream_base + 1];
             ulong count = stream_state[stream_base + 3];
-            // `head < capacity` (or both are 0) and `count <= capacity`: one conditional
-            // subtraction is the modulo.
-            ulong tail = stream_state[stream_base + 2] + count;
-            if (tail >= capacity) {
-                tail -= capacity;
-            }
             stream_state[batch] = 0;
-            stream_state[batch + 1] = tail;
+            stream_state[batch + 1] = (stream_state[stream_base + 2] + count) %
+                max(stream_state[stream_base + 1], 1ul);
             stream_state[batch + 2] = count;
             stream_state[batch + 3] = horizon_last;
 #ifdef DAYS_MERGE_AUDIT
