@@ -890,6 +890,27 @@ fn e5_projected_device_plans_are_derived_and_fit_boston() {
     }
 }
 
+/// P18 c9: the bytes of the routes the device `routes` plane no longer repeats: every flow's
+/// forward and reverse route words, less the distinct non-empty routes' words.
+#[cfg(all(feature = "metal-test-hooks", target_vendor = "apple"))]
+fn p18_shared_route_bytes(image: &days_executor::SimulationImage) -> u128 {
+    let every = image
+        .flows
+        .iter()
+        .map(|flow| flow.route.len() + flow.reverse_route.len())
+        .sum::<usize>();
+    let distinct = image
+        .flows
+        .iter()
+        .flat_map(|flow| [flow.route.as_slice(), flow.reverse_route.as_slice()])
+        .filter(|route| !route.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(<[_]>::len)
+        .sum::<usize>();
+    ((every - distinct) * 8) as u128
+}
+
 /// Exact production Metal sizing under the campaign's retained capped-plan policy. The generic
 /// host projection above is deliberately more conservative; this is the surface that produces the
 /// design's 14.516 GiB primary and 14.922 GiB backup classes.
@@ -903,8 +924,9 @@ fn e5_exact_capped_metal_plans_match_the_frozen_classes() {
         (CUBIC_FIXTURE, FROZEN_PRE_O212_CUBIC_PLAN_BYTES),
         (BACKUP_FIXTURE, FROZEN_PRE_O212_BACKUP_PLAN_BYTES),
     ] {
+        let image = lower(fixture);
         let report = size_metal_plan_for_testing(
-            &lower(fixture),
+            &image,
             None,
             MetalConfig {
                 capacity_caps: E5_CAPACITY_CAPS,
@@ -934,10 +956,30 @@ fn e5_exact_capped_metal_plans_match_the_frozen_classes() {
         // P14 Lane B T4 appended one params word addressing the PFC region (`u64::MAX` here: E5
         // carries no PFC state and plans no PFC words). No other plane moved.
         let p14_pfc_params_bytes = 8;
+        // P15 R4 and P16 G1 appended one params word each, addressing the RoCE receiver and stage
+        // regions (`u64::MAX` here), as `planner_bit_equal`'s anchor records.
+        let p15_p16_params_bytes = 16;
+        // P18 c9: the `routes` plane stores each distinct route once (DERIVED from the image).
+        let p18_shared_route_bytes = p18_shared_route_bytes(&image);
+        // P17 merge: the LP stream lists no longer store the generator stream ids, one 8-byte word
+        // per distinct generator flow (DERIVED, as `p16_stage_sizing` and `planner_bit_equal` do;
+        // this pin, built only under `metal-test-hooks`, missed it, so it failed on feat/p17
+        // 5c7629ff by exactly this amount).
+        let p17_generator_id_bytes = image
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .map(|generator| generator.flow)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u128
+            * 8;
         let expected_bytes = pre_o212_bytes
             .checked_sub(compact_reduction_bytes)
             .expect("compact planes must fit the prior frozen plan")
-            + p14_pfc_params_bytes;
+            + p14_pfc_params_bytes
+            + p15_p16_params_bytes
+            - p17_generator_id_bytes
+            - p18_shared_route_bytes;
         println!(
             "E5 exact capped Metal plan {fixture}: bytes={derived_total} gib={:.9} \
              channel_slots={} service_slots={} generator_slots={} remote_staging_words={} \
