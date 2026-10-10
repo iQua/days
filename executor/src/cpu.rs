@@ -198,7 +198,9 @@ pub struct CpuRoundMetrics {
     pub coordinator_partition_ns: u64,
     /// Time from the first worker assignment until every worker completion arrives.
     pub worker_wait_ns: u64,
-    /// Coordinator fused-outbox routing and next-minimum reduction.
+    /// Coordinator fused-outbox routing and next-minimum reduction after the last reply. Always 0
+    /// since P18: the static coordinator folds both into each reply as it arrives (that time is in
+    /// `worker_wait_ns`), and the dynamic path never timed them separately.
     pub coordinator_exchange_ns: u64,
     pub round_wall_time_ns: u64,
 }
