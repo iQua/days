@@ -898,7 +898,11 @@ fn run_scalar_events<'image>(
         }
     }
 
-    Ok((transitions, events.into_sorted_vec()?))
+    // The drain reuses the heap's buffer; the result keeps exactly its events, not the run's
+    // largest event list as spare capacity.
+    let mut pending_events = events.into_sorted_vec()?;
+    pending_events.shrink_to_fit();
+    Ok((transitions, pending_events))
 }
 
 /// Test hook: a Scalar run with the number of events it dispatched and the number of

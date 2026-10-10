@@ -147,6 +147,9 @@ impl FutureEvents {
     }
 
     /// The pending events in ascending key order. Two adjacent equal keys are a duplicate.
+    ///
+    /// The `Vec` is the heap's own buffer and keeps its capacity: a caller that holds it beyond
+    /// the drain (the Scalar result) shrinks it.
     pub(crate) fn into_sorted_vec(self) -> Result<Vec<Event>, ExecutionError> {
         // `Pending` is `Event` in a transparent wrapper, so this collect reuses the heap's buffer.
         let mut events = self
