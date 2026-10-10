@@ -172,6 +172,14 @@ fn scalar(image: &SimulationImage) -> RunResult {
     expected
 }
 
+/// Each retry grows the one channel that faulted first, so one-record rings on a fixture with many
+/// busy channels take many retries.
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+const TIGHT_RETRY_BUDGET: usize = 256;
+
 /// One device run's outcome: the result, the capacity retries it took and the audit rows.
 #[cfg(any(
     feature = "cuda-test-hooks",
@@ -242,7 +250,7 @@ fn check_visibility(backend: &str, run: impl Fn(&SimulationImage, bool) -> Audit
 mod cuda {
     use days_executor::{CudaConfig, ObservationMode, RoundKernel, run_cuda_with_observations};
 
-    use super::{Audited, FIXTURES, check_visibility, lower};
+    use super::{Audited, FIXTURES, TIGHT_RETRY_BUDGET, check_visibility, lower};
 
     #[test]
     fn cuda_ring_writes_publish_only_at_the_merge() {
@@ -252,6 +260,7 @@ mod cuda {
                 None,
                 CudaConfig {
                     max_channel_events_per_stream: tight.then_some(1),
+                    max_capacity_retries: TIGHT_RETRY_BUDGET,
                     ..CudaConfig::default()
                 },
                 ObservationMode::Full,
@@ -325,6 +334,7 @@ fn metal_ring_writes_publish_only_at_the_merge() {
             None,
             days_executor::MetalConfig {
                 max_channel_events_per_stream: tight.then_some(1),
+                max_capacity_retries: TIGHT_RETRY_BUDGET,
                 ..days_executor::MetalConfig::default()
             },
             ObservationMode::Full,

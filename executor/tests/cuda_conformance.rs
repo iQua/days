@@ -1043,6 +1043,9 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             0,
             1,
         ),
+        // The two producer arenas below exist only on the legacy heap path: since P18 a streams
+        // plan stages nothing (producers write the channel rings directly).
+        //
         // T20lm F-A. `max_outbox_events` is the *override* that serves BOTH producer arenas, and
         // under a zero override the arena that faults first is per-LP remote staging, not the
         // plane-wide outbox. This case asserted `Outbox` from the day it was written and had never
@@ -1053,6 +1056,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         // now pins that locally.
         (
             CudaConfig {
+                streams_enabled: false,
                 max_outbox_events: Some(0),
                 max_capacity_retries: 0,
                 ..CudaConfig::default()
@@ -1068,6 +1072,7 @@ fn cuda_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         // all; the Metal sibling has used this form since it was written.
         (
             CudaConfig {
+                streams_enabled: false,
                 capacity_caps: days_executor::DeviceCapacityCaps {
                     outbox_events_total: Some(0),
                     ..days_executor::DeviceCapacityCaps::default()
@@ -1162,7 +1167,9 @@ fn cuda_capacity_warm_start_records_a_plane_wide_arena_raised_through_its_overri
     let expected = run_scalar_with_observations(&image, None, ObservationMode::Full)
         .expect("scalar outbox oracle must run");
     let executor = CudaExecutor::new().expect("CUDA executor must initialize");
+    // The producer arenas exist only on the legacy heap path since P18.
     let config = CudaConfig {
+        streams_enabled: false,
         max_outbox_events: Some(0),
         ..CudaConfig::default()
     };

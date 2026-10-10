@@ -1,10 +1,11 @@
 //! Correctness-first production CUDA executor.
 //!
 //! The backend keeps the safe-horizon round loop resident in explicit CUDA device buffers. One
-//! fixed thirteen-kernel attempt DAG is captured as a CUDA Graph and replayed in bounded waves.
-//! Deterministic reductions publish each exact exclusive horizon and compact active LPs; one CUDA
-//! lane owns each active LP transition drain; boundary exchange remains
-//! producer-local followed by deterministic per-channel scatter. The host reads only the control
+//! fixed attempt DAG (at most twelve kernels) is captured as a CUDA Graph and replayed in bounded
+//! waves. Deterministic reductions publish each exact exclusive horizon and compact active LPs; one
+//! CUDA lane owns each active LP transition drain; on the streams path that lane writes each remote
+//! event straight into its consumer's channel ring at a slot fixed by a round-start snapshot, and
+//! the merge publishes the round's records. The host reads only the control
 //! plane at graph-wave boundaries, then explicitly transfers every result plane for normalization.
 //! Integrated devices provision the same bytes in managed allocations; discrete devices retain
 //! explicit device allocations and uploads. No result-affecting atomics are used.
@@ -30,9 +31,8 @@ use crate::device_compaction::{
     CompactionEntity, CompactionPlan, CompactionShape, metadata_region,
 };
 use crate::device_event_record::{
-    CHANNEL_EVENT_WORDS, EVENT_WORDS, GENERATOR_EVENT_WORDS, REMOTE_STAGING_EVENT_WORDS,
-    SERVICE_EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
-    stream_event_class,
+    CHANNEL_EVENT_WORDS, EVENT_WORDS, GENERATOR_EVENT_WORDS, SERVICE_EVENT_WORDS, StoredEventClass,
+    decode_event_record, stored_event_words, stream_event_class,
 };
 use crate::device_mechanism::RoundKernel;
 use crate::device_scheduler::{
@@ -1318,7 +1318,7 @@ impl CudaExecutor {
                 &own.functions[index]
             }
         });
-        launch_record(&[own, &other], &functions, true)
+        launch_record(&[own, &other], &functions, true, true)
     }
 
     /// Runs only O1.4's reset/count and stable-write dispatches over a synthetic FEL-root cache.
@@ -2848,10 +2848,9 @@ impl CudaPlan {
             },
             |capacity| capacity.max(config.capacity_floors.outbox_events_total),
         );
-        // `outbox_capacity` stays the uploaded `P_OUTBOX_CAPACITY` on both paths, so the round-wide
-        // remote-production check in `days_exchange_prefix`, its `ARENA_OUTBOX` fault, the retry
-        // growth law and every `CapacityWarmStart` entry are unchanged. Only the *storage* is
-        // conditional: the streams path never forms an outbox address.
+        // `outbox_capacity` is uploaded as `P_OUTBOX_CAPACITY` on both paths; only the legacy
+        // path's `days_exchange_prefix` reads it (a streams plan launches no staged exchange, P18),
+        // and only the legacy path allocates the arena it bounds.
         let outbox_records = if config.streams_enabled {
             crate::device_sizing::STREAMS_OUTBOX_RECORD_SLOTS
         } else {
@@ -2869,6 +2868,11 @@ impl CudaPlan {
                     0,
                 );
             }
+        }
+        // P18 ring writes: the streams path stages nothing (`append_remote` writes the channel
+        // rings), so only the legacy heap path gets staging capacity.
+        if config.streams_enabled {
+            remote_capacities.fill(0);
         }
         let mut remote_meta = vec![0_u64; node_count * ARENA_META_WORDS];
         let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
@@ -3035,14 +3039,7 @@ impl CudaPlan {
             arrivals: zero_words(observation_slots, ARRIVAL_WORDS)?,
             lp_state: vec![0_u64; node_count.max(1) * LP_STATE_WORDS],
             remote_meta,
-            remote_staging: zero_words(
-                remote_staging_slots,
-                if config.streams_enabled {
-                    REMOTE_STAGING_EVENT_WORDS
-                } else {
-                    EVENT_WORDS
-                },
-            )?,
+            remote_staging: zero_words(remote_staging_slots, EVENT_WORDS)?,
             observation_meta,
             inbound_meta,
             merge_cursors: vec![0_u64; inbound_producers.len().max(1)],
@@ -4547,8 +4544,13 @@ impl CudaBuffers {
             plan.params.push(offset as u64);
             // P17 merge: the merge counter rows and the flow-source table (params word 35).
             let merge_audit_offset = plan.stream_state.len();
-            let region =
-                crate::merge_audit::hook_region(plan.params[0] as usize, &plan.flows, FLOW_WORDS);
+            let region = crate::merge_audit::hook_region(
+                plan.params[0] as usize,
+                plan.params[1] as usize,
+                &plan.flows,
+                FLOW_WORDS,
+                plan.stream_layout.channel_count,
+            );
             plan.stream_state.extend(region);
             assert_eq!(plan.params.len(), PARAM_MERGE_AUDIT_OFFSET);
             plan.params.push(merge_audit_offset as u64);
@@ -5421,9 +5423,12 @@ impl CudaBuffers {
 /// the sweep's per-block partials. The **launch boundary is the barrier**: nothing in the kernels
 /// synchronizes across blocks inside a launch. That costs extra launches, which the analysis
 /// budgeted for at ≤0.11 % of a round, and buys the whole grid for the sweeps.
-/// T24 omits only `days_round_finalize_sweep` for a streams+Summary lowered plan; Full and legacy
-/// plans dispatch all thirteen entries.
-const KERNEL_NAMES: [&str; 13] = [
+/// T24 omits only `days_round_finalize_sweep` for a streams+Summary lowered plan. P18 ring writes
+/// omit the legacy staged exchange (`days_exchange_prefix`, `days_exchange_scatter`) from every
+/// streams plan: producers write the channel rings directly and `days_exchange_merge` publishes
+/// them. A streams plan dispatches ten entries under Full observations and nine under Summary; a
+/// legacy plan dispatches all twelve. [`attempt_kernel_launched`] decides.
+const KERNEL_NAMES: [&str; 12] = [
     "days_horizon_sweep",
     "days_horizon",
     "days_round_reset",
@@ -5431,7 +5436,6 @@ const KERNEL_NAMES: [&str; 13] = [
     "days_round",
     "days_round_control_sweep",
     "days_round_control",
-    "days_exchange_prefix_sweep",
     "days_exchange_prefix",
     "days_exchange_scatter",
     "days_exchange_merge",
@@ -5453,12 +5457,29 @@ const MECHANISMS_ROUND_KERNEL_NAME: &str = "days_round_mechanisms";
 // gather's output does not depend on it.
 const COMPACT_THREADS_PER_BLOCK: usize = 256;
 /// Launches that need the full [`LANES`]-wide block their deterministic reduction assumes.
-const CONTROL_KERNELS: [usize; 8] = [0, 1, 5, 6, 7, 8, 11, 12];
+const CONTROL_KERNELS: [usize; 7] = [0, 1, 5, 6, 7, 10, 11];
 /// Launches that take the full-grid control geometry:
 /// [`crate::device_sizing::CONTROL_SWEEP_BLOCKS`] blocks of [`LANES`] threads.
-const SWEEP_KERNELS: [usize; 4] = [0, 5, 7, 11];
-const PARALLEL_KERNELS: [usize; 5] = [2, 3, 4, 9, 10];
-const FINALIZE_SWEEP_KERNEL_INDEX: usize = 11;
+const SWEEP_KERNELS: [usize; 3] = [0, 5, 10];
+const PARALLEL_KERNELS: [usize; 5] = [2, 3, 4, 8, 9];
+const EXCHANGE_PREFIX_KERNEL_INDEX: usize = 7;
+const EXCHANGE_SCATTER_KERNEL_INDEX: usize = 8;
+const FINALIZE_SWEEP_KERNEL_INDEX: usize = 10;
+
+/// Whether the attempt DAG of a plan launches entry `index` of [`KERNEL_NAMES`]. Both inputs are
+/// lowered-plan policy ([`crate::device_sizing::finalize_sweep_required`],
+/// [`crate::device_sizing::staged_exchange_required`]), decided once per run.
+const fn attempt_kernel_launched(
+    index: usize,
+    finalize_sweep_required: bool,
+    staged_exchange_required: bool,
+) -> bool {
+    match index {
+        FINALIZE_SWEEP_KERNEL_INDEX => finalize_sweep_required,
+        EXCHANGE_PREFIX_KERNEL_INDEX | EXCHANGE_SCATTER_KERNEL_INDEX => staged_exchange_required,
+        _ => true,
+    }
+}
 
 struct DirectCuda {
     /// The device's context. Each run loads its round module into it.
@@ -5974,7 +5995,14 @@ impl DirectCuda {
             wall_ns: duration_ns(wall_started.elapsed()),
             round_kernel,
             #[cfg(feature = "cuda-test-hooks")]
-            launched_kernels: launch_record(&[module], &functions, buffers.finalize_sweep_required),
+            launched_kernels: launch_record(
+                &[module],
+                &functions,
+                buffers.finalize_sweep_required,
+                crate::device_sizing::staged_exchange_required(
+                    buffers.memory_layout.streams_enabled,
+                ),
+            ),
             #[cfg(feature = "cuda-test-hooks")]
             round_modules_at_capture,
         })
@@ -5992,10 +6020,16 @@ impl DirectCuda {
             .begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL)
             .map_err(|error| driver_error("CUDA Graph capture begin", error))?;
 
+        let staged_exchange_required =
+            crate::device_sizing::staged_exchange_required(buffers.memory_layout.streams_enabled);
         let captured = (|| {
             for _ in 0..attempts {
                 for (index, (function, config)) in functions.iter().zip(configs).enumerate() {
-                    if !buffers.finalize_sweep_required && index == FINALIZE_SWEEP_KERNEL_INDEX {
+                    if !attempt_kernel_launched(
+                        index,
+                        buffers.finalize_sweep_required,
+                        staged_exchange_required,
+                    ) {
                         continue;
                     }
                     launch_uniform(&self.stream, function, buffers, *config).map_err(|error| {
@@ -6032,18 +6066,21 @@ impl DirectCuda {
 }
 
 /// Test-only: `(module, kernel)` for each attempt kernel the graph captured from `functions`, in
-/// DAG order, skipping the finalize sweep when the plan omits it. Each entry identifies the handle
-/// itself ([`identify`]), so a run that mixes modules is recorded as mixed.
+/// DAG order, skipping the entries the plan omits ([`attempt_kernel_launched`]). Each entry
+/// identifies the handle itself ([`identify`]), so a run that mixes modules is recorded as mixed.
 #[cfg(feature = "cuda-test-hooks")]
 fn launch_record(
     modules: &[&RoundModule],
     functions: &[&CudaFunction; KERNEL_NAMES.len()],
     finalize_sweep_required: bool,
+    staged_exchange_required: bool,
 ) -> Vec<(RoundKernel, &'static str)> {
     functions
         .iter()
         .enumerate()
-        .filter(|&(index, _)| finalize_sweep_required || index != FINALIZE_SWEEP_KERNEL_INDEX)
+        .filter(|&(index, _)| {
+            attempt_kernel_launched(index, finalize_sweep_required, staged_exchange_required)
+        })
         .map(|(_, function)| identify(modules, function))
         .collect()
 }
@@ -6372,7 +6409,9 @@ mod tests {
     fn cuda_semantic_fault_decodes_the_word_the_kernels_write() {
         let source = include_str!("cuda_kernels.cu");
         assert!(source.contains("constexpr ulong ERROR_SEMANTIC = 3;"));
-        assert!(source.contains("control[C_ERROR] = ERROR_SEMANTIC + 42;"));
+        // P18 ring writes: the producer raises 42 as an LP error naming the channel, which the
+        // continuation control copies into the control plane.
+        assert!(source.contains("set_semantic_error(error, 42, channel);"));
 
         let mut control = vec![0_u64; 20];
         // An LP semantic fault (here semantic 25, raw 28) keeps the LP it names.

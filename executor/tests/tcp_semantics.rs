@@ -2769,6 +2769,11 @@ fn device_sizing_derives_a_tcp_plan() {
         .collect::<std::collections::BTreeSet<_>>()
         .len()
         * std::mem::size_of::<u64>();
+    // P18 ring writes: a streams plan stages nothing, so `stream_state` no longer holds one channel
+    // id per staging slot. This finished image's derived staging was the seed of two records per
+    // LP.
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+    let p18_staging_id_bytes = 2 * checkpoint.nodes.len() * std::mem::size_of::<u64>();
 
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
@@ -2784,7 +2789,7 @@ fn device_sizing_derives_a_tcp_plan() {
         assert_eq!(metal.memory_layout.channel_stream_event_slots, 4);
         assert_eq!(
             metal.memory_layout.total_event_arena_bytes(),
-            1_680 + t21_round_scratch_bytes - p17_generator_id_bytes
+            1_680 + t21_round_scratch_bytes - p17_generator_id_bytes - p18_staging_id_bytes
         );
     }
 
@@ -2802,7 +2807,7 @@ fn device_sizing_derives_a_tcp_plan() {
         assert_eq!(cuda.memory_layout.channel_stream_event_slots, 4);
         assert_eq!(
             cuda.memory_layout.total_event_arena_bytes(),
-            1_680 + t21_round_scratch_bytes - p17_generator_id_bytes
+            1_680 + t21_round_scratch_bytes - p17_generator_id_bytes - p18_staging_id_bytes
         );
     }
 }

@@ -272,33 +272,30 @@ fn the_round_control_scan_runs_on_the_whole_grid() {
     }
 }
 
-/// `days_exchange_prefix`'s **streams** path sums Θ(C) per-channel batch counts and picks the
-/// lowest invalid channel: a clamped sum, an `OR` and a `min`. Its **legacy** path is a
-/// node-ordered prefix scan whose output depends on the partition, so it does not move: it stays
-/// in the width-1 combine over the retained 1,024-lane contiguous chunks.
+/// `days_exchange_prefix` is the legacy heap path's alone (P18 ring writes retired its streams
+/// scan and the `days_exchange_prefix_sweep` that fed it): a node-ordered prefix scan whose output
+/// depends on the partition, so it stays in the width-1 kernel over the retained 1,024-lane
+/// contiguous chunks and reads no sweep partials.
 #[test]
-fn the_exchange_prefix_stream_scan_runs_on_the_whole_grid() {
-    for (backend, sweep, combine) in phase("days_exchange_prefix_sweep", "days_exchange_prefix") {
-        assert!(
-            sweep.contains("P_STREAMS_ENABLED"),
-            "{backend} `days_exchange_prefix_sweep` runs only on the streams path",
-        );
-        assert!(
-            sweep.contains("store_round_partial("),
-            "{backend} `days_exchange_prefix_sweep` publishes one partial per block",
-        );
-        assert!(
-            !writes_control(sweep),
-            "{backend} `days_exchange_prefix_sweep` must not write a control word",
-        );
-        assert!(
-            combine.contains("load_round_partial("),
-            "{backend} `days_exchange_prefix` reads the partials the sweep published",
-        );
+fn the_exchange_prefix_is_the_legacy_node_ordered_scan() {
+    for (backend, combine) in [
+        ("CUDA", cuda_kernel("days_exchange_prefix")),
+        ("Metal", metal_kernel("days_exchange_prefix")),
+    ] {
         assert!(
             combine.contains("remote_meta[base + 2] = write"),
             "{backend} `days_exchange_prefix` keeps the legacy node-ordered prefix scan, which is \
              NOT partition-free and therefore does NOT move",
+        );
+        assert!(
+            !combine.contains("load_round_partial(") && !combine.contains("P_STREAMS_ENABLED"),
+            "{backend} `days_exchange_prefix` has no streams branch left",
+        );
+    }
+    for (backend, source) in [("CUDA", CUDA_KERNELS), ("Metal", METAL_KERNELS)] {
+        assert!(
+            !source.contains("days_exchange_prefix_sweep"),
+            "{backend} kernels no longer carry the streams prefix sweep",
         );
     }
 }
@@ -357,12 +354,11 @@ fn no_kernel_synchronizes_across_blocks_inside_a_dispatch() {
     }
     // Metal's device-scope fence is still used where it always was — inside a *threadgroup*, to
     // order that threadgroup's own device writes — and nowhere else. `days_round_reset` and the
-    // four sweeps add none.
+    // three sweeps add none.
     for sweep in [
         "days_round_reset",
         "days_horizon_sweep",
         "days_round_control_sweep",
-        "days_exchange_prefix_sweep",
         "days_round_finalize_sweep",
     ] {
         assert_eq!(
@@ -373,20 +369,22 @@ fn no_kernel_synchronizes_across_blocks_inside_a_dispatch() {
     }
 }
 
-/// The maximum dispatch count, disclosed. Full and legacy plans retain thirteen dispatches; T24's
-/// exact streams+Summary specialization omits only `FinalControlSweep`.
+/// The maximum dispatch count, disclosed. Full and legacy plans retain twelve dispatches. T24's
+/// exact streams+Summary specialization omits `FinalControlSweep`; P18's streams plans omit the
+/// legacy staged exchange (`days_exchange_prefix`, `days_exchange_scatter`), and the streams-only
+/// `days_exchange_prefix_sweep` is gone.
 ///
 /// `perround-upperbound.md` Lever 2a budgeted "adds 2-5 dispatches per round — free at ≤0.11 %".
-/// This is +5, at that bound.
+/// T21 added five; P18 removed three from every streams attempt.
 #[test]
-fn the_full_and_legacy_attempt_dag_is_thirteen_dispatches() {
+fn the_full_and_legacy_attempt_dag_is_twelve_dispatches() {
     assert!(
-        CUDA_BACKEND.contains("const KERNEL_NAMES: [&str; 13]"),
-        "the CUDA Full/legacy attempt DAG is thirteen launches",
+        CUDA_BACKEND.contains("const KERNEL_NAMES: [&str; 12]"),
+        "the CUDA Full/legacy attempt DAG is twelve launches",
     );
     assert!(
-        METAL_BACKEND.contains("const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 13]"),
-        "the Metal Full/legacy attempt DAG is thirteen dispatches",
+        METAL_BACKEND.contains("const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 12]"),
+        "the Metal Full/legacy attempt DAG is twelve dispatches",
     );
     assert!(
         METAL_BACKEND.contains("DispatchGeometry::ControlSweep"),
@@ -400,7 +398,6 @@ fn the_full_and_legacy_attempt_dag_is_thirteen_dispatches() {
         "days_round",
         "days_round_control_sweep",
         "days_round_control",
-        "days_exchange_prefix_sweep",
         "days_exchange_prefix",
         "days_exchange_scatter",
         "days_exchange_merge",
@@ -428,7 +425,7 @@ fn the_full_and_legacy_attempt_dag_is_thirteen_dispatches() {
 fn every_attempt_dispatch_has_its_intended_geometry() {
     // The complete expected geometry of the attempt DAG, in encode order. `FixedControl` is one
     // threadgroup; `ControlSweep` is `CONTROL_SWEEP_BLOCKS` of them.
-    const EXPECTED: [(&str, &str); 13] = [
+    const EXPECTED: [(&str, &str); 12] = [
         ("HorizonSweep", "ControlSweep"),
         ("Horizon", "FixedControl"),
         ("RoundReset", "Parallel"),
@@ -436,7 +433,6 @@ fn every_attempt_dispatch_has_its_intended_geometry() {
         ("DrainExecute", "ActiveWorklist"),
         ("ContinuationControlSweep", "ControlSweep"),
         ("ContinuationControl", "FixedControl"),
-        ("ExchangePrefixSweep", "ControlSweep"),
         // The legacy node-ordered prefix still depends on its retained partition.
         ("ExchangePrefix", "FixedControl"),
         ("ExchangeScatter", "Parallel"),
@@ -467,8 +463,8 @@ fn every_attempt_dispatch_has_its_intended_geometry() {
     let parallel = const_indices(CUDA_BACKEND, "PARALLEL_KERNELS");
     assert_eq!(
         names.len(),
-        13,
-        "the CUDA DAG is thirteen launches: {names:?}"
+        12,
+        "the CUDA DAG is twelve launches: {names:?}"
     );
     for (kernel, expected) in [
         ("days_round_prepare", "Parallel"),
@@ -476,7 +472,6 @@ fn every_attempt_dispatch_has_its_intended_geometry() {
         ("days_horizon_sweep", "ControlSweep"),
         ("days_round_reset", "Parallel"),
         ("days_round_control_sweep", "ControlSweep"),
-        ("days_exchange_prefix_sweep", "ControlSweep"),
         ("days_round_finalize_sweep", "ControlSweep"),
         ("days_horizon", "FixedControl"),
         ("days_round_control", "FixedControl"),

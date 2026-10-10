@@ -9,7 +9,6 @@ pub(crate) const EVENT_WORDS: usize = 14;
 pub(crate) const CHANNEL_EVENT_WORDS: usize = 11;
 pub(crate) const SERVICE_EVENT_WORDS: usize = 5;
 pub(crate) const GENERATOR_EVENT_WORDS: usize = 10;
-pub(crate) const REMOTE_STAGING_EVENT_WORDS: usize = 12;
 
 #[cfg(any(
     test,
@@ -266,6 +265,5 @@ mod tests {
             stored_event_words(stream_event_class(5, 2, 5)),
             GENERATOR_EVENT_WORDS
         );
-        assert_eq!(REMOTE_STAGING_EVENT_WORDS, CHANNEL_EVENT_WORDS + 1);
     }
 }

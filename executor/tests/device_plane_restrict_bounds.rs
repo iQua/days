@@ -10,7 +10,7 @@ const CUDA_HOST: &str = include_str!("../src/cuda.rs");
 const CUDA_CONFORMANCE: &str = include_str!("cuda_conformance.rs");
 const METAL: &str = include_str!("../src/metal_kernels.metal");
 
-const ATTEMPT_KERNELS: [&str; 13] = [
+const ATTEMPT_KERNELS: [&str; 12] = [
     "days_horizon_sweep",
     "days_horizon",
     "days_round_reset",
@@ -18,7 +18,6 @@ const ATTEMPT_KERNELS: [&str; 13] = [
     "days_round",
     "days_round_control_sweep",
     "days_round_control",
-    "days_exchange_prefix_sweep",
     "days_exchange_prefix",
     "days_exchange_scatter",
     "days_exchange_merge",
@@ -101,5 +100,8 @@ fn metal_attempt_kernel_buffers_are_not_restrict_qualified() {
             );
         }
     }
-    assert_eq!(pointer_count, 96, "the 13-kernel Metal ABI shape moved");
+    // P18 ring writes: 96 before, less `days_exchange_prefix_sweep`'s five buffers, the streams
+    // prefix's `stream_state` and the streams scatter's `worklist`, `stream_state` and
+    // `stream_records`.
+    assert_eq!(pointer_count, 87, "the 12-kernel Metal ABI shape moved");
 }

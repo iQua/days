@@ -500,7 +500,6 @@ mod cuda {
             round,
             "days_round_control_sweep",
             "days_round_control",
-            "days_exchange_prefix_sweep",
             "days_exchange_prefix",
             "days_exchange_scatter",
             "days_exchange_merge",
@@ -511,8 +510,9 @@ mod cuda {
     }
 
     /// P14 round 3: each round-kernel build is its own complete module, holding only its own round
-    /// kernel, and every run launches its 14 kernels from that one module. Since round 4 a run
-    /// loads only that module, so the mixed-array probe loads the other build's module itself.
+    /// kernel, and every run launches its kernels from that one module. Since round 4 a run loads
+    /// only that module, so the mixed-array probe loads the other build's module itself. A streams
+    /// run launches neither legacy staged-exchange kernel (P18 ring writes).
     #[test]
     fn cuda_each_run_launches_one_complete_round_module() {
         let executor = CudaExecutor::on_device(0).expect("CUDA device 0");
@@ -554,8 +554,8 @@ mod cuda {
                 RoundKernel::Plain => &mechanisms,
                 RoundKernel::Mechanisms => &plain,
             };
-            for borrowed in [vec![0], vec![4], vec![0, 5, 12]] {
-                let expected = (0..13)
+            for borrowed in [vec![0], vec![4], vec![0, 5, 11]] {
+                let expected = (0..12)
                     .map(|index| {
                         if borrowed.contains(&index) {
                             (other, theirs[index])
@@ -649,6 +649,9 @@ mod cuda {
                 run.launched_kernels,
                 expected
                     .iter()
+                    .filter(|kernel| {
+                        !matches!(**kernel, "days_exchange_prefix" | "days_exchange_scatter")
+                    })
                     .map(|kernel| (build, *kernel))
                     .collect::<Vec<_>>(),
                 "{name}: every launched kernel comes from the {build:?} module"

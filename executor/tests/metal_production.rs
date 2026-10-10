@@ -1402,8 +1402,11 @@ fn process_wide_guard_recovers_after_a_mid_execution_panic() {
     assert_metal_full_result_matches_scalar(&recovered.result, &expected, "recovered Metal run");
 }
 
+/// The plane-wide outbox bounds the legacy heap path's staged exchange. Since P18 the streams path
+/// stages nothing (producers write the channel rings directly), so the same two-record bound
+/// neither faults nor changes a byte there.
 #[test]
-fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
+fn metal_global_outbox_capacity_faults_only_the_legacy_staged_exchange() {
     let mut image = uneven_multi_lp_backlog_image();
     for state in image.host_states.iter_mut().step_by(2) {
         state.queue.truncate(1);
@@ -1414,47 +1417,59 @@ fn metal_global_outbox_capacity_faults_identically_in_both_stream_modes() {
         .expect("scalar multi-producer recovery oracle must run");
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
 
-    for streams_enabled in [false, true] {
-        let error = executor
-            .run(
-                &image,
-                None,
-                MetalConfig {
-                    streams_enabled,
-                    max_outbox_events: Some(2),
-                    max_capacity_retries: 0,
-                    ..MetalConfig::default()
-                },
-            )
-            .expect_err("three producers must exceed the two-record global outbox");
-        assert_eq!(
-            error,
-            MetalError::CapacityExceeded {
-                arena: MetalArena::Outbox,
-                node: None,
-                flow: None,
-                stream: None,
-                capacity: 2,
-                demand: 3,
-            }
-        );
-        assert_metal_full_result_matches_scalar(
-            &executor
-                .run_with_observations(
-                    &image,
-                    None,
-                    MetalConfig {
-                        streams_enabled,
-                        ..MetalConfig::default()
-                    },
-                    ObservationMode::Full,
-                )
-                .expect("the same executor must recover after the global outbox fault")
-                .result,
-            &expected,
-            "Metal run recovered after global outbox fault",
-        );
-    }
+    let streams = executor
+        .run_with_observations(
+            &image,
+            None,
+            MetalConfig {
+                max_outbox_events: Some(2),
+                max_capacity_retries: 0,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .expect("the streams path has no outbox to exceed");
+    assert!(streams.capacity_retry_trace.is_empty());
+    assert_metal_full_result_matches_scalar(
+        &streams.result,
+        &expected,
+        "Metal streams run under a two-record outbox bound",
+    );
+
+    let legacy = MetalConfig {
+        streams_enabled: false,
+        ..MetalConfig::default()
+    };
+    let error = executor
+        .run(
+            &image,
+            None,
+            MetalConfig {
+                max_outbox_events: Some(2),
+                max_capacity_retries: 0,
+                ..legacy
+            },
+        )
+        .expect_err("three producers must exceed the two-record global outbox");
+    assert_eq!(
+        error,
+        MetalError::CapacityExceeded {
+            arena: MetalArena::Outbox,
+            node: None,
+            flow: None,
+            stream: None,
+            capacity: 2,
+            demand: 3,
+        }
+    );
+    assert_metal_full_result_matches_scalar(
+        &executor
+            .run_with_observations(&image, None, legacy, ObservationMode::Full)
+            .expect("the same executor must recover after the global outbox fault")
+            .result,
+        &expected,
+        "Metal run recovered after global outbox fault",
+    );
 }
 
 #[test]
@@ -1530,6 +1545,8 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
         "Metal run recovered after channel-stream fault",
     );
 
+    // The two producer arenas below exist only on the legacy heap path: since P18 a streams plan
+    // stages nothing.
     let outbox = executor
         .run(
             &image,
@@ -1539,8 +1556,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
                     outbox_events_total: Some(0),
                     ..days_executor::DeviceCapacityCaps::default()
                 },
-                max_capacity_retries: 0,
-                ..MetalConfig::default()
+                ..heap_config
             },
         )
         .expect_err("the first remote device child must exhaust the outbox");
@@ -1557,7 +1573,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     );
     assert_metal_full_result_matches_scalar(
         &executor
-            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .run_with_observations(&image, None, heap_config, ObservationMode::Full)
             .expect("the same executor must recover after the outbox fault")
             .result,
         &expected,
@@ -1575,8 +1591,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
             None,
             MetalConfig {
                 max_outbox_events: Some(0),
-                max_capacity_retries: 0,
-                ..MetalConfig::default()
+                ..heap_config
             },
         )
         .expect_err("a zero producer-arena override must fault per-LP remote staging first");
@@ -1593,7 +1608,7 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
     );
     assert_metal_full_result_matches_scalar(
         &executor
-            .run_with_observations(&image, None, MetalConfig::default(), ObservationMode::Full)
+            .run_with_observations(&image, None, heap_config, ObservationMode::Full)
             .expect("the same executor must recover after the remote-staging fault")
             .result,
         &expected,
@@ -1644,6 +1659,8 @@ fn metal_device_capacity_faults_are_explicit_and_do_not_poison_the_executor() {
 ///
 /// This is the plane-wide counterpart of the per-flow ledger case in `tcp_semantics`, and it is the
 /// only test that drives a plane-wide arena through a real retry on hardware.
+///
+/// The producer arenas exist only on the legacy heap path since P18, so the test runs it there.
 #[test]
 fn metal_capacity_warm_start_records_a_plane_wide_arena_raised_through_its_override() {
     let image = generator_image(GeneratorTermination::Bytes(4));
@@ -1651,6 +1668,7 @@ fn metal_capacity_warm_start_records_a_plane_wide_arena_raised_through_its_overr
         .expect("scalar outbox oracle must run");
     let executor = MetalExecutor::new().expect("Metal executor must initialize");
     let config = MetalConfig {
+        streams_enabled: false,
         max_outbox_events: Some(0),
         ..MetalConfig::default()
     };

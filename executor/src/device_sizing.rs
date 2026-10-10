@@ -11,8 +11,7 @@ use std::fmt;
 use num_bigint::BigUint;
 
 use crate::device_event_record::{
-    CHANNEL_EVENT_WORDS, EVENT_WORDS, GENERATOR_EVENT_WORDS, REMOTE_STAGING_EVENT_WORDS,
-    SERVICE_EVENT_WORDS,
+    CHANNEL_EVENT_WORDS, EVENT_WORDS, GENERATOR_EVENT_WORDS, SERVICE_EVENT_WORDS,
 };
 use crate::device_scheduler::{QUEUE_META_WORDS, device_scheduler_word_count};
 use crate::{
@@ -40,23 +39,18 @@ const WORD_BYTES: usize = std::mem::size_of::<u64>();
 
 /// Outbox record slots a **streams-enabled** plan allocates.
 ///
-/// The outbox is the *legacy* exchange path's compaction destination, and nothing else. On both
-/// device backends every access to it is inside a branch that has already tested
-/// `params[P_STREAMS_ENABLED] == 0`: `days_exchange_prefix` computes the per-producer compaction
-/// offsets, `days_exchange_scatter` copies `remote_staging` into it, and `days_exchange_merge`
-/// drains it into the target heaps. The stream-decomposed path stages a producer's remote events
-/// in `remote_staging` and scatters them straight into the per-channel `stream_records` rings, so
-/// it never forms an outbox address. (The Metal readback already classifies plane 12 as elided
-/// device scratch for the same reason: no decode reads it.) Sizing the plane to the legacy path's
-/// arena in a plan that cannot address it is pure overshoot — on the k48/h16 load-90 fixture it was
-/// 10,111,432,352 B, 40.92% of the whole plan.
-///
-/// What the streams path *does* still consult is the outbox **capacity number**:
-/// `days_exchange_prefix` sums the per-channel batch counts against `params[P_OUTBOX_CAPACITY]` and
-/// raises an `ARENA_OUTBOX` capacity fault when a round's remote production exceeds it. That number
-/// is still derived from the image exactly as before and still uploaded unchanged, so capacity
-/// faults, the retry growth law and `CapacityWarmStart` snapshots are all bit-identical. Only the
-/// unaddressable storage goes away. `streams_enabled = false` still gets the full arena.
+/// The outbox is the *legacy* exchange path's compaction destination, and nothing else:
+/// `days_exchange_prefix` computes the per-producer compaction offsets, `days_exchange_scatter`
+/// copies `remote_staging` into it, and `days_exchange_merge` drains it into the target heaps, and
+/// a streams plan launches none of those legacy branches. Since P18 its producers write each remote
+/// event straight into the consumer's channel ring (`append_remote`), so a streams plan stages
+/// nothing either: its `remote_staging` plane is the one-word placeholder of a logically empty
+/// plane, and neither the plane-wide outbox capacity (`params[P_OUTBOX_CAPACITY]`) nor the
+/// per-producer staging capacities bound anything on that path. (The Metal readback already
+/// classifies plane 12 as elided device scratch: no decode reads it.) Sizing the plane to the
+/// legacy path's arena in a plan that cannot address it was pure overshoot — on the k48/h16 load-90
+/// fixture it was 10,111,432,352 B, 40.92% of the whole plan. `streams_enabled = false` still gets
+/// the full arenas.
 ///
 /// One slot rather than zero keeps every backend's buffer non-empty.
 pub(crate) const STREAMS_OUTBOX_RECORD_SLOTS: usize = 1;
@@ -109,15 +103,29 @@ pub const fn round_compaction_count_words(node_count: usize) -> usize {
 /// Whether a lowered device plan must dispatch the full-width finalize sweep.
 ///
 /// Summary observations need no cumulative observation-log totals. With stream decomposition,
-/// continuation control has already collected every drain error, exchange prefix writes its errors
-/// directly to control, scatter has no error writer, and stream merge does not write LP errors. The
-/// streams+Summary path can therefore retain only the ordered width-1 finalize dispatch. Full
-/// observations and the legacy heap path keep the sweep.
+/// continuation control has already collected every drain error (since P18 including the channel
+/// capacity and order errors the producers raise while they write the rings), and stream merge
+/// does not write LP errors. The streams+Summary path can therefore retain only the ordered
+/// width-1 finalize dispatch. Full observations and the legacy heap path keep the sweep.
 ///
 /// This selector depends only on lowering inputs, never on timing, occupancy, or prior rounds.
 #[doc(hidden)]
 pub const fn finalize_sweep_required(full_observations: bool, streams_enabled: bool) -> bool {
     full_observations || !streams_enabled
+}
+
+/// Whether a lowered device plan dispatches the legacy staged exchange: `days_exchange_prefix`
+/// (each producer's outbox compaction base) and `days_exchange_scatter` (the copy into the
+/// outbox).
+///
+/// P18 ring writes (`days-gpu/evidence/P17/partition/design.md` §1): on the streams path each
+/// producer writes its remote events straight into the consumer's channel ring, at slots fixed by
+/// the round-start snapshot `days_round_reset` takes, and `days_exchange_merge` publishes them. A
+/// streams plan therefore stages nothing, and carries no `remote_staging` arena. Like
+/// [`finalize_sweep_required`], this depends only on lowering inputs.
+#[doc(hidden)]
+pub const fn staged_exchange_required(streams_enabled: bool) -> bool {
+    !streams_enabled
 }
 
 /// Words the per-round scratch region occupies inside `stream_state`: the T21 FEL-root cache (two
@@ -734,17 +742,12 @@ pub fn size_default_device_plan(
         .ok_or_else(|| sizing_error("fallback FEL slots overflow usize"))?;
     let legacy_heap_event_slots = checked_sum(&legacy_fel_capacities, "legacy FEL slots")?;
     let queue_slots = checked_sum(&queue_capacities, "queue slots")?;
-    let mut remote_capacities = derived_remote_capacities(image, &context, concurrency.as_ref());
     let mut channel_capacities = derived_channel_stream_capacities(image, &context)?;
     if let Some(notify) = &notify {
-        for &(node, count) in &notify.sources {
-            remote_capacities[node] = remote_capacities[node].saturating_add(count);
-        }
         for &(channel, count) in &notify.lanes {
             channel_capacities[channel] = channel_capacities[channel].saturating_add(count);
         }
     }
-    let remote_staging_slots = checked_sum(&remote_capacities, "remote staging slots")?;
     let channel_stream_event_slots = checked_sum(&channel_capacities, "channel stream slots")?;
     let service_stream_event_slots = node_count
         .checked_mul(2)
@@ -765,7 +768,7 @@ pub fn size_default_device_plan(
                 .and_then(|generator| words.checked_add(generator))
         })
         .ok_or_else(|| sizing_error("stream record words overflow usize"))?;
-    let stream_state_words = stream_state_words(image, remote_staging_slots)?.max(1);
+    let stream_state_words = stream_state_words(image)?.max(1);
     let inbound_producer_words = inbound_producer_words(image, notify.as_ref());
 
     let route_words = image
@@ -799,12 +802,9 @@ pub fn size_default_device_plan(
         1,
         checked_product(node_count.max(1), LP_STATE_WORDS, "LP-state plane")?,
         checked_product(node_count, ARENA_META_WORDS, "remote metadata plane")?,
-        checked_product(
-            remote_staging_slots,
-            REMOTE_STAGING_EVENT_WORDS,
-            "remote staging plane",
-        )?
-        .max(1),
+        // P18 ring writes: a streams plan stages no remote event; the logically empty plane keeps
+        // its one word.
+        1,
         checked_product(
             node_count,
             OBSERVATION_META_WORDS,
@@ -1980,61 +1980,6 @@ fn flow_link_fel_bound(
     )
 }
 
-/// Per-producer remote staging capacities.
-///
-/// The device planners upload the uncapped sum of these capacities (2 per node included) as
-/// `params[P_OUTBOX_CAPACITY]`. This module does not need that scalar: the streams-enabled plan it
-/// sizes carries [`STREAMS_OUTBOX_RECORD_SLOTS`] outbox records, and the capacity number is not a
-/// plane. The bounds of a host's unfinished stages are charged together (P16 G2, ruling G7).
-fn derived_remote_capacities(
-    image: &SimulationImage,
-    context: &CapacityContext,
-    concurrency: Option<&crate::stage_sizing::SizingConcurrency>,
-) -> Vec<usize> {
-    let mut capacities = vec![2_usize; image.nodes.len()];
-    let mut charges = crate::stage_sizing::ConcurrentCharges::default();
-    for (index, flow) in image.flows.iter().enumerate() {
-        let feedback_count = context.feedback_counts[index];
-        let data_count = context.packet_counts[index].saturating_sub(feedback_count);
-        let group = concurrency.and_then(|concurrency| concurrency.group(index));
-        // A windowed pair with its timeout off has at most its window's packets, and as many
-        // feedback packets, in the network at once (ruling R11 (b)).
-        let window = concurrency.and_then(|concurrency| concurrency.window_packets(index));
-        for (route, packet_count, packet_kind) in [
-            (flow.route.as_slice(), data_count, PacketKind::Data),
-            (
-                flow.reverse_route.as_slice(),
-                feedback_count,
-                PacketKind::Feedback,
-            ),
-        ] {
-            for link_id in route {
-                let producer = image.links[link_id.0 as usize].source.0 as usize;
-                let bound = flow_link_round_bound(
-                    image,
-                    context,
-                    index,
-                    packet_count,
-                    packet_kind,
-                    *link_id,
-                );
-                crate::stage_sizing::charge(
-                    &mut capacities,
-                    &mut charges,
-                    group,
-                    producer,
-                    crate::stage_sizing::charge_class(packet_kind),
-                    window.map_or(bound, |window| bound.min(window)),
-                );
-            }
-        }
-    }
-    if let Some(concurrency) = concurrency {
-        charges.apply(concurrency, &mut capacities);
-    }
-    capacities
-}
-
 fn derived_channel_stream_capacities(
     image: &SimulationImage,
     context: &CapacityContext,
@@ -2120,10 +2065,7 @@ fn derived_channel_stream_capacities(
         .collect())
 }
 
-fn stream_state_words(
-    image: &SimulationImage,
-    remote_staging_slots: usize,
-) -> Result<usize, DeviceSizingError> {
+fn stream_state_words(image: &SimulationImage) -> Result<usize, DeviceSizingError> {
     let node_count = image.nodes.len();
     let channel_count = image.channels.len();
     let service_stream_base = channel_count;
@@ -2185,7 +2127,6 @@ fn stream_state_words(
             "outbound channel entries",
         )?,
         checked_product(channel_count, CHANNEL_BATCH_WORDS, "channel batches")?,
-        remote_staging_slots,
         channel_count,
         round_scratch_words(node_count)
             .ok_or_else(|| sizing_error("round scratch size overflows usize"))?,

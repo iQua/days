@@ -44,23 +44,29 @@ fn only_streams_summary_omits_the_finalize_sweep() {
             "{backend} must derive the finalize policy from the lowered Full and streams words",
         );
     }
+    // P18: each backend decides every omitted entry (the finalize sweep, and on the streams path
+    // the legacy staged exchange) in one place, from the lowered-plan policy words.
     assert_eq!(
         CUDA_BACKEND
-            .matches("!buffers.finalize_sweep_required")
+            .matches("buffers.finalize_sweep_required,\n                        staged_exchange_required,")
             .count(),
         1,
         "CUDA production encoding must apply the lowered-plan policy directly",
     );
+    assert!(
+        CUDA_BACKEND.contains("FINALIZE_SWEEP_KERNEL_INDEX => finalize_sweep_required,"),
+        "CUDA must apply the finalize policy to the finalize-sweep entry",
+    );
     assert_eq!(
         METAL_BACKEND
-            .matches("!buffers.finalize_sweep_required")
+            .matches("kernel.encoded(buffers.finalize_sweep_required, staged_exchange_required)")
             .count(),
         1,
         "Metal ordinary encoding must apply the lowered-plan policy directly",
     );
     assert!(
-        CUDA_BACKEND.contains("index == FINALIZE_SWEEP_KERNEL_INDEX"),
-        "CUDA must apply the policy only to the finalize-sweep entry",
+        METAL_BACKEND.contains("Self::FinalControlSweep => finalize_sweep_required,"),
+        "Metal must apply the finalize policy to the finalize-sweep dispatch",
     );
     for (backend, finalize) in [
         ("CUDA", cuda_kernel("days_round_finalize")),

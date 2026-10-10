@@ -355,8 +355,10 @@ fn assert_0695_initial_plan(
     image: &SimulationImage,
     strict: DeviceSizingReport,
     retry_enabled: DeviceSizingReport,
+    legacy: DeviceSizingReport,
     expected_total_device_bytes: usize,
 ) {
+    const EVENT_WORDS: usize = 14;
     const CHANNEL_EVENT_WORDS: usize = 11;
     const SERVICE_EVENT_WORDS: usize = 5;
     const GENERATOR_EVENT_WORDS: usize = 10;
@@ -413,6 +415,25 @@ fn assert_0695_initial_plan(
         .collect::<std::collections::BTreeSet<_>>()
         .len()
         * std::mem::size_of::<u64>();
+    // P18 ring writes: a streams plan stages nothing. It drops the 12-word staging records (all
+    // but the placeholder word) and the one channel id per staging slot in `stream_state`. The
+    // slots are the legacy heap plan's: the same per-producer capacities, in 14-word records.
+    let staging = |report: &DeviceSizingReport| {
+        report
+            .planes
+            .iter()
+            .find(|plane| plane.name == "remote_staging")
+            .expect("remote-staging plane must exist")
+            .words
+    };
+    assert_eq!(
+        staging(&strict),
+        1,
+        "{backend}: a streams plan stages nothing"
+    );
+    assert_eq!(staging(&legacy) % EVENT_WORDS, 0);
+    let staging_slots = staging(&legacy) / EVENT_WORDS;
+    let p18_staging_bytes = (staging_slots * 12 - 1 + staging_slots) * std::mem::size_of::<u64>();
     assert_eq!(
         strict.total_device_bytes,
         expected_total_device_bytes
@@ -420,10 +441,11 @@ fn assert_0695_initial_plan(
             + p14_pfc_params_bytes
             + p15_roce_params_bytes
             + p16_stage_params_bytes
-            - p17_generator_id_bytes,
+            - p17_generator_id_bytes
+            - p18_staging_bytes,
         "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region, \
          the P14 PFC-offset params word, the P15 RoCE-offset params word and the P16 \
-         stage-offset params word, less the P17 generator stream ids",
+         stage-offset params word, less the P17 generator stream ids and the P18 staging",
     );
 }
 
@@ -472,6 +494,17 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
             ObservationMode::Summary,
         )
         .expect("retry-enabled Metal initial capped plan must size"),
+        size_metal_plan_for_testing(
+            &image,
+            None,
+            MetalConfig {
+                capacity_caps,
+                streams_enabled: false,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Summary,
+        )
+        .expect("legacy Metal initial capped plan must size"),
         // T20i widened the per-flow TCP ledger metadata row from 4 words to 6 (ring head +
         // occupancy high-water). The eight open-loop flows still reserve those generic per-flow
         // rows, so the anchor moves by exactly 8 * 2 * 8 = 128 B. Nothing else in the plan
@@ -514,6 +547,17 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
             ObservationMode::Summary,
         )
         .expect("retry-enabled CUDA initial capped plan must size"),
+        size_cuda_plan_for_testing(
+            &image,
+            None,
+            CudaConfig {
+                capacity_caps,
+                streams_enabled: false,
+                ..CudaConfig::default()
+            },
+            ObservationMode::Summary,
+        )
+        .expect("legacy CUDA initial capped plan must size"),
         // T20i ledger-metadata widening: 8 flows * 2 words * 8 B = 128 B. T21 streams-path outbox
         // elision: -435,344 B. The image-derived ACK-minimum delta is zero; see the Metal anchor.
         1_269_904 + 128 - 435_344 - 75_440,
@@ -523,12 +567,11 @@ fn channel_starting_cap_preserves_the_0695f02_initial_plan_bytes() {
 /// T21: the legacy exchange outbox is storage only the legacy exchange path can address.
 ///
 /// `days_exchange_prefix` (compaction offsets), `days_exchange_scatter` (the copy in) and
-/// `days_exchange_merge` (the drain out) are the only kernels that index the plane, and on both
-/// backends each of those accesses is inside a branch that has already tested
-/// `params[P_STREAMS_ENABLED] == 0`. A streams-enabled plan therefore allocates one record; a
-/// streams-disabled plan still allocates the whole derived arena. `P_OUTBOX_CAPACITY` — which the
-/// streams path *does* read, to bound a round's remote production — is derived and uploaded
-/// identically in both cases, so this is a storage change and not a capacity change.
+/// `days_exchange_merge`'s legacy branch (the drain out) are the only kernels that index the plane,
+/// and a streams plan launches neither of the first two (P18) and takes the merge's streams branch.
+/// A streams-enabled plan therefore allocates one record; a streams-disabled plan still allocates
+/// the whole derived arena. Since P18 the streams path stages nothing either, so it reads neither
+/// `P_OUTBOX_CAPACITY` nor any staging capacity.
 #[test]
 fn streams_enabled_plans_carry_one_outbox_record_and_legacy_plans_carry_the_arena() {
     const ONE_RECORD_WORDS: usize = 14;
@@ -610,17 +653,17 @@ fn assert_outbox_partition(
     );
     // The derived outbox capacity — what both paths upload as `P_OUTBOX_CAPACITY` — is the sum of
     // the per-producer remote-staging capacities, so uncapped the legacy arena is exactly the
-    // `remote_staging` plane. O2.12 stores one 12-word compact staging record in streams mode and
-    // one full 14-word record in legacy mode; the record capacity remains identical.
+    // `remote_staging` plane. Since P18 a streams plan stages nothing: its producers write the
+    // channel rings directly, and its staging plane is the one-word placeholder.
     assert_eq!(
         legacy_outbox,
         plane(legacy, "remote_staging"),
         "{backend} {fixture}: the uncapped legacy outbox arena is the remote-staging arena"
     );
     assert_eq!(
-        plane(streams, "remote_staging") / 12,
-        plane(legacy, "remote_staging") / 14,
-        "{backend} {fixture}: the derived remote record capacity must not depend on the exchange path"
+        plane(streams, "remote_staging"),
+        1,
+        "{backend} {fixture}: a streams plan stages nothing"
     );
 }
 

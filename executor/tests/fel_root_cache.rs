@@ -66,7 +66,6 @@ fn each_kernel_span_stops_at_the_next_entry_point_whatever_form_it_takes() {
             "days_round",
             "days_round_control_sweep",
             "days_round_control",
-            "days_exchange_prefix_sweep",
             "days_exchange_prefix",
             "days_exchange_scatter",
             "days_exchange_merge",

@@ -925,28 +925,69 @@ fn e5_exact_capped_metal_plans_match_the_frozen_classes() {
             .find(|plane| plane.name == "remote_staging")
             .expect("E5 Metal plan must report remote staging")
             .words as u128;
-        assert_eq!(remote_staging_words % 12, 0);
+        // P18 ring writes: a streams plan stages nothing, so its staging plane is the one-word
+        // placeholder. The staging slots the frozen classes carried are the legacy heap path's:
+        // the same per-producer capacities, in 14-word records.
+        assert_eq!(remote_staging_words, 1);
+        let legacy_staging_words = size_metal_plan_for_testing(
+            &lower(fixture),
+            None,
+            MetalConfig {
+                capacity_caps: E5_CAPACITY_CAPS,
+                streams_enabled: false,
+                ..MetalConfig::default()
+            },
+            ObservationMode::Summary,
+        )
+        .unwrap_or_else(|error| panic!("{fixture} legacy Metal plan must size: {error}"))
+        .planes
+        .iter()
+        .find(|plane| plane.name == "remote_staging")
+        .expect("E5 legacy Metal plan must report remote staging")
+        .words as u128;
+        assert_eq!(legacy_staging_words % 14, 0);
+        let staging_slots = legacy_staging_words / 14;
         let compact_reduction_bytes = (report.event_arenas.channel_stream_event_slots as u128 * 3
             + report.event_arenas.service_stream_event_slots as u128 * 9
             + report.event_arenas.generator_stream_event_slots as u128 * 4
-            + remote_staging_words / 12 * 2)
+            + staging_slots * 2)
             * 8;
         // P14 Lane B T4 appended one params word addressing the PFC region (`u64::MAX` here: E5
         // carries no PFC state and plans no PFC words). No other plane moved.
         let p14_pfc_params_bytes = 8;
+        // P18 ring writes: the 12-word staging records (all but the placeholder word) and the one
+        // channel id per staging slot in `stream_state`.
+        let p18_staging_bytes = (staging_slots * 12 - 1 + staging_slots) * 8;
+        // P15 lane R4 and P16 G1 each appended one params word (the RoCE and stage region
+        // offsets, `u64::MAX` here), and the P17 merge dropped the generator stream ids from the
+        // LP stream lists in `stream_state`, one word per distinct generator flow. This pin runs
+        // only with `metal-test-hooks` and had missed all three at `5c7629ff` (it failed there by
+        // 65,520 B, measured).
+        let p15_p16_params_bytes = 16;
+        let p17_generator_id_bytes = lower(fixture)
+            .host_states
+            .iter()
+            .flat_map(|state| &state.generators)
+            .map(|generator| generator.flow)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u128
+            * 8;
         let expected_bytes = pre_o212_bytes
             .checked_sub(compact_reduction_bytes)
             .expect("compact planes must fit the prior frozen plan")
-            + p14_pfc_params_bytes;
+            + p14_pfc_params_bytes
+            + p15_p16_params_bytes
+            - p17_generator_id_bytes
+            - p18_staging_bytes;
         println!(
             "E5 exact capped Metal plan {fixture}: bytes={derived_total} gib={:.9} \
-             channel_slots={} service_slots={} generator_slots={} remote_staging_words={} \
+             channel_slots={} service_slots={} generator_slots={} staging_slots={} \
              compact_reduction_bytes={compact_reduction_bytes} headroom_bytes={}",
             derived_total as f64 / GIB_BYTES as f64,
             report.event_arenas.channel_stream_event_slots,
             report.event_arenas.service_stream_event_slots,
             report.event_arenas.generator_stream_event_slots,
-            remote_staging_words,
+            staging_slots,
             DEVICE_CAP_BYTES - derived_total
         );
         assert_eq!(derived_total, expected_bytes);
@@ -1440,12 +1481,15 @@ fn e5_primary_completion_anchor_is_identical_on_metal() {
     );
     assert_eq!(high_water.queue_records.high_water.len(), image.nodes.len());
     assert_high_water("stream_records", &high_water.stream_records, None);
-    assert_high_water(
-        "remote_staging",
-        &high_water.remote_staging,
-        E5_CAPACITY_CAPS
-            .remote_staging_events_per_lp
-            .map(|capacity| capacity as u64),
+    // P18 ring writes: the streams path stages nothing, so every LP's staging capacity is zero.
+    assert!(
+        high_water
+            .remote_staging
+            .capacities
+            .iter()
+            .chain(&high_water.remote_staging.high_water)
+            .all(|words| *words == 0),
+        "the streams path must plan and use no remote staging"
     );
     assert_high_water(
         "queue_records",

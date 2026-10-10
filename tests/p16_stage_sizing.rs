@@ -79,6 +79,42 @@ fn exact_plans(image: &SimulationImage) -> Vec<(&'static str, DeviceSizingReport
     plans
 }
 
+/// The production plans with the legacy heap exchange. Since P18 only that path stages remote
+/// events (a streams plan's producers write the channel rings directly), so the staging rules
+/// (rulings G7 and R11) are checked on these plans.
+fn exact_legacy_plans(image: &SimulationImage) -> Vec<(&'static str, DeviceSizingReport)> {
+    vec![
+        #[cfg(any(feature = "cuda", feature = "cuda-planner-test"))]
+        (
+            "CUDA legacy",
+            days_executor::size_cuda_plan_for_testing(
+                image,
+                None,
+                days_executor::CudaConfig {
+                    streams_enabled: false,
+                    ..days_executor::CudaConfig::default()
+                },
+                ObservationMode::Summary,
+            )
+            .expect("CUDA plan must size"),
+        ),
+        #[cfg(all(feature = "metal", target_vendor = "apple"))]
+        (
+            "Metal legacy",
+            days_executor::size_metal_plan_for_testing(
+                image,
+                None,
+                days_executor::MetalConfig {
+                    streams_enabled: false,
+                    ..days_executor::MetalConfig::default()
+                },
+                ObservationMode::Summary,
+            )
+            .expect("Metal plan must size"),
+        ),
+    ]
+}
+
 #[test]
 fn projected_tcp_state_is_the_planners_allocation() {
     for relative in FIXTURES {
@@ -151,13 +187,33 @@ fn p17_generator_id_bytes(image: &SimulationImage) -> usize {
         * std::mem::size_of::<u64>()
 }
 
+/// P18 ring writes: a streams plan stages nothing. It drops the 12-word staging records (all but
+/// the placeholder word of the logically empty plane) and the one channel id per staging slot in
+/// `stream_state`. The slots are the legacy heap plan's: the same per-producer capacities, in
+/// 14-word records.
+fn p18_staging_bytes(legacy: &DeviceSizingReport) -> usize {
+    let words = plane_words(legacy, "remote_staging");
+    assert_eq!(words % 14, 0, "legacy staging records are 14 words");
+    let slots = words / 14;
+    (slots * 12 - 1 + slots) * std::mem::size_of::<u64>()
+}
+
 #[test]
 fn stageless_windowless_plans_keep_their_bytes() {
     for &(relative, metal, cuda) in STAGELESS_PLAN_BYTES {
         let image = lower(relative);
-        for (backend, exact) in exact_plans(&image) {
-            let expected =
-                if backend == "Metal" { metal } else { cuda } - p17_generator_id_bytes(&image);
+        for ((backend, exact), (_, legacy)) in exact_plans(&image)
+            .into_iter()
+            .zip(exact_legacy_plans(&image))
+        {
+            let expected = if backend == "Metal" { metal } else { cuda }
+                - p17_generator_id_bytes(&image)
+                - p18_staging_bytes(&legacy);
+            assert_eq!(
+                plane_words(&exact, "remote_staging"),
+                1,
+                "{backend} {relative}"
+            );
             assert_eq!(exact.total_device_bytes, expected, "{backend} {relative}");
         }
     }
@@ -291,13 +347,18 @@ fn a_longer_stage_chain_plans_no_more_staging_or_queue() {
         for ((backend, one), (_, three)) in exact_plans(&one).into_iter().zip(exact_plans(&three)) {
             plans.push((backend, one, three));
         }
-        for (backend, one, three) in plans {
+        for ((backend, one), (_, three)) in exact_legacy_plans(&one)
+            .into_iter()
+            .zip(exact_legacy_plans(&three))
+        {
             assert_eq!(
                 plane_words(&three, "remote_staging"),
                 plane_words(&one, "remote_staging"),
                 "{backend} window {window_bytes}: three chained collectives must plan the \
                  remote staging of one"
             );
+        }
+        for (backend, one, three) in plans {
             let (queue_one, queue_three) = (
                 plane_words(&one, "queue_records"),
                 plane_words(&three, "queue_records"),
@@ -353,16 +414,10 @@ fn all_to_all(ranks: u64, joined: bool, window_bytes: u64) -> String {
 fn a_join_after_an_all_to_all_plans_the_all_to_alls_concurrency() {
     let alone = compile_text(&all_to_all(4, false, 0));
     let joined = compile_text(&all_to_all(4, true, 0));
-    let mut plans = vec![(
-        "projection",
-        size_default_device_plan(&alone).expect("projection"),
-        size_default_device_plan(&joined).expect("projection"),
-    )];
-    for ((backend, alone), (_, joined)) in exact_plans(&alone).into_iter().zip(exact_plans(&joined))
+    for ((backend, alone), (_, joined)) in exact_legacy_plans(&alone)
+        .into_iter()
+        .zip(exact_legacy_plans(&joined))
     {
-        plans.push((backend, alone, joined));
-    }
-    for (backend, alone, joined) in plans {
         assert_eq!(
             plane_words(&joined, "remote_staging"),
             plane_words(&alone, "remote_staging"),
@@ -378,18 +433,10 @@ fn a_join_after_an_all_to_all_plans_the_all_to_alls_concurrency() {
 fn a_windowed_pairs_staging_is_bounded_by_its_window() {
     let windowless = compile_text(&all_to_all(4, true, 0));
     let windowed = compile_text(&all_to_all(4, true, 20_000));
-    let mut plans = vec![(
-        "projection",
-        size_default_device_plan(&windowless).expect("projection"),
-        size_default_device_plan(&windowed).expect("projection"),
-    )];
-    for ((backend, windowless), (_, windowed)) in exact_plans(&windowless)
+    for ((backend, windowless), (_, windowed)) in exact_legacy_plans(&windowless)
         .into_iter()
-        .zip(exact_plans(&windowed))
+        .zip(exact_legacy_plans(&windowed))
     {
-        plans.push((backend, windowless, windowed));
-    }
-    for (backend, windowless, windowed) in plans {
         let (without, with) = (
             plane_words(&windowless, "remote_staging"),
             plane_words(&windowed, "remote_staging"),
