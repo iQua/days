@@ -201,13 +201,16 @@ constant uint RESUME_SCAN_COUNT_WORDS = 3;
 // nothing and carry no audit. Transliterated from `cuda_kernels.cu` (params word 35 there).
 #ifdef DAYS_MERGE_AUDIT
 constant uint P_MERGE_AUDIT_OFFSET = 39;
-constant uint MERGE_AUDIT_WORDS = 6;
+constant uint MERGE_AUDIT_WORDS = 8;
 constant uint MA_INVOCATIONS = 0;
 constant uint MA_STREAMS_READ = 1;
 constant uint MA_APPENDED = 2;
 constant uint MA_MISMATCHES = 3;
 constant uint MA_NONEMPTY_STREAMS = 4;
 constant uint MA_STREAM_ENTRIES = 5;
+// P18 ring writes: the visibility audit (`days_exchange_merge`).
+constant uint MA_VISIBILITY_CHECKS = 6;
+constant uint MA_VISIBILITY_MISMATCHES = 7;
 #define RECORD_MERGE(params, state, node, counter, amount) \
     ((state)[(params)[P_MERGE_AUDIT_OFFSET] + (node) * MERGE_AUDIT_WORDS + (counter)] += \
         (ulong)(amount))

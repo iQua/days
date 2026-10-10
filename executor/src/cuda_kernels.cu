@@ -169,13 +169,16 @@ constexpr uint RESUME_SCAN_COUNT_WORDS = 3;
 // nothing and carry no audit.
 #ifdef DAYS_MERGE_AUDIT
 constexpr uint P_MERGE_AUDIT_OFFSET = 35;
-constexpr uint MERGE_AUDIT_WORDS = 6;
+constexpr uint MERGE_AUDIT_WORDS = 8;
 constexpr uint MA_INVOCATIONS = 0;
 constexpr uint MA_STREAMS_READ = 1;
 constexpr uint MA_APPENDED = 2;
 constexpr uint MA_MISMATCHES = 3;
 constexpr uint MA_NONEMPTY_STREAMS = 4;
 constexpr uint MA_STREAM_ENTRIES = 5;
+// P18 ring writes: the visibility audit (`days_exchange_merge`).
+constexpr uint MA_VISIBILITY_CHECKS = 6;
+constexpr uint MA_VISIBILITY_MISMATCHES = 7;
 #define RECORD_MERGE(params, state, node, counter, amount) \
     ((state)[(params)[P_MERGE_AUDIT_OFFSET] + (node) * MERGE_AUDIT_WORDS + (counter)] += \
         (ulong)(amount))
