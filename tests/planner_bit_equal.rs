@@ -402,16 +402,28 @@ fn assert_0695_initial_plan(
     // P16 G1 appended one params word addressing the stage region (`u64::MAX` for this image, which
     // carries no collective or compute stage and plans no stage words). No other plane moved.
     let p16_stage_params_bytes = std::mem::size_of::<u64>();
+    // P17 merge: the LP stream lists in `stream_state` no longer store the generator stream ids
+    // (the device merge reads only each LP's inbound channels and service stream), one word per
+    // distinct generator flow. DERIVED from the image, like the round-scratch delta above.
+    let p17_generator_id_bytes = image
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .map(|generator| generator.flow)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        * std::mem::size_of::<u64>();
     assert_eq!(
         strict.total_device_bytes,
         expected_total_device_bytes
             + t21_round_scratch_bytes
             + p14_pfc_params_bytes
             + p15_roce_params_bytes
-            + p16_stage_params_bytes,
+            + p16_stage_params_bytes
+            - p17_generator_id_bytes,
         "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region, \
          the P14 PFC-offset params word, the P15 RoCE-offset params word and the P16 \
-         stage-offset params word",
+         stage-offset params word, less the P17 generator stream ids",
     );
 }
 

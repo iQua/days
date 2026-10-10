@@ -85,6 +85,9 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
     let round_scratch_bytes = days_executor::device_sizing::round_scratch_words(LOWERED_LPS)
         .expect("round scratch must size")
         * std::mem::size_of::<u64>();
+    // P17 merge: the LP stream lists in `stream_state` no longer store the generator stream ids,
+    // one word for each of the image's 5,530 generator streams (one per flow, above).
+    let p17_generator_id_bytes = FLOWS * std::mem::size_of::<u64>();
     assert!(stdout.contains(&format!(
         "record=device_sizing_arena \
          legacy_heap_event_slots=32775270 fallback_heap_event_slots=152986 \
@@ -92,8 +95,8 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
          generator_stream_event_slots=11060 heap_arena_bytes=21853024 \
          stream_arena_bytes={} total_event_arena_bytes={} \
          legacy_heap_arena_bytes=3675548832",
-        490_621_544_usize + round_scratch_bytes,
-        512_474_568_usize + round_scratch_bytes,
+        490_621_544_usize + round_scratch_bytes - p17_generator_id_bytes,
+        512_474_568_usize + round_scratch_bytes - p17_generator_id_bytes,
     )));
     assert!(stdout.contains("record=device_sizing_total plane_count=29 total_device_bytes="));
 }

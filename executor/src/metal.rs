@@ -1286,6 +1286,7 @@ impl MetalExecutor {
         {
             reset_dominant_arena_high_water();
             crate::device_pfc::take_resume_scan_counts_for_testing();
+            crate::merge_audit::reset();
         }
         validate(image, Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
@@ -3142,9 +3143,17 @@ fn prepare_streams(
         }
     }
 
+    // P17 merge: the device reads only each LP's inbound channels and the service stream that
+    // ends them (`days_exchange_merge`), so only that prefix of the sorted list is stored. The
+    // LP's metadata keeps the whole list's length, the number of streams it owns, which sizes its
+    // active list (one entry per owned stream plus the heap entry).
+    let lp_stream_id_prefix =
+        |streams: &[u64]| streams.partition_point(|&stream| stream < generator_stream_base as u64);
     let lp_stream_id_words = lp_streams
         .iter()
-        .try_fold(0_usize, |total, streams| total.checked_add(streams.len()))
+        .try_fold(0_usize, |total, streams| {
+            total.checked_add(lp_stream_id_prefix(streams))
+        })
         .ok_or_else(|| MetalError::Validation("LP stream-list size overflows usize".into()))?;
     let lp_active_id_words = lp_streams
         .iter()
@@ -3191,8 +3200,9 @@ fn prepare_streams(
         state[meta] = declared_cursor as u64;
         state[meta + 1] = streams.len() as u64;
         state[meta + 2] = active_cursor as u64;
-        state[declared_cursor..declared_cursor + streams.len()].copy_from_slice(streams);
-        declared_cursor += streams.len();
+        let prefix = &streams[..lp_stream_id_prefix(streams)];
+        state[declared_cursor..declared_cursor + prefix.len()].copy_from_slice(prefix);
+        declared_cursor += prefix.len();
         let fel_count = fel_meta[node * ARENA_META_WORDS + 3];
         if fel_count != 0 {
             state[active_cursor] = NONE;
@@ -4151,6 +4161,8 @@ struct DominantArenaDiagnosticLayout {
     queue_high_water_offset: usize,
     /// P16 H4: the RESUME-scan counter rows in `scheduler_state`.
     resume_scan_offset: usize,
+    /// P17 merge: the merge-audit rows in `stream_state`.
+    merge_audit_offset: usize,
 }
 
 impl MetalBuffers {
@@ -4207,6 +4219,17 @@ impl MetalBuffers {
                 "the RESUME-scan counters take params word 38"
             );
             plan.params.push(resume_scan_offset as u64);
+            // P17 merge: the merge counter rows and the flow-source table (params word 39).
+            let merge_audit_offset = plan.stream_state.len();
+            let region =
+                crate::merge_audit::hook_region(plan.params[0] as usize, &plan.flows, FLOW_WORDS);
+            plan.stream_state.extend(region);
+            assert_eq!(
+                plan.params.len(),
+                39,
+                "the merge-audit region takes params word 39"
+            );
+            plan.params.push(merge_audit_offset as u64);
             DominantArenaDiagnosticLayout {
                 stream_high_water_offset,
                 stream_count: plan.stream_layout.stream_count,
@@ -4214,6 +4237,7 @@ impl MetalBuffers {
                 node_count: plan.params[0] as usize,
                 queue_high_water_offset,
                 resume_scan_offset,
+                merge_audit_offset,
             }
         };
         let round_capacity = plan.round_capacity;
@@ -4396,6 +4420,14 @@ impl MetalBuffers {
                     layout
                         .node_count
                         .saturating_mul(crate::device_pfc::RESUME_SCAN_COUNT_WORDS),
+                ),
+            );
+            crate::merge_audit::record(
+                &self.planes[25].read_range(
+                    layout.merge_audit_offset,
+                    layout
+                        .node_count
+                        .saturating_mul(crate::merge_audit::MERGE_AUDIT_WORDS),
                 ),
             );
         }
@@ -5560,7 +5592,8 @@ impl DirectMetal {
             .ok_or_else(|| MetalError::Unavailable("command queue creation failed".into()))?;
         #[cfg(feature = "metal-test-hooks")]
         let instrumented_source = format!(
-            "#define DAYS_DOMINANT_ARENA_HIGH_WATER 1\n#define DAYS_RESUME_SCAN_COUNT 1\n{}",
+            "#define DAYS_DOMINANT_ARENA_HIGH_WATER 1\n#define DAYS_RESUME_SCAN_COUNT 1\n\
+             #define DAYS_MERGE_AUDIT 1\n{}",
             include_str!("metal_kernels.metal")
         );
         #[cfg(feature = "metal-test-hooks")]
