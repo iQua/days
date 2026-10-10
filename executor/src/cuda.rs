@@ -219,17 +219,79 @@ fn managed_memory_reserve(total: usize) -> usize {
 ///
 /// Neither limit can see memory that other processes allocate after the check, so a plan under it
 /// can still run out of memory when the host is shared.
+///
+/// P18 c6: on a managed device the host's heap shares the same memory, so the managed limit is
+/// also reduced by `host_bytes`, the heap the run holds beside its plan ([`run_host_bytes`]). A
+/// plan the device alone could hold but the device and the host together could not is refused
+/// before allocation, instead of the kernel OOM-killing the process during upload or readback.
 fn plan_memory_limit(
     provisioning: CudaProvisioning,
     free: usize,
     total: usize,
     configured: Option<usize>,
+    host_bytes: usize,
 ) -> usize {
     let device = match provisioning {
         CudaProvisioning::Device => free,
-        CudaProvisioning::Managed => total.saturating_sub(managed_memory_reserve(total)),
+        CudaProvisioning::Managed => total
+            .saturating_sub(managed_memory_reserve(total))
+            .saturating_sub(host_bytes),
     };
     configured.map_or(device, |configured| configured.min(device))
+}
+
+/// The host heap a device run holds beside its plan's device bytes (P18 c6): the image, plus the
+/// larger of the plan's host planes (alive until they are uploaded) and the readback's copy of
+/// the image's host and switch states. A deterministic lower bound: table lengths times element
+/// sizes, so whether a plan is admitted depends on the image and the plan, not on allocator
+/// state.
+fn run_host_bytes(image: &SimulationImage, plan_host_bytes: usize) -> usize {
+    use std::mem::size_of;
+    let states = image
+        .host_states
+        .iter()
+        .map(|state| {
+            size_of::<crate::HostState>()
+                + state.queue.len() * size_of::<PayloadId>()
+                + state.generators.len() * size_of::<crate::FlowGeneratorState>()
+                + state.stages.len() * size_of::<Option<crate::CollectiveStage>>()
+                + state.tcp_receivers.len() * size_of::<crate::TcpReceiverState>()
+                + state.dcqcn_receivers.len() * size_of::<crate::DcqcnReceiverState>()
+                + state
+                    .roce_receivers
+                    .as_ref()
+                    .map_or(0, |receivers| receivers.len())
+                    * size_of::<crate::RoceReceiverState>()
+        })
+        .chain(image.switch_states.iter().map(|state| {
+            size_of::<crate::SwitchState>()
+                + state
+                    .queues
+                    .iter()
+                    .map(|queue| {
+                        size_of::<crate::SwitchQueueState>()
+                            + queue.queue.len() * size_of::<PayloadId>()
+                    })
+                    .sum::<usize>()
+        }))
+        .fold(0_usize, usize::saturating_add);
+    let rest = image.nodes.len() * size_of::<crate::NodeDescriptor>()
+        + image
+            .flows
+            .iter()
+            .map(|flow| {
+                size_of::<crate::FlowDescriptor>()
+                    + (flow.route.len() + flow.reverse_route.len()) * size_of::<crate::LinkId>()
+            })
+            .fold(0_usize, usize::saturating_add)
+        + image.initial_packets.len() * size_of::<PacketDescriptor>()
+        + image.links.len() * size_of::<crate::LinkDescriptor>()
+        + image.channels.len() * size_of::<crate::RemoteChannel>()
+        + image.initial_events.len() * size_of::<Event>()
+        + image.stage_joins.len() * size_of::<crate::FlowId>();
+    states
+        .saturating_add(rest)
+        .saturating_add(plan_host_bytes.max(states))
 }
 
 #[cfg(feature = "cuda-test-hooks")]
@@ -1563,7 +1625,10 @@ impl CudaExecutor {
                 // P16 D2: refuse, before allocating, a plan the device cannot hold. The previous
                 // attempt's buffers were dropped with its closure; `device_memory_limit`
                 // synchronizes so their memory counts as free.
-                let limit_bytes = direct.device_memory_limit(attempt_config.max_device_bytes)?;
+                let limit_bytes = direct.device_memory_limit(
+                    attempt_config.max_device_bytes,
+                    run_host_bytes(image, plan.host_bytes()),
+                )?;
                 let planned_bytes = plan.device_bytes();
                 if planned_bytes > limit_bytes {
                     return Err(CudaError::DeviceMemoryExceeded {
@@ -1966,6 +2031,28 @@ impl CudaPlan {
             .fold(0_usize, |total, words| {
                 total.saturating_add(words.saturating_mul(std::mem::size_of::<u64>()))
             })
+    }
+
+    /// Bytes of the plan's planes held on the host until upload: every plane but the all-zero
+    /// ones, which the device allocates itself (P18 c2a).
+    fn host_bytes(&self) -> usize {
+        let zero = [
+            self.outbox,
+            self.worklist,
+            self.summary,
+            self.observed,
+            self.departures,
+            self.arrivals,
+            self.lp_state,
+            self.remote_staging,
+            self.merge_cursors,
+            self.stream_records,
+        ]
+        .into_iter()
+        .fold(0_usize, |total, plane| {
+            total.saturating_add(plane.len().saturating_mul(std::mem::size_of::<u64>()))
+        });
+        self.device_bytes().saturating_sub(zero)
     }
 
     /// Refuses the plain round kernel on this plan, before it is uploaded, if the plan holds any
@@ -5710,7 +5797,11 @@ impl DirectCuda {
     /// device's default pool, and reaches the free count only once a synchronization releases it
     /// (release threshold 0). Without the synchronization a capacity retry could see the previous
     /// attempt's memory as still in use and refuse a plan that fits.
-    fn device_memory_limit(&self, configured: Option<usize>) -> Result<usize, CudaError> {
+    fn device_memory_limit(
+        &self,
+        configured: Option<usize>,
+        host_bytes: usize,
+    ) -> Result<usize, CudaError> {
         self.stream
             .synchronize()
             .map_err(|error| driver_error("device memory query synchronization", error))?;
@@ -5723,6 +5814,7 @@ impl DirectCuda {
             free,
             total,
             configured,
+            host_bytes,
         ))
     }
 
@@ -6264,40 +6356,68 @@ mod tests {
     /// Fix 2 (review M2): the total itself is not usable, since the host keeps part of it (a
     /// 127 GB plan on madrid's 130.6 GB was OOM-killed during upload). The limit keeps a fixed
     /// reserve of `max(8 GiB, total / 16)`.
+    /// P18 c6 (finding F3): on a managed device the host heap shares the memory, so the limit
+    /// leaves room for it. madrid admitted a 100 GB plan beside a 30 GB host heap (122.0 GB limit,
+    /// 130.6 GB total); it is now refused. A discrete device's limit is its free memory, which the
+    /// host heap does not use.
+    #[test]
+    fn managed_provisioning_leaves_room_for_the_host_heap() {
+        const GB: usize = 1_000_000_000;
+        let (free, total) = (83_136_438_272, 130_594_156_544);
+        let limit = plan_memory_limit(CudaProvisioning::Managed, free, total, None, 30 * GB);
+        assert_eq!(limit, 122_004_221_952 - 30 * GB);
+        assert!(
+            100 * GB > limit,
+            "a 100 GB plan beside a 30 GB host heap is refused"
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None, total),
+            0
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Device, free, total, None, 30 * GB),
+            free
+        );
+        assert_eq!(
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(1_000), 30 * GB),
+            1_000
+        );
+    }
+
     #[test]
     fn managed_provisioning_checks_plans_against_total_memory_less_a_reserve() {
         const GIB: usize = 1 << 30;
         // madrid: total / 16 = 8,162,134,784 B is under the 8 GiB floor.
         let (free, total) = (83_136_438_272, 130_594_156_544);
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Managed, free, total, None),
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None, 0),
             total - 8 * GIB
         );
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Managed, free, total, None),
+            plan_memory_limit(CudaProvisioning::Managed, free, total, None, 0),
             122_004_221_952
         );
         // A small device keeps the 8 GiB floor.
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Managed, 0, 32 * GIB, None),
+            plan_memory_limit(CudaProvisioning::Managed, 0, 32 * GIB, None, 0),
             24 * GIB
         );
         // A large device keeps a sixteenth.
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Managed, 0, 512 * GIB, None),
+            plan_memory_limit(CudaProvisioning::Managed, 0, 512 * GIB, None, 0),
             480 * GIB
         );
         // A device smaller than the reserve admits nothing.
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Managed, 0, 4 * GIB, None),
+            plan_memory_limit(CudaProvisioning::Managed, 0, 4 * GIB, None, 0),
             0
         );
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(1_000)),
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(1_000), 0),
             1_000
         );
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(usize::MAX)),
+            plan_memory_limit(CudaProvisioning::Managed, free, total, Some(usize::MAX), 0),
             total - 8 * GIB
         );
     }
@@ -6307,15 +6427,15 @@ mod tests {
     fn device_provisioning_checks_plans_against_free_memory() {
         let (free, total) = (20_818_296_832, 21_464_350_720);
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Device, free, total, None),
+            plan_memory_limit(CudaProvisioning::Device, free, total, None, 0),
             free
         );
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Device, free, total, Some(1_000)),
+            plan_memory_limit(CudaProvisioning::Device, free, total, Some(1_000), 0),
             1_000
         );
         assert_eq!(
-            plan_memory_limit(CudaProvisioning::Device, free, total, Some(usize::MAX)),
+            plan_memory_limit(CudaProvisioning::Device, free, total, Some(usize::MAX), 0),
             free
         );
     }
