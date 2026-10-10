@@ -93,7 +93,8 @@ fn producers_write_their_rings_without_atomics_or_a_modulo() {
 }
 
 /// The round-start snapshot: `tail0 = (head + count) mod capacity` and `count0 = count`, taken by
-/// the reset before any processing attempt of the round.
+/// the reset before any processing attempt of the round, with the modulo as one conditional
+/// subtraction (`head < capacity`, `count <= capacity`).
 #[test]
 fn the_reset_snapshots_each_channel_tail_and_count() {
     for (backend, source, start, end) in [
@@ -112,8 +113,10 @@ fn the_reset_snapshots_each_channel_tail_and_count() {
     ] {
         let body = production(kernel_body(source, start, end));
         for fragment in [
+            "ulong tail = stream_state[stream_base + 2] + count;",
+            "if (tail >= capacity) {\n                tail -= capacity;",
             "stream_state[batch] = 0;",
-            "stream_state[batch + 1] = (stream_state[stream_base + 2] + count) %",
+            "stream_state[batch + 1] = tail;",
             "stream_state[batch + 2] = count;",
             "stream_state[batch + 3] = horizon_last;",
         ] {
@@ -122,6 +125,17 @@ fn the_reset_snapshots_each_channel_tail_and_count() {
                 "{backend} reset must contain `{fragment}`"
             );
         }
+        assert!(
+            !production(kernel_body(source, start, end))
+                .split("channel < params[P_CHANNEL_COUNT];")
+                .nth(1)
+                .expect("the per-channel loop")
+                .split("ulong local_count = 0;")
+                .next()
+                .expect("before the per-LP part")
+                .contains('%'),
+            "{backend} reset snapshot must not take a 64-bit modulo per channel"
+        );
     }
 }
 
