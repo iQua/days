@@ -206,6 +206,12 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         purpose: "validator flow-index equality hook and the P16 H1 per-host stage-width probe are exported only for standard tests",
     },
     AllowedFeatureGate {
+        path: "phase_marks.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 3,
+        purpose: "P18 diet-host's per-thread phase hook (its slot, the call in `mark` and its setter) exists only for memory-accounting tests and probes; in production builds `mark` is empty",
+    },
+    AllowedFeatureGate {
         path: "stage_sizing.rs",
         predicate: r#"feature = "planner-test-hooks""#,
         count: 1,
