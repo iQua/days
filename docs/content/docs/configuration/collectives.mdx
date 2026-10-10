@@ -87,7 +87,7 @@ Both runs end with `result_bytes=69710 result_fnv1a64=bf4bb10a72685679`. `--engi
 | `priority` | Optional 802.1Q priority in `0..=7`; default `0`. |
 | `traffic` | A byte `size`, and a constant `pkt_size_dist`, which sets the segment size (MSS) of every TCP stage or the MTU of every RoCE stage. `arr_dist` must be present but does not affect TCP or RoCE stages. `initial_delay` sets when the first stages start if the collective has no `after`. Duration-terminated traffic is rejected. |
 | `traffic.tcp` | TCP only. `cc_algorithm = "TCPReno"` or `"TCPCubic"`, with the same limits as a TCP [flow](/docs/configuration/flows#tcp). |
-| `traffic.dcqcn`, `traffic.roce` | RoCE only, both required. The same tables as a RoCE queue-pair [flow](/docs/configuration/flows), with the same defaults and limits. `retransmit_timeout_ns = 0` is accepted; see [RoCE stages](#roce-stages). |
+| `traffic.dcqcn`, `traffic.roce` | RoCE only. `traffic.roce` is required; `traffic.dcqcn` is required under its default `congestion_control = "dcqcn"` and refused with `congestion_control = "none"`. The same tables as a RoCE queue-pair [flow](/docs/configuration/flows), with the same defaults and limits. `retransmit_timeout_ns = 0` is accepted; see [RoCE stages](#roce-stages). |
 
 Lowering rejects `first_flow_id`, `graph`, `routing`, and `paths`: flow identity comes from the collective stage key, and routes come from the topology.
 
@@ -280,7 +280,7 @@ Two limits of the zero-send case are recorded rather than fixed: in an all-to-al
 
 ### RoCE stages
 
-With `flow_type = "RoCE"`, each stage is a RoCE queue pair: Mellanox-form DCQCN rate control, fed by the ECN echo on its ACKs and NACKs, with Go-back-N recovery, as described for [RoCE flows](/docs/configuration/flows#roce-queue-pairs). The collective's tables replace the flow's:
+With `flow_type = "RoCE"`, each stage is a RoCE queue pair with Go-back-N recovery, as described for [RoCE flows](/docs/configuration/flows#roce-queue-pairs): by default under Mellanox-form DCQCN rate control, fed by the ECN echo on its ACKs and NACKs, or with `congestion_control = "none"` at the host's link rate and with no controller. The collective's tables replace the flow's:
 
 ```toml
 [[collective]]
@@ -314,9 +314,20 @@ feedback_priority = 0
 
 `configs/p15/roce_compute_dag.toml` puts this collective between two compute groups on a four-switch line with host-link PFC and an ECN step. Scalar and CPU at 2 workers both end it with `result_bytes=208285 result_fnv1a64=b9462a2b3cbe0b26`.
 
+`configs/p17/nocc_ring_lossless.toml` runs the same ring without congestion control: `[collective.traffic.roce]` gains `congestion_control = "none"` and the `[collective.traffic.dcqcn]` table is removed, so each stage paces at its 1 Gbps host link, one 1,000-byte packet per 8,000 ns.
+
+```toml
+[collective.traffic.roce]
+congestion_control = "none"
+retransmit_timeout_ns = 1000000
+feedback_priority = 0
+```
+
+Its fabric has host-link PFC on class 3 and a 20 to 60 KB ECN ramp; a mark is echoed on the stage's ACKs and ignored by its sender. All 24 stages finish, with PFC pauses and no drop, and Scalar and CPU at 2 workers both end it with `result_bytes=191797 result_fnv1a64=cbc00d7c900ec7a9`.
+
 A RoCE stage differs from a TCP stage in four points:
 
-- **Start.** A stage that starts at time `t` behaves exactly like a queue pair whose `initial_delay` is `t`. Its first pacing tick is at `t` and its pacing grid is anchored at `t`. Its DCQCN controller is pristine until the stage's first ECN echo, and its retransmission timeout is armed by its first packet. Before it starts, a stage sends nothing and has no pending event.
+- **Start.** A stage that starts at time `t` behaves exactly like a queue pair whose `initial_delay` is `t`. Its first pacing tick is at `t` and its pacing grid is anchored at `t`. Under DCQCN its controller is pristine until the stage's first ECN echo (a stage without congestion control has no controller), and its retransmission timeout is armed by its first packet. Before it starts, a stage sends nothing and has no pending event.
 - **Inbound progress.** The receiver discards out-of-order packets (Go-back-N), so only the packet whose PSN equals the receiver's expected PSN advances the inbound predecessor.
 - **Completion.** The local predecessor is complete at the first ACK that acknowledges all of its bytes. A NACK never completes a stage.
 - **Pause.** If the stage's data class is paused at its host when it starts (host-link PFC), its first tick sends nothing and parks the queue pair, and the RESUME restarts it on the grid anchored at `t`.
