@@ -161,7 +161,21 @@ fn old_cli_fold(rounds: &[CpuRoundMetrics]) -> CpuRunTotals {
 }
 
 /// The totals with every wall-clock-derived field cleared: what two runs must share.
-fn deterministic(totals: CpuRunTotals) -> CpuRunTotals {
+///
+/// On the dynamic path (fixed chunks) a worker asks for its next chunk when it is free, so which
+/// worker executes an LP, and therefore how many source-to-owner batches a round sends, depends on
+/// thread timing: those message counts are cleared there too.
+fn deterministic(totals: CpuRunTotals, dynamic: bool) -> CpuRunTotals {
+    let totals = if dynamic {
+        CpuRunTotals {
+            owner_batch_messages: 0,
+            owner_delivery_messages: 0,
+            pool_messages: 0,
+            ..totals
+        }
+    } else {
+        totals
+    };
     CpuRunTotals {
         lp_time_parallel_efficiency_sum: 0.0,
         worker_parallel_efficiency_sum: 0.0,
@@ -264,9 +278,10 @@ fn check(image: &SimulationImage, horizon_ns: Option<u64>, label: &str) {
             )
             .expect("the Totals run succeeds");
             assert_eq!(totals.result, per_round.result, "{label} {config:?}");
+            let dynamic = matches!(config.granularity, ChunkGranularity::Fixed(_));
             assert_eq!(
-                bits(&deterministic(totals.totals)),
-                bits(&deterministic(per_round.totals)),
+                bits(&deterministic(totals.totals, dynamic)),
+                bits(&deterministic(per_round.totals, dynamic)),
                 "{label} {config:?} {observation:?}: Totals tallies against PerRound lists"
             );
             if observation == ObservationMode::Full || per_round.totals.rounds > 64 {
