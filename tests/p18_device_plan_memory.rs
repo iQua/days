@@ -12,9 +12,12 @@
 //! less the live heap when validation ended; the device bytes are what the run allocated on the
 //! device (`device_alloc` marks up to the end of upload). Both are deterministic.
 //!
-//! **The cap:** the host plan is at most 60% of the device plan on b4. On CUDA (sim) it was all
-//! of it before c2a, 70,777,720 B against a 70,074,936 B device plan (with planner scratch still
-//! live), and is 34,678,512 B (49%) after.
+//! **The cap:** the host plan and the all-zero planes together are at most the device plan plus
+//! 4 MiB: the host holds no all-zero plane. The planner's own exact report names the all-zero
+//! planes' bytes, so the check holds under any capacity caps. On CUDA (sim), before c2a and the
+//! P18 c1 stock cap, the host plan was 70,777,720 B against a 70,074,936 B device plan; after
+//! c2a, 34,678,512 B. Under the c1 stock cap the device plan is 53,256,760 B, 19,338,376 B of it
+//! all zero, and the host plan 34,617,072 B.
 //!
 //! Run: `cargo test --release -p days --features test,metal --test p18_device_plan_memory` on
 //! the Mac, `--features test,cuda` on a CUDA host.
@@ -112,16 +115,39 @@ fn plan_bytes(run: impl FnOnce()) -> (u64, u64) {
     )
 }
 
-fn check(backend: &str, (host, device): (u64, u64)) {
+/// The planes a device plan holds all zero at upload.
+const ZERO_PLANES: [&str; 10] = [
+    "outbox",
+    "worklist",
+    "summary",
+    "observed",
+    "departures",
+    "arrivals",
+    "lp_state",
+    "remote_staging",
+    "merge_cursors",
+    "stream_records",
+];
+
+fn zero_bytes(report: &days_executor::DeviceSizingReport) -> u64 {
+    report
+        .planes
+        .iter()
+        .filter(|plane| ZERO_PLANES.contains(&plane.name))
+        .map(|plane| plane.bytes as u64)
+        .sum()
+}
+
+fn check(backend: &str, (host, device): (u64, u64), zero: u64) {
     println!(
         "record=p18_device_plan_memory backend={backend} fixture=b4 host_plan_bytes={host} \
-         device_plan_bytes={device}"
+         device_plan_bytes={device} all_zero_plane_bytes={zero}"
     );
     assert!(device > 0, "{backend}: the run uploaded its plan");
     assert!(
-        5 * host <= 3 * device,
-        "{backend}: the host plan holds {host} B against a {device} B device plan: an all-zero \
-         plane is built on the host again"
+        host + zero <= device + (4 << 20),
+        "{backend}: the host plan holds {host} B beside {zero} B of all-zero planes, against a \
+         {device} B device plan: an all-zero plane is built on the host again"
     );
 }
 
@@ -131,21 +157,25 @@ fn a_metal_plan_holds_no_all_zero_plane_on_the_host() {
     use days_executor::{MetalConfig, MetalExecutor};
     let image = b4();
     let executor = MetalExecutor::new().expect("Metal executor");
+    let config = MetalConfig {
+        capacity_caps: days::STOCK_CAPACITY_CAPS,
+        ..MetalConfig::default()
+    };
+    let report = days_executor::size_metal_plan_for_testing(
+        &image,
+        Some(29_000_000),
+        config,
+        ObservationMode::Summary,
+    )
+    .expect("b4 plans on Metal");
     check(
         "metal",
         plan_bytes(|| {
             executor
-                .run_with_observations(
-                    &image,
-                    Some(29_000_000),
-                    MetalConfig {
-                        capacity_caps: days::STOCK_CAPACITY_CAPS,
-                        ..MetalConfig::default()
-                    },
-                    ObservationMode::Summary,
-                )
+                .run_with_observations(&image, Some(29_000_000), config, ObservationMode::Summary)
                 .expect("Metal runs b4");
         }),
+        zero_bytes(&report),
     );
 }
 
@@ -155,20 +185,24 @@ fn a_cuda_plan_holds_no_all_zero_plane_on_the_host() {
     use days_executor::{CudaConfig, CudaExecutor};
     let image = b4();
     let executor = CudaExecutor::new().expect("CUDA executor");
+    let config = CudaConfig {
+        capacity_caps: days::STOCK_CAPACITY_CAPS,
+        ..CudaConfig::default()
+    };
+    let report = days_executor::size_cuda_plan_for_testing(
+        &image,
+        Some(29_000_000),
+        config,
+        ObservationMode::Summary,
+    )
+    .expect("b4 plans on CUDA");
     check(
         "cuda",
         plan_bytes(|| {
             executor
-                .run_with_observations(
-                    &image,
-                    Some(29_000_000),
-                    CudaConfig {
-                        capacity_caps: days::STOCK_CAPACITY_CAPS,
-                        ..CudaConfig::default()
-                    },
-                    ObservationMode::Summary,
-                )
+                .run_with_observations(&image, Some(29_000_000), config, ObservationMode::Summary)
                 .expect("CUDA runs b4");
         }),
+        zero_bytes(&report),
     );
 }
