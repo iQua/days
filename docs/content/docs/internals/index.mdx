@@ -62,12 +62,18 @@ Compaction is lossless: it changes transfer size, not record order or decoded by
 Device future-event storage does not pay one fixed record size for every
 event kind. The fallback record is 14 `u64` words, and each proven-monotone
 stream class stores a compact per-kind encoding: channel events in 11 words,
-generator events in 10, service events in 5, and remote staging records
-in 12. On the benchmark mix this roughly halves record traffic. The
+generator events in 10, and service events in 5. On the benchmark mix this
+roughly halves record traffic. The
 encodings are lossless: every slim record decodes to the same bytes as its
 wide form, and a test checks the round trip. The shared encoder is in
 `executor/src/device_event_record.rs`, with matching device-side codecs in
 both kernel files.
+
+A producer writes each remote event's 11-word channel record straight into
+its consumer's ring, at a slot fixed by a snapshot of the ring taken at the
+start of the round. The round's merge then publishes the new records, so
+nothing a round produces is visible inside that round, and every ring slot
+ends the round where a separate copy step would have put it.
 
 The drain kernels themselves carry three measured optimizations, selected
 per backend rather than assumed portable:
