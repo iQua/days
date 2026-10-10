@@ -282,24 +282,29 @@ pub(crate) fn stage_row_words(image: &SimulationImage) -> usize {
     }
 }
 
-/// Restores every stage's dependency state from the rows read back from the region start.
+/// Restores every stage's dependency state, in place, from the rows read back from the region
+/// start, and returns which flows' stages the run released (indexed by flow).
 ///
-/// `image` is the input image and `host_states` its clone being rebuilt. Each row's immutable
-/// words are checked against the input (a corrupt row is an error, not trusted state); the
-/// mutable state must have moved only forward from the input (completion bits are never cleared,
-/// inbound bytes never decrease or exceed the requirement, and an inbound completion bit means
-/// exactly that the requirement is met). `activated` is derived as `prerequisites_complete`, the
-/// value the validator pins on every stage at every boundary.
+/// `host_states` holds the run's input states, which readback rebuilds in place (P18 c5: the
+/// states are the image's own, moved, or a clone of them): each stage is read before it is
+/// written. `image` supplies the flow count and the join table. Each row's immutable words are
+/// checked against the input (a corrupt row is an error, not trusted state); the mutable state must
+/// have moved only forward from the input (completion bits are never cleared, inbound bytes never
+/// decrease or exceed the requirement, and an inbound completion bit means exactly that the
+/// requirement is met). `activated` is derived as `prerequisites_complete`, the value the validator
+/// pins on every stage at every boundary. A stage was released during the run when it was not
+/// activated in the input and is after (design note G6: only then may its queue pair's grid anchor
+/// change).
 pub(crate) fn decode_stage_rows(
     rows: &[u64],
     image: &SimulationImage,
     host_states: &mut [HostState],
-) -> Result<(), &'static str> {
+) -> Result<Vec<bool>, &'static str> {
     // The predecessors of inbound joins, whose rows carry the immutable credit bit that
     // `encode_stage_region` sets; none (and no allocation) in an image without joins.
     let mut credited = Vec::new();
     if !image.stage_joins.is_empty() {
-        for state in &image.host_states {
+        for state in host_states.iter() {
             for (_, stage) in host_stages(state) {
                 if matches!(stage.dependencies.inbound, StagePredecessors::Join { .. }) {
                     credited.extend(stage.dependencies.inbound.iter(&image.stage_joins));
@@ -309,9 +314,13 @@ pub(crate) fn decode_stage_rows(
         credited.sort_unstable();
         credited.dedup();
     }
-    for (input, state) in image.host_states.iter().zip(host_states.iter_mut()) {
-        for (position, stage) in host_stages(input) {
-            let flow = input.generators[position].flow;
+    let mut released = vec![false; image.flows.len()];
+    for state in host_states.iter_mut() {
+        for position in 0..state.stages.len() {
+            let Some(stage) = state.stage(position) else {
+                continue;
+            };
+            let flow = state.generators[position].flow;
             let index = usize::try_from(flow.0).map_err(|_| "stage flow id exceeds usize")?;
             let row = rows
                 .get(index * STAGE_ROW_WORDS..(index + 1) * STAGE_ROW_WORDS)
@@ -364,19 +373,10 @@ pub(crate) fn decode_stage_rows(
                 .ok_or("stage table changed shape")?;
             record.dependencies = dependencies;
             record.activated = dependencies.prerequisites_complete();
+            released[index] = !stage.activated && record.activated;
         }
     }
-    Ok(())
-}
-
-/// Whether a generator's stage was unreleased in the input image and is released in the decoded
-/// state (design note G6: only then may its queue pair's grid anchor change). `None` (not a stage)
-/// is never released during the run.
-pub(crate) fn released_during_run(
-    input: Option<CollectiveStage>,
-    decoded: Option<CollectiveStage>,
-) -> bool {
-    input.is_some_and(|stage| !stage.activated) && decoded.is_some_and(|stage| stage.activated)
+    Ok(released)
 }
 
 #[cfg(test)]
@@ -575,17 +575,14 @@ mod tests {
         // All 700: released.
         rows[4 * STAGE_ROW_WORDS + SR_FLAGS] |= SR_INBOUND_COMPLETE;
         rows[4 * STAGE_ROW_WORDS + SR_INBOUND_RECEIVED] = 700;
-        decode_stage_rows(&rows, &image, &mut decoded).unwrap();
+        let released = decode_stage_rows(&rows, &image, &mut decoded).unwrap();
         assert!(decoded[0].stage(2).unwrap().activated);
-        assert!(released_during_run(
-            image.host_states[0].stage(2),
-            decoded[0].stage(2)
-        ));
-        assert!(!released_during_run(
-            image.host_states[0].stage(0),
-            decoded[0].stage(0)
-        ));
-        assert!(!released_during_run(None, None));
+        assert!(released[4], "flow 4's stage is released during the run");
+        assert!(
+            !released[decoded[0].generators[0].flow.0 as usize],
+            "a stage already released in the input is not released during the run"
+        );
+        assert_eq!(released.iter().filter(|released| **released).count(), 1);
     }
 
     /// `image()` with flow 3 (host B) also joining flows 0 and 1 from host A, 500 B each, which

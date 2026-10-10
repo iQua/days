@@ -1573,7 +1573,7 @@ impl CudaExecutor {
             crate::merge_audit::reset();
         }
         // P18 c4: an image validated for this backend at compile is not validated again.
-        let run_image = image.into();
+        let mut run_image = image.into();
         run_image
             .validate_for(Backend::Cuda)
             .map_err(|error| CudaError::Validation(error.to_string()))?;
@@ -1610,6 +1610,7 @@ impl CudaExecutor {
         let held = direct.hold_round_module(round_kernel)?;
         loop {
             let attempt = (|| {
+                let image = run_image.image();
                 let plan = CudaPlan::new_with_entity_capacity_floors(
                     image,
                     exclusive_horizon_ns,
@@ -1651,8 +1652,13 @@ impl CudaExecutor {
                 crate::phase_marks::mark("executed", planned_bytes);
                 #[cfg(feature = "cuda-test-hooks")]
                 panic_after_execution_if_requested();
-                let mut run =
-                    buffers.finish(&direct, &held.module, image, observation_mode, timing)?;
+                let mut run = buffers.finish(
+                    &direct,
+                    &held.module,
+                    &mut run_image,
+                    observation_mode,
+                    timing,
+                )?;
                 crate::phase_marks::mark("read_back", planned_bytes);
                 run.module_load_ns = held.load_ns;
                 Ok(run)
@@ -4777,10 +4783,11 @@ impl CudaBuffers {
         &self,
         direct: &DirectCuda,
         module: &RoundModule,
-        image: &SimulationImage,
+        run_image: &mut RunImage<'_>,
         observation_mode: ObservationMode,
         timing: CudaTiming,
     ) -> Result<CudaRun, AttemptFailure> {
+        let image = run_image.image();
         let stream = &direct.stream;
         // T20l fix 1: screen the attempt BEFORE the result arena crosses the bus.
         //
@@ -5125,18 +5132,21 @@ impl CudaBuffers {
             .try_into()
             .expect("compaction returns one buffer per request");
 
-        let mut host_states = image.host_states.clone();
+        // P18 c5: the result's host and switch states are the run image's own, moved out of a
+        // validated image the run consumes, or a clone of a borrowed one; the decoders below read
+        // the input states only through them, each before writing it.
+        let (mut host_states, mut switch_states) = run_image.take_states();
+        let image = run_image.image();
         // P16 G1: stage state first, so the queue-pair decoder knows which anchors a release moved
         // and the parked-set recomputation sees the decoded releases (design note §1.5).
-        if let Some(rows) = &stage_rows {
-            crate::device_stage::decode_stage_rows(rows, image, &mut host_states).map_err(
-                |_| CudaError::DeviceExecution {
+        let released = match &stage_rows {
+            None => Vec::new(),
+            Some(rows) => crate::device_stage::decode_stage_rows(rows, image, &mut host_states)
+                .map_err(|_| CudaError::DeviceExecution {
                     code: 96,
                     node: None,
-                },
-            )?;
-        }
-        let mut switch_states = image.switch_states.clone();
+                })?,
+        };
         let mut resident = self
             .orphan_packets
             .iter()
@@ -5177,8 +5187,7 @@ impl CudaBuffers {
                     state.sourced_packets = node_state[base + 7];
                     state.departed_packets = node_state[base + 8];
                     state.received_packets = node_state[base + 9];
-                    let input = &image.host_states[node.state_slot as usize];
-                    for (position, generator) in state.generators.iter_mut().enumerate() {
+                    for generator in &mut state.generators {
                         let offset = generator.flow.0 as usize * GENERATOR_WORDS;
                         generator.packets_emitted = generators[offset + 2];
                         generator.bytes_emitted = generators[offset + 3];
@@ -5243,10 +5252,10 @@ impl CudaBuffers {
                                 crate::device_mechanism::decode_roce_generator(
                                     &generators[offset..offset + GENERATOR_WORDS],
                                     roce,
-                                    crate::device_stage::released_during_run(
-                                        input.stage(position),
-                                        state.stages.get(position).copied().flatten(),
-                                    ),
+                                    released
+                                        .get(generator.flow.0 as usize)
+                                        .copied()
+                                        .unwrap_or(false),
                                 )
                                 .map_err(|_| {
                                     CudaError::DeviceExecution {

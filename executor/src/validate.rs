@@ -695,6 +695,21 @@ impl RunImage<'_> {
             _ => validate(self.image(), backend),
         }
     }
+    /// The host and switch states a run's readback rebuilds into its result (P18 c5): a borrowed
+    /// image's are cloned, as before; a validated image's are moved out, since the run consumes
+    /// it, so the result does not hold a second copy beside the image. Taken once, after the
+    /// run's last attempt succeeded: a validated image keeps its other tables for the decoders,
+    /// which then read the input states only through what this returns.
+    #[doc(hidden)]
+    pub fn take_states(&mut self) -> (Vec<crate::HostState>, Vec<crate::SwitchState>) {
+        match self {
+            Self::Borrowed(image) => (image.host_states.clone(), image.switch_states.clone()),
+            Self::Validated(image) => (
+                std::mem::take(&mut image.image.host_states),
+                std::mem::take(&mut image.image.switch_states),
+            ),
+        }
+    }
 }
 
 /// [`validate`] for `backend`, then, with `device`, the device's own refusals (see
