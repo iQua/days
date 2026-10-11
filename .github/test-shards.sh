@@ -27,9 +27,13 @@
 #                      other target selections).
 # Every test command passes `-- --show-output`, as the unsharded commands did.
 #
-# Balance (debug, from days-gpu evidence/P16/cisplit): the named targets are the slowest ones;
-# keep `rest`, where new `days` test files land, the lightest shard. It also carries the one full
-# `days` build (`--no-run`) and the doctests.
+# Balance (debug, from the hosted per-target times in days-gpu evidence/P17/cishards): five shards
+# of roughly equal hosted time, so the slowest shard sets CI's wall time as low as the largest
+# unit allows (`days-validation`, whose `width_via_load_full` alone takes 5 to 9 minutes). The
+# named `days` targets are the slow ones that the balance moves out of `rest`. `rest`, where new
+# `days` test files land, is kept about a minute under the slowest shard; it also carries the one
+# full `days` build (`--no-run`) and the doctests. In each shard the `days` unit runs first, so a
+# later package reuses the `days` build.
 set -euo pipefail
 
 LAYOUT='
@@ -39,11 +43,11 @@ package days-legacy --features test
 package days-validation --features test
 untested xtask
 
-shard lowering-budget days:collective_lowering_budget
-shard width-via-load-legacy days:width_via_load_fixtures days:p14_dcqcn_pfc_fixtures days-legacy
-shard roce days:p15_roce_fixtures days:p15_roce_collectives
-shard validation-executor days-validation days-executor
-shard rest days:rest
+shard validation days-validation
+shard width-via-load days:width_via_load_fixtures days:p16_aicb_scenario
+shard roce-fixtures-executor days:p15_roce_fixtures days-executor
+shard roce-collectives days:p15_roce_collectives days:p16_aicb_runs days:executor_small_lookahead days:p16_roce_window
+shard rest days:rest days-legacy
 '
 
 # Resolves the layout against the metadata on stdin into

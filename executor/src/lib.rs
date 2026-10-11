@@ -33,11 +33,18 @@ pub mod device_sizing;
 mod device_stage;
 pub mod ecn_ramp;
 pub mod event;
+mod fel;
 pub mod image;
 mod mechanism_trace;
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+mod merge_audit;
 #[cfg(all(feature = "metal", target_vendor = "apple"))]
 pub mod metal;
 pub mod model;
+mod packet_store;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 mod planner_capacity;
 mod roce;
@@ -105,11 +112,11 @@ pub use image::{
     FlowGeneratorState, GeneratorFeedbackAction, GeneratorFeedbackState, GeneratorStatus,
     GeneratorTermination, HostPfcState, HostState, LinkDescriptor, NodeDescriptor,
     PacketDescriptor, PacketKind, PfcHeader, PfcIngressState, PfcQueueState, RateGenerator,
-    RemoteChannel, RoceAckHeader, RoceDataHeader, RoceGenerator, RoceNackMark, RocePacer,
-    RoceReceiverState, ScheduledEmission, SeededCollective, SimulationImage, StageDependencies,
-    StageOperation, StagePredecessors, StageRole, StageStream, SwitchQueueState, SwitchState,
-    TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange, TcpReceiverState, TcpTimerState,
-    default_propagation_ns,
+    RemoteChannel, RoceAckHeader, RoceCongestionControl, RoceDataHeader, RoceGenerator,
+    RoceNackMark, RocePacer, RoceReceiverState, ScheduledEmission, SeededCollective,
+    SimulationImage, StageDependencies, StageOperation, StagePredecessors, StageRole, StageStream,
+    SwitchQueueState, SwitchState, TcpAckHeader, TcpDataHeader, TcpGenerator, TcpReceiveRange,
+    TcpReceiverState, TcpTimerState, default_propagation_ns,
 };
 pub use mechanism_trace::{
     CollectiveActivationCause, CollectiveProgressRecord, CollectiveStageKind, CollectiveTraceError,
@@ -121,6 +128,12 @@ pub use mechanism_trace::{
     drr_transitions_csv, pfc_transitions_csv, rate_transitions_csv, roce_receiver_transitions_csv,
     roce_sender_transitions_csv, sp_transitions_csv, wfq_transitions_csv, wrr_transitions_csv,
 };
+#[cfg(any(
+    feature = "cuda-test-hooks",
+    all(feature = "metal-test-hooks", target_vendor = "apple")
+))]
+#[doc(hidden)]
+pub use merge_audit::{MergeAuditRow, take_merge_audit_for_testing};
 #[cfg(all(
     feature = "metal",
     feature = "planner-test-hooks",

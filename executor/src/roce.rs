@@ -340,6 +340,9 @@ pub struct RoceSenderRecord {
     /// The controller's configured initial rate: a pair's rate until its controller's first
     /// feedback (fix round 1, review F3), so a pair with no DCQCN row is tied to its config.
     pub initial_rate_bps: u64,
+    /// P17 (qp-schema Amendment 7): the pair's congestion control. A pair without one never has
+    /// a DCQCN row, and its rate is `initial_rate_bps` throughout.
+    pub congestion_control: crate::RoceCongestionControl,
     /// The controller rate a tick credited, for a tick that credited one.
     pub rate_bps: Option<u64>,
     /// The ACK or NACK value of an `ack` or `nack` transition.
@@ -467,6 +470,7 @@ mod tests {
             window_bytes: window,
             variable_window,
             window_parked: false,
+            congestion_control: crate::RoceCongestionControl::Dcqcn,
         }
     }
 

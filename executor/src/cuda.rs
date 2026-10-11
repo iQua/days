@@ -114,6 +114,10 @@ const PARAM_STAGE_OFFSET: usize = 33;
 /// `scheduler_state`, appended after every production params word.
 #[cfg(feature = "cuda-test-hooks")]
 const PARAM_RESUME_SCAN_COUNT_OFFSET: usize = 34;
+/// Test hooks only (P17 merge): params word holding the merge-audit region's offset in
+/// `stream_state` (`merge_audit.rs`), appended after the RESUME-scan offset.
+#[cfg(feature = "cuda-test-hooks")]
+const PARAM_MERGE_AUDIT_OFFSET: usize = 35;
 const PACKET_ECN_FLAG: u64 = 1_u64 << 63;
 const PACKET_KIND_MASK: u64 = !PACKET_ECN_FLAG;
 
@@ -1501,7 +1505,10 @@ impl CudaExecutor {
         warm_start: &CapacityWarmStart,
     ) -> Result<CudaRun, CudaError> {
         #[cfg(feature = "cuda-test-hooks")]
-        crate::device_pfc::take_resume_scan_counts_for_testing();
+        {
+            crate::device_pfc::take_resume_scan_counts_for_testing();
+            crate::merge_audit::reset();
+        }
         validate(image, Backend::Cuda).map_err(|error| CudaError::Validation(error.to_string()))?;
         validate_config(config)?;
         let direct = self.direct_for(config.device_index)?;
@@ -3612,9 +3619,17 @@ fn prepare_streams(
         }
     }
 
+    // P17 merge: the device reads only each LP's inbound channels and the service stream that
+    // ends them (`days_exchange_merge`), so only that prefix of the sorted list is stored. The
+    // LP's metadata keeps the whole list's length, the number of streams it owns, which sizes its
+    // active list (one entry per owned stream plus the heap entry).
+    let lp_stream_id_prefix =
+        |streams: &[u64]| streams.partition_point(|&stream| stream < generator_stream_base as u64);
     let lp_stream_id_words = lp_streams
         .iter()
-        .try_fold(0_usize, |total, streams| total.checked_add(streams.len()))
+        .try_fold(0_usize, |total, streams| {
+            total.checked_add(lp_stream_id_prefix(streams))
+        })
         .ok_or_else(|| CudaError::Validation("LP stream-list size overflows usize".into()))?;
     let lp_active_id_words = lp_streams
         .iter()
@@ -3661,8 +3676,9 @@ fn prepare_streams(
         state[meta] = declared_cursor as u64;
         state[meta + 1] = streams.len() as u64;
         state[meta + 2] = active_cursor as u64;
-        state[declared_cursor..declared_cursor + streams.len()].copy_from_slice(streams);
-        declared_cursor += streams.len();
+        let prefix = &streams[..lp_stream_id_prefix(streams)];
+        state[declared_cursor..declared_cursor + prefix.len()].copy_from_slice(prefix);
+        declared_cursor += prefix.len();
         let fel_count = fel_meta[node * ARENA_META_WORDS + 3];
         if fel_count != 0 {
             state[active_cursor] = NONE;
@@ -4529,6 +4545,13 @@ impl CudaBuffers {
             );
             assert_eq!(plan.params.len(), PARAM_RESUME_SCAN_COUNT_OFFSET);
             plan.params.push(offset as u64);
+            // P17 merge: the merge counter rows and the flow-source table (params word 35).
+            let merge_audit_offset = plan.stream_state.len();
+            let region =
+                crate::merge_audit::hook_region(plan.params[0] as usize, &plan.flows, FLOW_WORDS);
+            plan.stream_state.extend(region);
+            assert_eq!(plan.params.len(), PARAM_MERGE_AUDIT_OFFSET);
+            plan.params.push(merge_audit_offset as u64);
             plan
         };
         let round_capacity = plan.round_capacity;
@@ -4710,6 +4733,20 @@ impl CudaBuffers {
                 &scheduler_state
                     [offset..offset + self.node_count * crate::device_pfc::RESUME_SCAN_COUNT_WORDS],
             );
+        }
+        #[cfg(feature = "cuda-test-hooks")]
+        {
+            let [rows] = bounded_plane_words(
+                stream,
+                [(
+                    &self.planes[25],
+                    params[PARAM_MERGE_AUDIT_OFFSET] as usize,
+                    self.node_count
+                        .saturating_mul(crate::merge_audit::MERGE_AUDIT_WORDS),
+                    "merge audit rows",
+                )],
+            )?;
+            crate::merge_audit::record(&rows);
         }
 
         let node_count = image.nodes.len();

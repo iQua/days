@@ -712,6 +712,7 @@ mod tests {
                 pacer_armed: true,
                 variable_window: false,
                 window_parked: false,
+                congestion_control: crate::RoceCongestionControl::Dcqcn,
             })
         };
         image.host_states[0].generators[1].kind = roce(0, 0);

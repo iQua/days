@@ -161,6 +161,27 @@ constexpr uint RESUME_SCAN_COUNT_WORDS = 3;
 #else
 #define RECORD_RESUME_SCAN(params, state, node, counter, amount) ((void)0)
 #endif
+// P17 merge (test hooks only): the exchange-merge counters and active-set audit. `CudaBuffers::new`
+// appends one row of MERGE_AUDIT_WORDS words per LP to `stream_state`, after every production word,
+// then one word per flow holding the flow's source LP (the audit's generator-ownership table), and
+// the region's offset as params word 35, after the RESUME-scan offset. Each merge thread adds only to
+// its own LP's row, so the counters need no atomics. Production builds compile `RECORD_MERGE` to
+// nothing and carry no audit.
+#ifdef DAYS_MERGE_AUDIT
+constexpr uint P_MERGE_AUDIT_OFFSET = 35;
+constexpr uint MERGE_AUDIT_WORDS = 6;
+constexpr uint MA_INVOCATIONS = 0;
+constexpr uint MA_STREAMS_READ = 1;
+constexpr uint MA_APPENDED = 2;
+constexpr uint MA_MISMATCHES = 3;
+constexpr uint MA_NONEMPTY_STREAMS = 4;
+constexpr uint MA_STREAM_ENTRIES = 5;
+#define RECORD_MERGE(params, state, node, counter, amount) \
+    ((state)[(params)[P_MERGE_AUDIT_OFFSET] + (node) * MERGE_AUDIT_WORDS + (counter)] += \
+        (ulong)(amount))
+#else
+#define RECORD_MERGE(params, state, node, counter, amount) ((void)0)
+#endif
 // P16 G1: one stage row per flow, then the successor array (`executor/src/device_stage.rs`).
 constexpr uint STAGE_ROW_WORDS = 5;
 constexpr uint SR_FLAGS = 0;
@@ -393,6 +414,8 @@ constexpr uint G_ROCE_SND_UNA = 17;
 constexpr uint G_ROCE_WINDOW = 36;
 constexpr uint G_ROCE_VARIABLE_WINDOW = 37;
 constexpr uint G_ROCE_WINDOW_PARKED = 38;
+// P17 lane nocc: 0 under DCQCN, 1 without congestion control (`RoceCongestionControl`).
+constexpr uint G_ROCE_CONGESTION_CONTROL = 39;
 constexpr uint G_ROCE_PACER_ARMED = 40;
 constexpr uint G_ROCE_RTO_DEADLINE = 41;
 constexpr uint G_ROCE_RTO = 42;
@@ -5136,7 +5159,8 @@ __device__ __forceinline__ bool roce_pacing_tick(
 // rewinds the next PSN to it (Go-back-N). Every advance or rewind restarts the timeout, removing
 // the superseded record in this transition (the live-state contract), and restarts a parked pacer.
 // The controller's due instants before the arrival apply first; the ACK that completes the pair
-// freezes the controller; otherwise an ECN echo is a feedback (P16 rulings D2, D4, D11).
+// freezes the controller; otherwise an ECN echo is a feedback (P16 rulings D2, D4, D11), except for
+// a pair without congestion control, whose sender ignores it (P17).
 __device__ __forceinline__ bool roce_feedback_arrival(
     ulong node,
     const ulong *event,
@@ -5213,8 +5237,12 @@ __device__ __forceinline__ bool roce_feedback_arrival(
     if (snd_una_before < total && row[G_ROCE_SND_UNA] >= total) {
         dcqcn_settle(row, now);
     }
-    // Word 2 of an ACK or NACK: the packet size in bits 0..32, the ECN echo in bit 32.
-    if ((event[PK_META_2] >> 32) != 0 && row[G_ROCE_SND_UNA] < total) {
+    // Word 2 of an ACK or NACK: the packet size in bits 0..32, the ECN echo in bit 32. A pair
+    // without congestion control (P17) ignores the echo; its inert controller is never armed, so
+    // the settle above returns at once for it. The mode is tested last: a DCQCN pair reads it only
+    // on an echoing ACK or NACK.
+    if ((event[PK_META_2] >> 32) != 0 && row[G_ROCE_SND_UNA] < total &&
+        row[G_ROCE_CONGESTION_CONTROL] == 0) {
         dcqcn_on_feedback(row, now);
     }
     roce_settle(row, row[G_STATUS]);
@@ -8243,6 +8271,117 @@ extern "C" __global__ void days_exchange_scatter(DAYS_BUFFERS) {
     }
 }
 
+#ifdef DAYS_MERGE_AUDIT
+// P17 merge (test hooks only): audits LP `node`'s active list after the merge against the list a
+// full rebuild over every stream the LP owns would produce, without enumerating those streams.
+//
+// Invariant E: the list holds exactly one entry per non-empty stream the LP owns, carrying that
+// stream's head key, plus exactly one `NONE` entry carrying the fallback heap's root key iff the
+// heap is non-empty, and nothing else; when the heap is non-empty its entry is at index 0; and the
+// count is within the list's capacity, `stream_state[meta + 1] + 1`. Locally, each entry is checked
+// for a duplicate, for ownership (an inbound channel in the LP's channel prefix, its own service
+// stream, or a generator whose flow it sources), for a non-empty stream and for the current key;
+// any failure adds to MA_MISMATCHES. That makes the entries an injection into the LP's non-empty
+// streams. Globally, the merge threads also count every non-empty stream once (thread `node`
+// takes streams `node`, `node + N`, ...), into MA_NONEMPTY_STREAMS, against the entries into
+// MA_STREAM_ENTRIES. The host checks, after each successful attempt, that the mismatches are zero
+// and the two sums are equal; since the entries never exceed the non-empty streams in any round,
+// equal sums over the run mean equal counts in every round, so the list is the full rebuild's set.
+__device__ void merge_audit(
+    ulong node,
+    const ulong *params,
+    const ulong *fel_meta,
+    const ulong *fel_records,
+    ulong *stream_state,
+    const ulong *stream_records
+) {
+    ulong meta = params[P_LP_STREAM_META_OFFSET] + node * LP_STREAM_META_WORDS;
+    ulong declared = stream_state[meta];
+    ulong declared_count = stream_state[meta + 1];
+    ulong active = stream_state[meta + 2];
+    ulong count = stream_state[meta + 3];
+    ulong mismatches = 0;
+    ulong stream_entries = 0;
+    ulong none_entries = 0;
+    bool heap = fel_meta[node * META_WORDS + 3] != 0;
+    if (count > declared_count + 1) {
+        mismatches += 1;
+        count = declared_count + 1;
+    }
+    for (ulong index = 0; index < count; ++index) {
+        ulong entry = active + index * ACTIVE_STREAM_ENTRY_WORDS;
+        ulong stream = stream_state[entry];
+        for (ulong earlier = 0; earlier < index; ++earlier) {
+            if (stream_state[active + earlier * ACTIVE_STREAM_ENTRY_WORDS] == stream) {
+                mismatches += 1;
+            }
+        }
+        ulong record = NONE;
+        const ulong *records = stream_records;
+        if (stream == NONE) {
+            none_entries += 1;
+            if (heap) {
+                record = fel_meta[node * META_WORDS] * EVENT_WORDS;
+                records = fel_records;
+            }
+        } else {
+            stream_entries += 1;
+            bool owned = false;
+            if (stream < params[P_SERVICE_STREAM_BASE]) {
+                for (ulong slot = 0; slot < declared_count; ++slot) {
+                    ulong declared_stream = stream_state[declared + slot];
+                    if (declared_stream >= params[P_SERVICE_STREAM_BASE]) {
+                        break;
+                    }
+                    owned = owned || declared_stream == stream;
+                }
+            } else if (stream < params[P_GENERATOR_STREAM_BASE]) {
+                owned = stream == params[P_SERVICE_STREAM_BASE] + node;
+            } else if (stream < params[P_STREAM_COUNT]) {
+                // The hooks region's per-flow source table follows the LP rows.
+                owned = stream_state[
+                    params[P_MERGE_AUDIT_OFFSET] +
+                    params[P_NODE_COUNT] * MERGE_AUDIT_WORDS +
+                    stream - params[P_GENERATOR_STREAM_BASE]
+                ] == node;
+            }
+            if (owned && stream_state[stream * META_WORDS + 3] != 0) {
+                ulong capacity = stream_state[stream * META_WORDS + 1];
+                ulong physical = stream_state[stream * META_WORDS + 2] % max(capacity, 1ul);
+                record = stream_record_offset(stream, physical, params, stream_state);
+            }
+        }
+        if (record == NONE) {
+            mismatches += 1;
+            continue;
+        }
+        for (uint word = 0; word < 4; ++word) {
+            if (stream_state[entry + 1 + word] != records[record + word]) {
+                mismatches += 1;
+                break;
+            }
+        }
+    }
+    if (heap != (none_entries != 0)) {
+        mismatches += 1;
+    }
+    if (heap && stream_state[active] != NONE) {
+        mismatches += 1;
+    }
+    ulong nonempty = 0;
+    for (
+        ulong stream = node;
+        stream < params[P_STREAM_COUNT];
+        stream += params[P_NODE_COUNT]
+    ) {
+        nonempty += ulong(stream_state[stream * META_WORDS + 3] != 0);
+    }
+    RECORD_MERGE(params, stream_state, node, MA_MISMATCHES, mismatches);
+    RECORD_MERGE(params, stream_state, node, MA_NONEMPTY_STREAMS, nonempty);
+    RECORD_MERGE(params, stream_state, node, MA_STREAM_ENTRIES, stream_entries);
+}
+#endif
+
 extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
     uint target = blockIdx.x * blockDim.x + threadIdx.x;
     if (
@@ -8254,34 +8393,67 @@ extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
         return;
     }
     if (params[P_STREAMS_ENABLED] != 0) {
+        // P17 merge (`days-gpu/evidence/P17/merge/design.md`): processing keeps the LP's active
+        // list exact for every local push, pop and timer removal; only the scatter's remote
+        // delivery leaves a channel that went from empty to non-empty without an entry. So the
+        // merge keeps the maintained list and appends exactly those channels.
+        //
+        // A channel's batch word counts the records its unique producer appended this round
+        // (zeroed by the reset), and the scatter added it to the channel's count. `count == batch`
+        // with `batch != 0` therefore means the channel was empty after processing and is
+        // non-empty now, which by the list invariant is exactly a channel without an entry.
+        // The LP's stream list holds its inbound channels, ascending, then its service stream;
+        // `stream_state[meta + 1]` counts every stream the LP owns, generators included.
+        //
+        // The list's order is not canonical: every reader is order-independent (event keys are
+        // unique; `fel_peek` takes a strict minimum, the continuation predicate is universal),
+        // and the list is device scratch, never read back. The heap entry is moved back to index
+        // 0, where every merge left it before P17, so `active_find(NONE)` costs what it did.
+        //
+        // No capacity check: the list holds at most one entry per stream the LP owns plus the
+        // heap entry, and its region holds `stream_state[meta + 1] + 1` entries.
         ulong meta =
             params[P_LP_STREAM_META_OFFSET] +
             ulong(target) * LP_STREAM_META_WORDS;
         ulong declared = stream_state[meta];
         ulong declared_count = stream_state[meta + 1];
         ulong active = stream_state[meta + 2];
-        ulong active_count = 0;
-        if (fel_meta[ulong(target) * META_WORDS + 3] != 0) {
-            ulong entry = active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
-            active_count += 1;
-            stream_state[entry] = NONE;
-            ulong record =
-                fel_meta[ulong(target) * META_WORDS] * EVENT_WORDS;
-            for (uint word = 0; word < 4; ++word) {
-                stream_state[entry + 1 + word] = fel_records[record + word];
+        ulong active_count = stream_state[meta + 3];
+        RECORD_MERGE(params, stream_state, target, MA_INVOCATIONS, 1);
+        if (
+            active_count > 1 &&
+            fel_meta[ulong(target) * META_WORDS + 3] != 0 &&
+            stream_state[active] != NONE
+        ) {
+            for (ulong index = 1; index < active_count; ++index) {
+                ulong entry = active + index * ACTIVE_STREAM_ENTRY_WORDS;
+                if (stream_state[entry] == NONE) {
+                    for (uint word = 0; word < ACTIVE_STREAM_ENTRY_WORDS; ++word) {
+                        ulong value = stream_state[active + word];
+                        stream_state[active + word] = stream_state[entry + word];
+                        stream_state[entry + word] = value;
+                    }
+                    break;
+                }
             }
         }
         for (ulong index = 0; index < declared_count; ++index) {
             ulong stream = stream_state[declared + index];
-            if (stream_state[stream * META_WORDS + 3] != 0) {
-                ulong entry =
-                    active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
+            RECORD_MERGE(params, stream_state, target, MA_STREAMS_READ, 1);
+            if (stream >= params[P_SERVICE_STREAM_BASE]) {
+                break;
+            }
+            ulong batch = stream_state[
+                params[P_CHANNEL_BATCH_OFFSET] + stream * CHANNEL_BATCH_WORDS
+            ];
+            ulong stream_base = stream * META_WORDS;
+            if (batch != 0 && stream_state[stream_base + 3] == batch) {
+                ulong entry = active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
                 active_count += 1;
+                RECORD_MERGE(params, stream_state, target, MA_APPENDED, 1);
                 stream_state[entry] = stream;
-                ulong stream_base = stream * META_WORDS;
                 ulong capacity = stream_state[stream_base + 1];
-                ulong physical =
-                    stream_state[stream_base + 2] % max(capacity, 1ul);
+                ulong physical = stream_state[stream_base + 2] % max(capacity, 1ul);
                 ulong record = stream_record_offset(
                     stream,
                     physical,
@@ -8289,12 +8461,21 @@ extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
                     stream_state
                 );
                 for (uint word = 0; word < 4; ++word) {
-                    stream_state[entry + 1 + word] =
-                        stream_records[record + word];
+                    stream_state[entry + 1 + word] = stream_records[record + word];
                 }
             }
         }
         stream_state[meta + 3] = active_count;
+#ifdef DAYS_MERGE_AUDIT
+        merge_audit(
+            target,
+            params,
+            fel_meta,
+            fel_records,
+            stream_state,
+            stream_records
+        );
+#endif
         return;
     }
     ulong inbound_base = ulong(target) * INBOUND_META_WORDS;

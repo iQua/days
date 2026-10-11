@@ -2146,9 +2146,11 @@ fn stream_state_words(
                 .insert(generator_stream_base + generator.flow.0 as usize);
         }
     }
+    // P17 merge: only each LP's inbound channels and its service stream are stored; the
+    // generator streams it owns size its active list alone.
     let lp_stream_id_words = lp_streams.iter().try_fold(0_usize, |total, streams| {
         total
-            .checked_add(streams.len())
+            .checked_add(streams.range(..generator_stream_base).count())
             .ok_or_else(|| sizing_error("LP stream-list size overflows usize"))
     })?;
     let lp_active_id_words = lp_streams.iter().try_fold(0_usize, |total, streams| {

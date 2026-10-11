@@ -274,3 +274,52 @@ fn paired_copy_preserves_interleaved_channel_slots_and_bytes() {
         "pairing records must preserve each channel cursor"
     );
 }
+
+/// P17 merge (`days-gpu/evidence/P17/merge/design.md`, ruling R1 (d)): on the streams path the
+/// exchange merge keeps the incrementally maintained active list and reads only the LP's inbound
+/// channels, the declared list's prefix that ends at the LP's service stream. It must not rebuild
+/// the list from every declared stream (one generator stream per sourced flow: 14,443 per host on
+/// the flagship), which the hooks-only audit alone may still sweep.
+#[test]
+fn merge_reads_only_the_inbound_channel_prefix() {
+    for (backend, body) in [
+        (
+            "CUDA",
+            kernel_body(
+                CUDA,
+                "extern \"C\" __global__ void days_exchange_merge",
+                "    ulong inbound_base = ulong(target) * INBOUND_META_WORDS;",
+            ),
+        ),
+        (
+            "Metal",
+            kernel_body(
+                METAL,
+                "kernel void days_exchange_merge",
+                "    ulong inbound_base = ulong(target) * INBOUND_META_WORDS;",
+            ),
+        ),
+    ] {
+        let production = body
+            .split("#ifdef DAYS_MERGE_AUDIT")
+            .next()
+            .expect("the streams branch precedes the hooks-only audit call");
+        for fragment in [
+            "ulong active_count = stream_state[meta + 3];",
+            "if (stream >= params[P_SERVICE_STREAM_BASE]) {\n                break;",
+            "params[P_CHANNEL_BATCH_OFFSET] + stream * CHANNEL_BATCH_WORDS",
+            "if (batch != 0 && stream_state[stream_base + 3] == batch) {",
+        ] {
+            assert!(
+                production.contains(fragment),
+                "{backend} streams merge must contain `{fragment}`"
+            );
+        }
+        for forbidden in ["ulong active_count = 0;", "atomic", "fel_records["] {
+            assert!(
+                !production.contains(forbidden),
+                "{backend} streams merge must not contain `{forbidden}`"
+            );
+        }
+    }
+}

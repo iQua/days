@@ -102,7 +102,7 @@ Exact lowering supports byte-bounded Reno and CUBIC. It rejects BBR, duration-bo
 
 **Scope: Days AGO.** The legacy engine's DCQCN keys are on the [Legacy flows](/docs/legacy/components/flows#dcqcn-configuration) page; the two tables differ.
 
-Days AGO runs the Mellanox form of DCQCN: the reaction point of HPCC's ns-3 model (`CC_MODE 1`) and of SimAI, in exact integer arithmetic. `[flow.traffic.dcqcn]` configures it on an unreliable `flow_type = "DCQCN"` flow and on a [RoCE queue pair](#roce-queue-pairs). Only `max_rate_gbps` is required; the other controller keys default to the values SimAI and HPCC ship.
+Days AGO runs the Mellanox form of DCQCN: the reaction point of HPCC's ns-3 model (`CC_MODE 1`) and of SimAI, in exact integer arithmetic. `[flow.traffic.dcqcn]` configures it on an unreliable `flow_type = "DCQCN"` flow and on a [RoCE queue pair](#roce-queue-pairs) under the pair's default congestion control. Only `max_rate_gbps` is required; the other controller keys default to the values SimAI and HPCC ship.
 
 ```toml
 [[flow]]
@@ -179,7 +179,7 @@ DCQCN sources emit ECN-capable data. Use the ECN ramp (`switch.ecn` or `switch.e
 
 ## RoCE queue pairs
 
-A RoCE queue pair is a reliable DCQCN flow. It uses the DCQCN controller and pacer above and adds Go-back-N reliability: a PSN on every data packet, cumulative ACKs, NACKs, and a retransmission timeout. Its congestion feedback is the ECN echo its ACKs and NACKs carry; a queue pair sends no CNP. A queue pair completes when its last byte is acknowledged. Queue pairs are an exact-lowering feature; the legacy simulator does not run them.
+A RoCE queue pair is a reliable flow with Go-back-N: a PSN on every data packet, cumulative ACKs, NACKs, and a retransmission timeout. By default (`congestion_control = "dcqcn"`) it is paced by the DCQCN controller above, and its congestion feedback is the ECN echo its ACKs and NACKs carry; a queue pair sends no CNP. With `congestion_control = "none"` it has no controller and sends at its host's link rate; see [Without congestion control](#without-congestion-control). A queue pair completes when its last byte is acknowledged. Queue pairs are an exact-lowering feature; the legacy simulator does not run them.
 
 ```toml
 [[flow]]
@@ -193,7 +193,7 @@ size = 2_000_000                  # required: a queue pair is byte-bounded
 arr_dist = { type = "Uniform", low = 1, high = 1 }
 pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }   # the MTU
 
-[flow.traffic.dcqcn]              # the controller: the DCQCN keys above, without cnp_interval_ns and cnp_priority
+[flow.traffic.dcqcn]              # the controller, required under the default congestion_control: the DCQCN keys above, without cnp_interval_ns and cnp_priority
 max_rate_gbps = 100.0
 ai_rate_gbps = 0.02
 hai_rate_gbps = 0.2
@@ -207,6 +207,7 @@ window_bytes = 250_000
 
 | `[flow.traffic.roce]` key | Required | Meaning |
 | --- | --- | --- |
+| `congestion_control` | no | `"dcqcn"` (the default) or `"none"`, in lowercase. `"none"` removes the controller and the `[flow.traffic.dcqcn]` table; see [Without congestion control](#without-congestion-control). |
 | `retransmit_timeout_ns` | yes | Fixed retransmission timeout, with no backoff. `0` turns the timeout off (see below). |
 | `ack_every_packets` | no | In-order packets per cumulative ACK; default `1`. The receiver also ACKs the last byte. |
 | `nack_interval_ns` | no | Minimum spacing of two NACKs for the same expected PSN; default `500000`. |
@@ -214,13 +215,13 @@ window_bytes = 250_000
 | `duplicate_ack` | no | Whether a packet below the receiver's frontier is answered with an ACK; default `true`. `false` is allowed only with `retransmit_timeout_ns = 0`. |
 | `ack_size_bytes` | no | Wire size of an ACK or NACK; default `64`. |
 | `window_bytes` | no | The most bytes the pair keeps unacknowledged in flight (SimAI `m_win`); default `0`, no window. |
-| `variable_window` | no | Scale the window with the controller's current rate (SimAI `m_var_win`); default `false`. Needs `window_bytes` above `0`. |
+| `variable_window` | no | Scale the window with the controller's current rate (SimAI `m_var_win`); default `false`. Needs `window_bytes` above `0`; refused with `congestion_control = "none"`. |
 
-The PSN is the byte offset of a packet's first byte. Every packet is `pkt_size_dist` bytes except a short last one, so a retransmission resends exactly the bytes of the original. The pacer sends at most one packet per `pacing_interval_ns` tick, so the tick must be short enough for the line rate: at 100 Gbps with 1,000-byte packets, at most 80 ns.
+The PSN is the byte offset of a packet's first byte. Every packet is `pkt_size_dist` bytes except a short last one, so a retransmission resends exactly the bytes of the original. The pacer sends at most one packet per `pacing_interval_ns` tick, so under DCQCN the tick must be short enough for the line rate: at 100 Gbps with 1,000-byte packets, at most 80 ns. Without congestion control the tick is derived from the link rate (below).
 
 On a NACK or a timeout, the sender rewinds to the first unacknowledged byte and resends everything from there (Go-back-N). Retransmissions are paced like first transmissions.
 
-**ECN echo.** Each ACK or NACK echoes the CE bit of the data packet whose arrival produced it. With `ack_every_packets` above `1`, only the packet that produces the ACK is echoed; a NACK that the NACK interval suppresses echoes nothing. The sender's controller takes one feedback per ACK or NACK whose echo is set, until the pair completes. ACKs and NACKs ride `feedback_priority`; a class other than the data class is not held back by a pause of the data class.
+**ECN echo.** Each ACK or NACK echoes the CE bit of the data packet whose arrival produced it. With `ack_every_packets` above `1`, only the packet that produces the ACK is echoed; a NACK that the NACK interval suppresses echoes nothing. Under DCQCN, the sender's controller takes one feedback per ACK or NACK whose echo is set, until the pair completes; a pair without congestion control ignores the echo. ACKs and NACKs ride `feedback_priority`; a class other than the data class is not held back by a pause of the data class.
 
 **Window.** With `window_bytes` above `0`, the window is `w = window_bytes`, or with `variable_window` the larger of `1` and `floor(window_bytes * R_C / R_max)`, with `R_C` the controller's current rate and `R_max` its `max_rate_gbps`, both in bits per second; the product is exact and does not wrap. A pacing tick that has a packet to send and finds `next_psn - snd_una >= w` sends nothing, adds no credit and parks the pacer, as a tick in a paused class does. Only a fresh ACK (one that moves `snd_una`), a NACK at or above `snd_una` (the usual NACK: it rewinds `next_psn` to `snd_una` without moving `snd_una`), or a timeout restarts it; a rate increase or a host-link RESUME does not. SimAI sets `m_win` to a bandwidth-delay product, `(2 * propagation delay + one packet's transmission time) * line rate` in bytes, of the pair's path or the largest over all host pairs; Days AGO takes the value from `window_bytes`.
 
@@ -228,13 +229,109 @@ On a NACK or a timeout, the sender rewinds to the first unacknowledged byte and 
 
 With `[link.pfc] host_links = true`, a switch can pause a queue pair's host. The queue pair then stops sending in its data class until the resume; see [host links](/docs/configuration/l2#host-links).
 
-Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic.tcp]` on a queue pair, `cnp_priority` on a queue pair (use `feedback_priority`), `cnp_interval_ns` on a queue pair, `variable_window` without `window_bytes`, duration-bounded queue pairs, and an MTU above `4294967295` bytes. A queue pair with `cnp_interval_ns` fails with:
+### Without congestion control
+
+`congestion_control = "none"` in `[flow.traffic.roce]` gives a queue pair no rate controller. The key takes `"dcqcn"` (the default: the queue pair described above) or `"none"`, in lowercase, and every `[*.traffic.roce]` table accepts it: `flow`, `flow_set`, `collective` and `collective_set`. The AICB adapter does not expose it: `[workload.aicb]` requires `CC_MODE 1` and writes a DCQCN table for every queue pair (see [Workloads](/docs/configuration/workloads)).
+
+A pair without congestion control has no `[flow.traffic.dcqcn]` table. Its pacer runs at the rate of its source host's link, which is `switch.port_rate`, or the NIC rate on the [Spectrum-X](/docs/configuration/topology#spectrum-x) topology, and sends one MTU per `ceil(MTU * 8e9 / rate)` ns: the link rate exactly when the MTU's bits divide by the rate, and one MTU per tick just below it otherwise. At 1 Gbps with 1,000-byte packets the tick is 8,000 ns; at 100 Gbps with 9,000-byte packets, 720 ns.
+
+What changes at the endpoints? Only the sender's use of the ECN echo. Switches still mark the pair's data by the ECN ramp, and its receiver still echoes the mark on its ACKs and NACKs; the sender ignores the echo, never cuts, and writes no DCQCN record, not even the freeze at completion. Go-back-N, ACKs and NACKs, the retransmission timeout, a fixed `window_bytes` and PFC are those of a DCQCN pair. A scenario may mix the two kinds: in `configs/p17/nocc_mixed.toml`, two DCQCN pairs cut behind a marking queue while two pairs without congestion control keep the link rate.
+
+This scenario, derived from `configs/p17/nocc_unmarked.toml`, sends two queue pairs into host 0 over a four-switch line, lossless on class 0 and with no ECN ramp:
+
+```toml
+seed = 42
+edges = [[0, 1], [1, 2], [2, 3]]
+hosts = [0, 1, 2, 3]
+duration = 0.02
+
+[switch]
+port_rate = 1000000000
+capacity = 1000
+discipline = "FIFO"
+drop = "TailDrop"
+
+[link]
+mode = "Pfc"
+
+[link.pfc]
+buffer_capacity = [100000, 0, 0, 0, 0, 0, 0, 0]
+xoff = [20000, 0, 0, 0, 0, 0, 0, 0]
+xon = [10000, 0, 0, 0, 0, 0, 0, 0]
+
+[[flow]]
+flow_type = "RoCE"
+priority = 0
+graph = [[2, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.roce]
+congestion_control = "none"
+retransmit_timeout_ns = 1000000
+
+[[flow]]
+flow_type = "RoCE"
+priority = 0
+graph = [[3, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.roce]
+congestion_control = "none"
+retransmit_timeout_ns = 1000000
+```
+
+Scalar and CPU at 2 workers both end it with `result_bytes=42641 result_fnv1a64=7fe653a9fb044849`. `configs/p17/nocc_gbn_lossy.toml` runs four such pairs, in two incasts, without PFC and on 8-packet queues with an ECN ramp: packets are dropped, NACKs and retransmissions follow, and every pair completes.
+
+Three combinations are refused, and each message names the key and its table. A `traffic.dcqcn` table with `"none"`:
+
+```text
+unsupported `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]` with `congestion_control = "none"` in `[flow.traffic.roce]`: a queue pair without congestion control has no DCQCN controller and paces at its host's line rate; remove the `traffic.dcqcn` table
+```
+
+`variable_window = true` with `"none"` (the window would scale with a rate that never moves):
+
+```text
+unsupported `variable_window = true` with `congestion_control = "none"` in `[flow.traffic.roce]`: a variable window scales with the DCQCN rate, which a queue pair without congestion control does not have; use a fixed `window_bytes`
+```
+
+Any other value, `"DCQCN"` and `"None"` included:
+
+```text
+TOML parse error at line 32, column 22
+   |
+32 | congestion_control = "hpcc"
+   |                      ^^^^^^
+unknown variant `hpcc`, expected `dcqcn` or `none`
+(in `[flow.traffic.roce]`)
+```
+
+Under `"dcqcn"`, written or defaulted, the DCQCN table stays required:
+
+```text
+RoCE traffic must provide `[flow.traffic.dcqcn]` or `[flow_set.traffic.dcqcn]` for its controller, or set `congestion_control = "none"` in `[flow.traffic.roce]`
+```
+
+What does the option model? A RoCE NIC whose rate control is off. With PFC and no ECN ramp, nothing is dropped and nothing is marked (`nocc_unmarked.toml`); without PFC, Go-back-N repairs the losses (`nocc_gbn_lossy.toml`). Meta's SIGCOMM 2024 paper on its training clusters ("RDMA over Ethernet for Distributed AI Training at Meta Scale", §5.2.1) reports that at 400 Gbps it "proceeded without DCQCN". The option also gives a same-model comparison with htsim, whose RoCE has Go-back-N and PFC and no congestion control. Before P17 such a scenario pinned the DCQCN controller at the link rate (`min_rate_gbps = rate_gbps = max_rate_gbps`, with `pacing_interval_ns` at the line-rate tick); `tests/p17_nocc.rs` pins that the pinned form and `"none"` send and deliver every packet at the same instants, marked or not; their complete states differ (the controller words, the seeds and the mode field), so their `result_fnv1a64` values do.
+
+The sender certificate, `roce_sender_transitions_csv`, names each pair's mode in its last column, `congestion_control` (column 46); see [LeanGuard](/docs/verification/leanguard#coverage-by-mechanism).
+
+Exact lowering refuses `[flow.traffic.roce]` on other flow types, `[flow.traffic.tcp]` on a queue pair, `cnp_priority` on a queue pair (use `feedback_priority`), `cnp_interval_ns` on a queue pair, `variable_window` without `window_bytes`, a `traffic.dcqcn` table or `variable_window = true` with `congestion_control = "none"`, duration-bounded queue pairs, and an MTU above `4294967295` bytes. A queue pair with `cnp_interval_ns` fails with:
 
 ```text
 unsupported `cnp_interval_ns` on RoCE traffic: a queue pair's receiver echoes ECN on its ACKs and NACKs and sends no CNP (P16)
 ```
 
-Queue pairs also carry collective stages (see [Collectives](/docs/configuration/collectives#roce-stages)). Queue pairs and collective stages run on Scalar, CPU, Metal, and CUDA.
+Queue pairs also carry collective stages (see [Collectives](/docs/configuration/collectives#roce-stages)). Queue pairs and collective stages, under either congestion control, run on Scalar, CPU, Metal, and CUDA, byte-identically.
 
 ## Days AGO field limits
 

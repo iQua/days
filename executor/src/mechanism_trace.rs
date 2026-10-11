@@ -832,7 +832,8 @@ pub fn dcqcn_transitions_csv(
 
 /// The sender transitions of RoCE queue pairs, one row per event in `EventKey` order (pinned
 /// schema `days-gpu/plans/briefs/p15/qp-schema.md`, with Amendment 6: the ECN echo and the
-/// window).
+/// window; and P17's Amendment 7: the pair's congestion control, `dcqcn` or `none`, appended as
+/// column 46).
 pub fn roce_sender_transitions_csv(
     records: &[MechanismTransitionRecord],
 ) -> Result<String, MechanismTraceError> {
@@ -861,7 +862,7 @@ pub fn roce_sender_transitions_csv(
         });
     }
     let mut csv = String::from(
-        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,window_blocked,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,window_bytes,variable_window,maximum_rate_bps,initial_rate_bps,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status\n",
+        "time_ns,event_phase,event_origin_node,event_origin_sequence,node_id,flow_id,kind,class_paused,window_blocked,data_class,mtu_bytes,total_bytes,pacing_interval_ns,first_pacing_time_ns,rto_ns,window_bytes,variable_window,maximum_rate_bps,initial_rate_bps,rate_bps,input_acknowledgment,input_ce_echo,emitted,emitted_psn,emitted_bytes,emitted_retransmission,emitted_payload,before_next_psn,before_snd_una,before_bytes_emitted,before_packets_emitted,before_credit_quanta,before_rto_deadline_ns,before_pacer,before_next_tick_ns,before_status,after_next_psn,after_snd_una,after_bytes_emitted,after_packets_emitted,after_credit_quanta,after_rto_deadline_ns,after_pacer,after_next_tick_ns,after_status,congestion_control\n",
     );
     for record in records {
         let emitted = record.emitted;
@@ -914,7 +915,10 @@ pub fn roce_sender_transitions_csv(
             )
             .expect("writing to String cannot fail");
         }
-        csv.push('\n');
+        csv.push_str(match record.congestion_control {
+            crate::RoceCongestionControl::Dcqcn => ",dcqcn\n",
+            crate::RoceCongestionControl::None => ",none\n",
+        });
     }
     Ok(csv)
 }

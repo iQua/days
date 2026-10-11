@@ -1,12 +1,14 @@
 //! Canonical serial priority-queue execution.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
 use num_bigint::BigUint;
 use num_rational::Ratio;
 
+use crate::fel::FutureEvents;
+use crate::packet_store::{PacketStore, Resident};
 use crate::stage_index::{HostStageIndex, HostStageSlot, ProbedTable, StageScanProbe};
 use crate::{
     Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorFeedbackAction,
@@ -880,27 +882,27 @@ fn run_scalar_events<'image>(
     let mut children = Vec::new();
     let mut superseded = Vec::new();
 
-    while events.first_key_value().is_some_and(|(key, _)| {
+    while events.peek_key().is_some_and(|key| {
         key.time_ns <= image.stop_time_ns
             && exclusive_horizon_ns.is_none_or(|horizon_ns| key.time_ns < horizon_ns)
     }) {
-        let (_, event) = events
-            .pop_first()
-            .expect("first_key_value established a pending event");
+        let event = events.pop()?.expect("peek_key established a pending event");
         transitions.dispatch(event, &mut children)?;
         after_dispatch(&transitions, event);
         transitions.take_superseded_timers(&mut superseded);
         for timer in superseded.drain(..) {
-            remove_superseded_timer(&mut events, timer)?;
+            events.remove_superseded_timer(timer)?;
         }
         for child in children.drain(..) {
-            if events.insert(child.key, child).is_some() {
-                return Err(ExecutionError::DuplicateEventKey(child.key));
-            }
+            events.insert(child)?;
         }
     }
 
-    Ok((transitions, events.into_values().collect()))
+    // The drain reuses the heap's buffer; the result keeps exactly its events, not the run's
+    // largest event list as spare capacity.
+    let mut pending_events = events.into_sorted_vec()?;
+    pending_events.shrink_to_fit();
+    Ok((transitions, pending_events))
 }
 
 /// Test hook: a Scalar run with the number of events it dispatched and the number of
@@ -1116,7 +1118,7 @@ pub(crate) struct TransitionState<'image> {
     /// queues are never paused carries one empty pointer and nothing else. Never serialized.
     switch_pfc_orders: Option<Box<PfcClassOrders>>,
     local_node: Option<NodeDescriptor>,
-    packets: BTreeMap<PayloadId, ResidentPacket>,
+    packets: PacketStore<ResidentPacket>,
     observation_mode: ObservationMode,
     summary: RunSummary,
     observed_packets: BTreeMap<PayloadId, PacketDescriptor>,
@@ -1174,7 +1176,8 @@ impl SupersededTimer {
     }
 }
 
-/// Removes the event carrying a superseded timer identity from one ordered future-event map.
+/// Removes the event carrying a superseded timer identity from one ordered future-event map: the
+/// retransmission-timeout map of a `FutureEvents`, or a Scalar-rounds LP's whole map.
 ///
 /// The canonical owner of a timer identity is the minimum-`EventKey` event carrying it, which is
 /// also the event the lazy recognition would have consumed first. Removal is therefore exact even
@@ -1204,6 +1207,13 @@ struct ResidentPacket {
     source_time_ns: Option<u64>,
     transmitters: u64,
     terminal: bool,
+}
+
+impl Resident for ResidentPacket {
+    #[inline]
+    fn payload(&self) -> PayloadId {
+        self.descriptor.id
+    }
 }
 
 pub(crate) enum LocalNodeState {
@@ -1524,7 +1534,7 @@ impl<'image> TransitionState<'image> {
         image: &'image SimulationImage,
         observation_mode: ObservationMode,
     ) -> Result<Self, ExecutionError> {
-        let mut packets = BTreeMap::new();
+        let mut packets = PacketStore::new();
         let tcp_sent_segments =
             crate::tcp_ledger::seed_image(image).map_err(tcp_segment_conflict_error)?;
         let live_payloads = crate::tcp_ledger::initial_live_payloads(image);
@@ -1535,15 +1545,12 @@ impl<'image> TransitionState<'image> {
                 continue;
             }
             if packets
-                .insert(
-                    descriptor.id,
-                    ResidentPacket {
-                        descriptor,
-                        source_time_ns: None,
-                        transmitters: 0,
-                        terminal: false,
-                    },
-                )
+                .insert(ResidentPacket {
+                    descriptor,
+                    source_time_ns: None,
+                    transmitters: 0,
+                    terminal: false,
+                })
                 .is_some()
             {
                 return Err(ExecutionError::DuplicatePayload(descriptor.id));
@@ -1638,18 +1645,15 @@ impl<'image> TransitionState<'image> {
             }
         };
 
-        let mut resident = BTreeMap::new();
+        let mut resident = PacketStore::new();
         for descriptor in packets {
             if resident
-                .insert(
-                    descriptor.id,
-                    ResidentPacket {
-                        descriptor,
-                        source_time_ns: None,
-                        transmitters: 0,
-                        terminal: false,
-                    },
-                )
+                .insert(ResidentPacket {
+                    descriptor,
+                    source_time_ns: None,
+                    transmitters: 0,
+                    terminal: false,
+                })
                 .is_some()
             {
                 return Err(ExecutionError::DuplicatePayload(descriptor.id));
@@ -1752,15 +1756,12 @@ impl<'image> TransitionState<'image> {
                 Err(ExecutionError::DuplicatePayload(descriptor.id))
             };
         }
-        self.packets.insert(
-            descriptor.id,
-            ResidentPacket {
-                descriptor,
-                source_time_ns: None,
-                transmitters: 0,
-                terminal: false,
-            },
-        );
+        self.packets.insert(ResidentPacket {
+            descriptor,
+            source_time_ns: None,
+            transmitters: 0,
+            terminal: false,
+        });
         Ok(())
     }
 
@@ -1840,7 +1841,8 @@ impl<'image> TransitionState<'image> {
             summary: self.summary,
             resident_packets: self
                 .packets
-                .into_values()
+                .into_sorted()
+                .into_iter()
                 .map(|packet| packet.descriptor)
                 .collect(),
             tcp_segment_ledger: self
@@ -4897,7 +4899,13 @@ impl<'image> TransitionState<'image> {
                 }
                 tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
             }
-            let froze = snd_una_before < total && roce.snd_una >= total;
+            // A pair without congestion control (P17) has no controller to freeze or feed: its
+            // inert controller is never armed, and its sender ignores the ECN echo, so neither
+            // transition runs and no DCQCN record is written. The mode is tested last, so a DCQCN
+            // pair pays for it only at its completion and on an echoing ACK or NACK.
+            let froze = snd_una_before < total
+                && roce.snd_una >= total
+                && roce.congestion_control == crate::RoceCongestionControl::Dcqcn;
             if froze {
                 let settled = roce.controller.settle(now);
                 advance.alpha_ticks += settled.alpha_ticks;
@@ -4906,7 +4914,9 @@ impl<'image> TransitionState<'image> {
             }
             // The ECN echo is the pair's congestion feedback (ruling D4), ignored once the pair is
             // complete (ruling D11), as HPCC's `QpComplete` precedes `cnp_received_mlx`.
-            let feedback = header.ce_echo && roce.snd_una < total;
+            let feedback = header.ce_echo
+                && roce.snd_una < total
+                && roce.congestion_control == crate::RoceCongestionControl::Dcqcn;
             if feedback {
                 let fed = roce.controller.on_feedback(now);
                 advance.alpha_ticks += fed.alpha_ticks;
@@ -6667,15 +6677,12 @@ impl<'image> TransitionState<'image> {
         if self.packets.contains_key(&packet.id) {
             return Err(ExecutionError::DuplicatePayload(packet.id));
         }
-        self.packets.insert(
-            packet.id,
-            ResidentPacket {
-                descriptor: packet,
-                source_time_ns,
-                transmitters: 0,
-                terminal: false,
-            },
-        );
+        self.packets.insert(ResidentPacket {
+            descriptor: packet,
+            source_time_ns,
+            transmitters: 0,
+            terminal: false,
+        });
         Ok(())
     }
 
@@ -7196,12 +7203,13 @@ fn tcp_segment_conflict_error(conflict: crate::tcp_ledger::TcpSegmentConflict) -
 }
 
 fn resumable_packets(
-    packets: BTreeMap<PayloadId, ResidentPacket>,
+    packets: PacketStore<ResidentPacket>,
     tcp_sent_segments: &crate::tcp_ledger::TcpSegmentLedger,
 ) -> Vec<PacketDescriptor> {
     let mut descriptors = packets
+        .into_sorted()
         .into_iter()
-        .map(|(payload, packet)| (payload, packet.descriptor))
+        .map(|packet| (packet.descriptor.id, packet.descriptor))
         .collect::<BTreeMap<_, _>>();
     for packet in tcp_sent_segments.values().flat_map(BTreeMap::values) {
         descriptors.entry(packet.id).or_insert(*packet);
@@ -7489,7 +7497,7 @@ fn derive_switch_queue_bytes(
     image: &SimulationImage,
     switch_states: &[SwitchState],
     local_node: Option<NodeDescriptor>,
-    packets: &BTreeMap<PayloadId, ResidentPacket>,
+    packets: &PacketStore<ResidentPacket>,
 ) -> Result<DerivedSwitchQueues, ExecutionError> {
     let mut node_ids = vec![None; switch_states.len()];
     if let Some(node) = local_node {
@@ -7631,14 +7639,16 @@ fn indexed_lookup<T>(table: &[T], id: u64, matches_id: impl Fn(&T) -> bool) -> O
     indexed.or_else(|| table.iter().find(|descriptor| matches_id(descriptor)))
 }
 
-fn initial_event_queue(
-    image: &SimulationImage,
-) -> Result<BTreeMap<EventKey, Event>, ExecutionError> {
-    let mut events = BTreeMap::new();
+/// The image's initial events as the run's future-event list. A duplicate key is refused here, at
+/// the first event in image order that repeats an earlier key, as the ordered map refused it.
+fn initial_event_queue(image: &SimulationImage) -> Result<FutureEvents, ExecutionError> {
+    let mut keys = BTreeSet::new();
+    let mut events = FutureEvents::with_capacity(image.initial_events.len());
     for event in image.initial_events.iter().copied() {
-        if events.insert(event.key, event).is_some() {
+        if !keys.insert(event.key) {
             return Err(ExecutionError::DuplicateEventKey(event.key));
         }
+        events.insert(event)?;
     }
     Ok(events)
 }
@@ -7837,6 +7847,7 @@ fn roce_sender_record(
             variable_window: roce.variable_window,
             maximum_rate_bps: roce.controller.config.maximum_rate_bps,
             initial_rate_bps: roce.controller.config.initial_rate_bps,
+            congestion_control: roce.congestion_control,
             rate_bps,
             input_acknowledgment: input.map(|header| header.acknowledgment),
             input_ce_echo: input.map(|header| header.ce_echo),

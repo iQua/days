@@ -2758,6 +2758,17 @@ fn device_sizing_derives_a_tcp_plan() {
         days_executor::device_sizing::round_scratch_words(checkpoint.nodes.len())
             .expect("round scratch must size")
             * std::mem::size_of::<u64>();
+    // P17 merge: the LP stream lists in `stream_state` no longer store the generator stream ids,
+    // one word per distinct generator flow (this image's one TCP flow).
+    #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+    let p17_generator_id_bytes = checkpoint
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .map(|generator| generator.flow)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+        * std::mem::size_of::<u64>();
 
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     {
@@ -2773,7 +2784,7 @@ fn device_sizing_derives_a_tcp_plan() {
         assert_eq!(metal.memory_layout.channel_stream_event_slots, 4);
         assert_eq!(
             metal.memory_layout.total_event_arena_bytes(),
-            1_680 + t21_round_scratch_bytes
+            1_680 + t21_round_scratch_bytes - p17_generator_id_bytes
         );
     }
 
@@ -2791,7 +2802,7 @@ fn device_sizing_derives_a_tcp_plan() {
         assert_eq!(cuda.memory_layout.channel_stream_event_slots, 4);
         assert_eq!(
             cuda.memory_layout.total_event_arena_bytes(),
-            1_680 + t21_round_scratch_bytes
+            1_680 + t21_round_scratch_bytes - p17_generator_id_bytes
         );
     }
 }
