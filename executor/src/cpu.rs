@@ -4978,6 +4978,17 @@ fn route_load_estimator_uses_only_declared_routes_and_generator_rates() {
     assert_eq!(loads[NodeId(4).0 as usize], 0);
 }
 
+/// The coordinator copies every round reply out of its channel slot; at 16 workers on dp1 those
+/// copies were a quarter of its instructions (P18 cpu-levers). A round reply stays this small.
+#[test]
+fn a_round_reply_fits_its_budget() {
+    assert!(
+        std::mem::size_of::<OwnedWorkerReply<'static>>() <= 192,
+        "OwnedWorkerReply is {} B",
+        std::mem::size_of::<OwnedWorkerReply<'static>>()
+    );
+}
+
 #[test]
 fn owner_sets_hold_every_owner_inline_and_wide() {
     for workers in [1, 2, 64, 128, 129, 200] {
