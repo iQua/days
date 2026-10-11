@@ -1076,6 +1076,7 @@ impl CpuLp<'_> {
             .map_err(|_| ExecutionError::CounterOverflow(self.node.id))
     }
 
+    /// Drains with fresh buffers: the classified and dynamic paths, and tests.
     fn drain(
         &mut self,
         exclusive_horizon_ns: u128,
@@ -1084,9 +1085,37 @@ impl CpuLp<'_> {
         worker: usize,
         round: u64,
     ) -> Result<(LpRoundWork, Vec<RemoteEnvelope>), ExecutionError> {
-        let mut children = Vec::new();
-        let mut outbox = Vec::new();
-        let mut superseded = Vec::new();
+        let mut scratch = DrainScratch::default();
+        let work = self.drain_with(
+            &mut scratch,
+            exclusive_horizon_ns,
+            outbox_capacity,
+            fault,
+            worker,
+            round,
+        )?;
+        Ok((work, scratch.outbox))
+    }
+
+    /// Drains every event below the horizon, with the worker's reusable buffers: the remote
+    /// children are left in `scratch.outbox`, in emission order.
+    fn drain_with(
+        &mut self,
+        scratch: &mut DrainScratch,
+        exclusive_horizon_ns: u128,
+        outbox_capacity: Option<usize>,
+        fault: Option<CpuFaultInjection>,
+        worker: usize,
+        round: u64,
+    ) -> Result<LpRoundWork, ExecutionError> {
+        let DrainScratch {
+            children,
+            outbox,
+            superseded,
+        } = scratch;
+        children.clear();
+        outbox.clear();
+        superseded.clear();
         let mut events_processed = 0_u64;
         let mut same_time_continuations = 0_u64;
         let mut fallback_classified_pushes = 0_u64;
@@ -1123,14 +1152,14 @@ impl CpuLp<'_> {
             } else {
                 None
             };
-            self.transitions.dispatch(event, &mut children)?;
+            self.transitions.dispatch(event, children)?;
             if let Some(packet) = preserved_packet {
                 self.transitions.install_packet(packet)?;
             }
             // Live-state contract (T20g item 2): a source-owned retransmission timeout targets its
             // own host, so every superseded timer belongs to this LP's future map and needs no
             // cross-worker cancellation protocol.
-            self.transitions.take_superseded_timers(&mut superseded);
+            self.transitions.take_superseded_timers(superseded);
             for timer in superseded.drain(..) {
                 debug_assert_eq!(timer.target, self.node.id);
                 self.futures.remove_superseded_timer(timer)?;
@@ -1187,16 +1216,21 @@ impl CpuLp<'_> {
                 });
             }
         }
-        Ok((
-            LpRoundWork {
-                node: self.node.id,
-                events_processed,
-                same_time_continuations,
-                fallback_classified_pushes,
-            },
-            outbox,
-        ))
+        Ok(LpRoundWork {
+            node: self.node.id,
+            events_processed,
+            same_time_continuations,
+            fallback_classified_pushes,
+        })
     }
+}
+
+/// One worker's drain buffers, reused for every LP it drains.
+#[derive(Default)]
+struct DrainScratch {
+    children: Vec<Event>,
+    outbox: Vec<RemoteEnvelope>,
+    superseded: Vec<crate::scalar::SupersededTimer>,
 }
 
 #[derive(Clone, Copy)]
@@ -1246,6 +1280,8 @@ struct StaticOwnerIngress {
 
 struct StaticOwnerBatch {
     round: u64,
+    /// The sending worker: the owner returns the emptied buffer to it in a later batch.
+    source: usize,
     envelopes: Vec<RemoteEnvelope>,
 }
 
@@ -1481,6 +1517,13 @@ struct WorkerShard<'image> {
     merge_marks: Vec<bool>,
     /// Merge scratch: the owned LPs the batch being merged has touched, in first-touch order.
     merge_touched: Vec<usize>,
+    /// Drain buffers, reused for every LP.
+    drain_scratch: DrainScratch,
+    /// This round's outbound envelopes, one buffer per owner (static path).
+    outboxes: Vec<Vec<RemoteEnvelope>>,
+    /// Emptied batch buffers from each source worker, sent back to that worker as the next batch
+    /// to it (static path). Buffers move between workers only inside messages.
+    returned_buffers: Vec<Vec<RemoteEnvelope>>,
 }
 
 struct StaticPlacement {
@@ -2229,7 +2272,6 @@ fn owned_worker_loop<'image>(
                 );
                 let OwnedRoundDrain {
                     executed,
-                    remote_by_owner,
                     frontier_updates,
                     heap_pops,
                     physical_lp_probes,
@@ -2243,19 +2285,30 @@ fn owned_worker_loop<'image>(
                 };
                 let mut outbound_owners = OwnerSet::new(config.workers);
                 let mut next_minimum_ns = minimum_ns;
-                for (owner, envelopes) in remote_by_owner.into_iter().enumerate() {
-                    if envelopes.is_empty() {
+                for (owner, route) in routes.iter().enumerate() {
+                    if shard.outboxes[owner].is_empty() {
                         continue;
                     }
+                    // Send this round's buffer, and keep the one the owner returned last; while
+                    // the owner has returned none, one allocation sized like this batch.
+                    let mut next = std::mem::take(&mut shard.returned_buffers[owner]);
+                    if next.capacity() == 0 {
+                        next = Vec::with_capacity(shard.outboxes[owner].len());
+                    }
+                    let envelopes = std::mem::replace(&mut shard.outboxes[owner], next);
                     outbound_owners.insert(owner);
                     next_minimum_ns = envelopes
                         .iter()
                         .map(|envelope| envelope.event.key.time_ns)
                         .chain(next_minimum_ns)
                         .min();
-                    if routes[owner]
+                    if route
                         .remote
-                        .send(StaticOwnerBatch { round, envelopes })
+                        .send(StaticOwnerBatch {
+                            round,
+                            source: shard.worker,
+                            envelopes,
+                        })
                         .is_err()
                     {
                         let _ = replies.send(OwnedWorkerReply::Failed {
@@ -2328,7 +2381,6 @@ struct InboundMergeMetrics {
 
 struct OwnedRoundDrain {
     executed: ExecutedLps,
-    remote_by_owner: Vec<Vec<RemoteEnvelope>>,
     frontier_updates: u64,
     heap_pops: u64,
     physical_lp_probes: u64,
@@ -2470,8 +2522,14 @@ fn merge_static_owner_batch(
     metrics: &mut InboundMergeMetrics,
 ) -> Result<(), ExecutionError> {
     let started = Instant::now();
+    let StaticOwnerBatch {
+        source,
+        mut envelopes,
+        ..
+    } = batch;
     let (frontier_updates, heap_pops, physical_lp_probes) =
-        shard.merge_static_remote(batch.envelopes, remote_floor_ns, placement)?;
+        shard.merge_static_remote(&mut envelopes, remote_floor_ns, placement)?;
+    shard.return_buffer(source, envelopes);
     debug_assert_eq!(heap_pops, 0, "a merge pops no frontier entry");
     metrics.frontier_updates = metrics.frontier_updates.saturating_add(frontier_updates);
     metrics.physical_lp_probes = metrics
@@ -4406,6 +4464,9 @@ impl<'image> WorkerShard<'image> {
             frontier,
             merge_marks: vec![false; lp_count],
             merge_touched: Vec::new(),
+            drain_scratch: DrainScratch::default(),
+            outboxes: Vec::new(),
+            returned_buffers: Vec::new(),
         })
     }
 
@@ -4446,7 +4507,7 @@ impl<'image> WorkerShard<'image> {
         let mut frontier_updates = 0_u64;
         let mut heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
-        let inbox = ingress.remote.try_iter().flatten().collect::<Vec<_>>();
+        let mut inbox = ingress.remote.try_iter().flatten().collect::<Vec<_>>();
         for state in states {
             let node = state.lp.node.id;
             let next = state.lp.next_key();
@@ -4464,7 +4525,7 @@ impl<'image> WorkerShard<'image> {
 
         // The dynamic path places LP `slot` on worker `slot % workers`, at `slot / workers`.
         let (remote_updates, _, remote_probes) =
-            self.merge_remote_with(inbox, exclusive_horizon_ns, |global_slot| {
+            self.merge_remote_with(&mut inbox, exclusive_horizon_ns, |global_slot| {
                 Some((global_slot % workers, global_slot / workers))
             })?;
         frontier_updates = frontier_updates.saturating_add(remote_updates);
@@ -4935,9 +4996,11 @@ impl<'image> WorkerShard<'image> {
     ) -> Result<OwnedRoundDrain, ExecutionError> {
         let round_started = measure_lp_wall.then(Instant::now);
         let mut executed = ExecutedLps::new(records);
-        let mut remote_by_owner = (0..placement.workers)
-            .map(|_| Vec::new())
-            .collect::<Vec<_>>();
+        if self.outboxes.len() != placement.workers {
+            self.outboxes.resize_with(placement.workers, Vec::new);
+            self.returned_buffers
+                .resize_with(placement.workers, Vec::new);
+        }
         let mut frontier_updates = 0_u64;
         let mut heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
@@ -4964,22 +5027,24 @@ impl<'image> WorkerShard<'image> {
             } else {
                 0
             };
-            let (work, outbox) = lp.drain(
+            let work = lp.drain_with(
+                &mut self.drain_scratch,
                 exclusive_horizon_ns,
                 outbox_capacity,
                 fault,
                 self.worker,
                 round,
             )?;
+            let outbox = &mut self.drain_scratch.outbox;
             let messages_exchanged = u64::try_from(outbox.len())
                 .map_err(|_| ExecutionError::CounterOverflow(lp.node.id))?;
-            for envelope in outbox {
+            for envelope in outbox.drain(..) {
                 let target_slot = usize::try_from(envelope.event.target.0)
                     .map_err(|_| ExecutionError::UnknownNode(envelope.event.target))?;
                 let (owner_worker, _) = placement
                     .locate(target_slot)
                     .ok_or(ExecutionError::UnknownNode(envelope.event.target))?;
-                remote_by_owner[owner_worker].push(envelope);
+                self.outboxes[owner_worker].push(envelope);
             }
             let node = lp.node.id;
             let next = lp.next_key();
@@ -5032,7 +5097,6 @@ impl<'image> WorkerShard<'image> {
         }
         Ok(OwnedRoundDrain {
             executed,
-            remote_by_owner,
             frontier_updates,
             heap_pops,
             physical_lp_probes,
@@ -5040,9 +5104,24 @@ impl<'image> WorkerShard<'image> {
         })
     }
 
+    /// Keeps an emptied batch buffer for the next batch to `source`. A buffer much larger than
+    /// its last use is shrunk, so a burst cannot pin memory: each worker holds at most two
+    /// buffers per peer (its outbox and one returned buffer).
+    fn return_buffer(&mut self, source: usize, mut buffer: Vec<RemoteEnvelope>) {
+        let Some(slot) = self.returned_buffers.get_mut(source) else {
+            return;
+        };
+        let used = buffer.len().max(64);
+        buffer.clear();
+        if buffer.capacity() > 4 * used {
+            buffer.shrink_to(2 * used);
+        }
+        *slot = buffer;
+    }
+
     fn merge_static_remote(
         &mut self,
-        inbox: Vec<RemoteEnvelope>,
+        inbox: &mut Vec<RemoteEnvelope>,
         remote_floor_ns: u128,
         placement: &StaticPlacement,
     ) -> Result<(u64, u64, u64), ExecutionError> {
@@ -5054,7 +5133,7 @@ impl<'image> WorkerShard<'image> {
     fn restore_classified_round(
         &mut self,
         states: Vec<ReturnedLp<'image>>,
-        inbox: Vec<RemoteEnvelope>,
+        mut inbox: Vec<RemoteEnvelope>,
         exclusive_horizon_ns: u128,
         placement: &StaticPlacement,
     ) -> Result<(u64, u64, u64, Option<u64>), ExecutionError> {
@@ -5079,7 +5158,7 @@ impl<'image> WorkerShard<'image> {
             frontier_updates = frontier_updates.saturating_add(1);
         }
         let (remote_updates, remote_heap_pops, remote_probes) =
-            self.merge_static_remote(inbox, exclusive_horizon_ns, placement)?;
+            self.merge_static_remote(&mut inbox, exclusive_horizon_ns, placement)?;
         frontier_updates = frontier_updates.saturating_add(remote_updates);
         heap_pops = heap_pops.saturating_add(remote_heap_pops);
         physical_lp_probes = physical_lp_probes.saturating_add(remote_probes);
@@ -5113,9 +5192,10 @@ impl<'image> WorkerShard<'image> {
     /// `install_packet` is idempotent for an equal descriptor. Batches from different sources
     /// already arrive in thread-timing order. The frontier work matches a per-target pass
     /// exactly: one probe and one update per distinct target of the batch.
+    /// The batch is left empty, its buffer kept for reuse.
     fn merge_remote_with(
         &mut self,
-        inbox: Vec<RemoteEnvelope>,
+        inbox: &mut Vec<RemoteEnvelope>,
         remote_floor_ns: u128,
         locate: impl Fn(usize) -> Option<(usize, usize)>,
     ) -> Result<(u64, u64, u64), ExecutionError> {
@@ -5125,8 +5205,8 @@ impl<'image> WorkerShard<'image> {
         debug_assert!(self.merge_touched.is_empty());
         #[cfg(feature = "planner-test-hooks")]
         count_inbound(inbox.len(), inbox.len());
-        let merged =
-            self.merge_envelopes(&inbox, remote_floor_ns, &locate, &mut physical_lp_probes);
+        let merged = self.merge_envelopes(inbox, remote_floor_ns, &locate, &mut physical_lp_probes);
+        inbox.clear();
         // The touched LPs are cleared even when the merge failed, so the scratch stays empty.
         let touched = std::mem::take(&mut self.merge_touched);
         for owner_slot in &touched {
