@@ -46,7 +46,6 @@ pub fn take_cpu_inbound_merge_counts_for_testing() -> (u64, u64) {
         INBOUND_ENVELOPE_VISITS.swap(0, Relaxed),
     )
 }
-const REMOTE_ORDER_BYTES: usize = 34;
 const WALL_CLOCK_SAMPLE_ROUNDS: u64 = 64;
 
 /// LP count per dispatch request.
@@ -1478,6 +1477,10 @@ struct WorkerShard<'image> {
     worker: usize,
     lps: Vec<Option<CpuLp<'image>>>,
     frontier: OwnerFrontierIndex,
+    /// Merge scratch, one mark per owned LP: whether the batch being merged has touched it.
+    merge_marks: Vec<bool>,
+    /// Merge scratch: the owned LPs the batch being merged has touched, in first-touch order.
+    merge_touched: Vec<usize>,
 }
 
 struct StaticPlacement {
@@ -4235,71 +4238,6 @@ fn add_summary_checked(
     Ok(())
 }
 
-/// Returns the byte passes it made.
-fn radix_sort_remote_envelopes(events: &mut Vec<RemoteEnvelope>) -> usize {
-    if events.len() < 2 {
-        return 0;
-    }
-    let varying_bytes = remote_envelope_varying_bytes(events);
-    let mut scratch = vec![events[0]; events.len()];
-    let mut passes = 0;
-    for pass in 0..REMOTE_ORDER_BYTES {
-        if varying_bytes & (1_u64 << pass) == 0 {
-            continue;
-        }
-        passes += 1;
-        let mut counts = [0_usize; 256];
-        for event in events.iter() {
-            counts[usize::from(remote_order_byte(event.event, pass))] += 1;
-        }
-        let mut offset = 0;
-        for count in &mut counts {
-            let next = offset + *count;
-            *count = offset;
-            offset = next;
-        }
-        for event in events.iter().copied() {
-            let byte = usize::from(remote_order_byte(event.event, pass));
-            scratch[counts[byte]] = event;
-            counts[byte] += 1;
-        }
-        std::mem::swap(events, &mut scratch);
-    }
-    passes
-}
-
-fn remote_envelope_varying_bytes(events: &[RemoteEnvelope]) -> u64 {
-    let first = events[0].event;
-    let mut target = 0_u64;
-    let mut time = 0_u64;
-    let mut phase = 0_u16;
-    let mut origin_node = 0_u64;
-    let mut origin_seq = 0_u64;
-    for envelope in &events[1..] {
-        let event = envelope.event;
-        target |= first.target.0 ^ event.target.0;
-        time |= first.key.time_ns ^ event.key.time_ns;
-        phase |= first.key.phase ^ event.key.phase;
-        origin_node |= first.key.origin_node.0 ^ event.key.origin_node.0;
-        origin_seq |= first.key.origin_seq ^ event.key.origin_seq;
-    }
-    varying_byte_mask(origin_seq, 0)
-        | varying_byte_mask(origin_node, 8)
-        | varying_byte_mask(u64::from(phase), 16)
-        | varying_byte_mask(time, 18)
-        | varying_byte_mask(target, 26)
-}
-
-fn varying_byte_mask(value: u64, first_pass: usize) -> u64 {
-    let mut mask = 0_u64;
-    for byte in 0..8 {
-        if value & (0xff_u64 << (byte * 8)) != 0 {
-            mask |= 1_u64 << (first_pass + byte);
-        }
-    }
-    mask
-}
-
 fn radix_sort_by_node<T: Copy>(items: &mut Vec<T>, node: impl Fn(T) -> NodeId + Copy) {
     if items.len() < 2 {
         return;
@@ -4325,18 +4263,6 @@ fn radix_sort_by_node<T: Copy>(items: &mut Vec<T>, node: impl Fn(T) -> NodeId + 
         }
         std::mem::swap(items, &mut scratch);
     }
-}
-
-const fn remote_order_byte(event: Event, pass: usize) -> u8 {
-    let (value, byte) = match pass {
-        0..=7 => (event.key.origin_seq, pass),
-        8..=15 => (event.key.origin_node.0, pass - 8),
-        16..=17 => (event.key.phase as u64, pass - 16),
-        18..=25 => (event.key.time_ns, pass - 18),
-        26..=33 => (event.target.0, pass - 26),
-        _ => (0, 0),
-    };
-    ((value >> (byte * 8)) & 0xff) as u8
 }
 
 fn efficiency(values: impl Iterator<Item = u64>, count: usize) -> f64 {
@@ -4473,10 +4399,13 @@ impl<'image> WorkerShard<'image> {
                 &mut setup_physical_lp_probes,
             )?;
         }
+        let lp_count = lps.len();
         Ok(Self {
             worker,
             lps: lps.into_iter().map(Some).collect(),
             frontier,
+            merge_marks: vec![false; lp_count],
+            merge_touched: Vec::new(),
         })
     }
 
@@ -4517,7 +4446,7 @@ impl<'image> WorkerShard<'image> {
         let mut frontier_updates = 0_u64;
         let mut heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
-        let mut inbox = ingress.remote.try_iter().flatten().collect::<Vec<_>>();
+        let inbox = ingress.remote.try_iter().flatten().collect::<Vec<_>>();
         for state in states {
             let node = state.lp.node.id;
             let next = state.lp.next_key();
@@ -4533,54 +4462,13 @@ impl<'image> WorkerShard<'image> {
             frontier_updates = frontier_updates.saturating_add(1);
         }
 
-        let _sort_passes = radix_sort_remote_envelopes(&mut inbox);
-        // One visit to find the varying bytes, two per sorting pass, one to group and insert.
-        #[cfg(feature = "planner-test-hooks")]
-        count_inbound(
-            inbox.len(),
-            if inbox.len() < 2 {
-                inbox.len()
-            } else {
-                inbox.len() * (2 + 2 * _sort_passes)
-            },
-        );
-        let mut offset = 0;
-        while offset < inbox.len() {
-            let target = inbox[offset].event.target;
-            let global_slot =
-                usize::try_from(target.0).map_err(|_| ExecutionError::UnknownNode(target))?;
-            if global_slot % workers != self.worker {
-                return Err(ExecutionError::UnknownNode(target));
-            }
-            let owner_slot = global_slot / workers;
-            physical_lp_probes = physical_lp_probes.saturating_add(1);
-            let lp = self
-                .lps
-                .get_mut(owner_slot)
-                .and_then(Option::as_mut)
-                .ok_or(ExecutionError::UnknownNode(target))?;
-            if lp.node.id != target {
-                return Err(ExecutionError::UnknownNode(target));
-            }
-            let mut end = offset + 1;
-            while end < inbox.len() && inbox[end].event.target == target {
-                end += 1;
-            }
-            for envelope in &inbox[offset..end] {
-                if u128::from(envelope.event.key.time_ns) < exclusive_horizon_ns {
-                    return Err(ExecutionError::RemoteEventBeforeHorizon {
-                        key: envelope.event.key,
-                        exclusive_horizon_ns,
-                    });
-                }
-                lp.transitions.install_packet(envelope.packet)?;
-                lp.futures.insert(envelope.event)?;
-            }
-            self.frontier
-                .update(owner_slot, target, lp.next_key(), &mut physical_lp_probes)?;
-            frontier_updates = frontier_updates.saturating_add(1);
-            offset = end;
-        }
+        // The dynamic path places LP `slot` on worker `slot % workers`, at `slot / workers`.
+        let (remote_updates, _, remote_probes) =
+            self.merge_remote_with(inbox, exclusive_horizon_ns, |global_slot| {
+                Some((global_slot % workers, global_slot / workers))
+            })?;
+        frontier_updates = frontier_updates.saturating_add(remote_updates);
+        physical_lp_probes = physical_lp_probes.saturating_add(remote_probes);
 
         let minimum_ns = if let Some(entry) = self
             .frontier
@@ -5217,29 +5105,57 @@ impl<'image> WorkerShard<'image> {
         Ok((frontier_updates, heap_pops, physical_lp_probes, minimum_ns))
     }
 
+    /// Merges one inbound batch into its owners' queues and stores, in arrival order, then
+    /// updates the frontier once per LP the batch touched.
+    ///
+    /// The order of arrival reaches no output: each LP's queue pops in unique-key order whatever
+    /// its insertion history (`crate::fel`), the packet store has no iteration API, and
+    /// `install_packet` is idempotent for an equal descriptor. Batches from different sources
+    /// already arrive in thread-timing order. The frontier work matches a per-target pass
+    /// exactly: one probe and one update per distinct target of the batch.
     fn merge_remote_with(
         &mut self,
-        mut inbox: Vec<RemoteEnvelope>,
+        inbox: Vec<RemoteEnvelope>,
         remote_floor_ns: u128,
         locate: impl Fn(usize) -> Option<(usize, usize)>,
     ) -> Result<(u64, u64, u64), ExecutionError> {
         let mut frontier_updates = 0_u64;
         let heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
-        let _sort_passes = radix_sort_remote_envelopes(&mut inbox);
-        // One visit to find the varying bytes, two per sorting pass, one to group and insert.
+        debug_assert!(self.merge_touched.is_empty());
         #[cfg(feature = "planner-test-hooks")]
-        count_inbound(
-            inbox.len(),
-            if inbox.len() < 2 {
-                inbox.len()
-            } else {
-                inbox.len() * (2 + 2 * _sort_passes)
-            },
-        );
-        let mut offset = 0;
-        while offset < inbox.len() {
-            let target = inbox[offset].event.target;
+        count_inbound(inbox.len(), inbox.len());
+        let merged =
+            self.merge_envelopes(&inbox, remote_floor_ns, &locate, &mut physical_lp_probes);
+        // The touched LPs are cleared even when the merge failed, so the scratch stays empty.
+        let touched = std::mem::take(&mut self.merge_touched);
+        for owner_slot in &touched {
+            self.merge_marks[*owner_slot] = false;
+        }
+        merged?;
+        for owner_slot in touched.iter().copied() {
+            let lp = self.lps[owner_slot]
+                .as_ref()
+                .expect("a merged LP is resident");
+            let (node, next) = (lp.node.id, lp.next_key());
+            self.frontier
+                .update(owner_slot, node, next, &mut physical_lp_probes)?;
+            frontier_updates = frontier_updates.saturating_add(1);
+        }
+        self.merge_touched = touched;
+        self.merge_touched.clear();
+        Ok((frontier_updates, heap_pops, physical_lp_probes))
+    }
+
+    fn merge_envelopes(
+        &mut self,
+        inbox: &[RemoteEnvelope],
+        remote_floor_ns: u128,
+        locate: &impl Fn(usize) -> Option<(usize, usize)>,
+        physical_lp_probes: &mut u64,
+    ) -> Result<(), ExecutionError> {
+        for envelope in inbox {
+            let target = envelope.event.target;
             let global_slot =
                 usize::try_from(target.0).map_err(|_| ExecutionError::UnknownNode(target))?;
             let Some((owner_worker, owner_slot)) = locate(global_slot) else {
@@ -5248,33 +5164,27 @@ impl<'image> WorkerShard<'image> {
             if owner_worker != self.worker {
                 return Err(ExecutionError::UnknownNode(target));
             }
-            physical_lp_probes = physical_lp_probes.saturating_add(1);
             let lp = self
                 .lps
                 .get_mut(owner_slot)
                 .and_then(Option::as_mut)
                 .filter(|lp| lp.node.id == target)
                 .ok_or(ExecutionError::UnknownNode(target))?;
-            let mut end = offset + 1;
-            while end < inbox.len() && inbox[end].event.target == target {
-                end += 1;
+            if !self.merge_marks[owner_slot] {
+                self.merge_marks[owner_slot] = true;
+                self.merge_touched.push(owner_slot);
+                *physical_lp_probes = physical_lp_probes.saturating_add(1);
             }
-            for envelope in &inbox[offset..end] {
-                if u128::from(envelope.event.key.time_ns) < remote_floor_ns {
-                    return Err(ExecutionError::RemoteEventBeforeHorizon {
-                        key: envelope.event.key,
-                        exclusive_horizon_ns: remote_floor_ns,
-                    });
-                }
-                lp.transitions.install_packet(envelope.packet)?;
-                lp.futures.insert(envelope.event)?;
+            if u128::from(envelope.event.key.time_ns) < remote_floor_ns {
+                return Err(ExecutionError::RemoteEventBeforeHorizon {
+                    key: envelope.event.key,
+                    exclusive_horizon_ns: remote_floor_ns,
+                });
             }
-            self.frontier
-                .update(owner_slot, target, lp.next_key(), &mut physical_lp_probes)?;
-            frontier_updates = frontier_updates.saturating_add(1);
-            offset = end;
+            lp.transitions.install_packet(envelope.packet)?;
+            lp.futures.insert(envelope.event)?;
         }
-        Ok((frontier_updates, heap_pops, physical_lp_probes))
+        Ok(())
     }
 
     fn into_lps(self) -> Result<Vec<CpuLp<'image>>, ExecutionError> {
