@@ -20,6 +20,32 @@ use crate::{
 };
 
 const TIME_AFTER_U64_MAX: u128 = 1_u128 << 64;
+
+/// Test hook: remote envelopes merged into owner queues, and envelope visits the merges made.
+#[cfg(feature = "planner-test-hooks")]
+static INBOUND_ENVELOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(feature = "planner-test-hooks")]
+static INBOUND_ENVELOPE_VISITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(feature = "planner-test-hooks")]
+fn count_inbound(envelopes: usize, visits: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    INBOUND_ENVELOPES.fetch_add(envelopes as u64, Relaxed);
+    INBOUND_ENVELOPE_VISITS.fetch_add(visits as u64, Relaxed);
+}
+
+/// Test hook: the remote envelopes CPU workers merged into owner queues since the last call, and
+/// the envelope visits those merges made (sorting, grouping and inserting), process-wide; resets
+/// both to zero.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn take_cpu_inbound_merge_counts_for_testing() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        INBOUND_ENVELOPES.swap(0, Relaxed),
+        INBOUND_ENVELOPE_VISITS.swap(0, Relaxed),
+    )
+}
 const REMOTE_ORDER_BYTES: usize = 34;
 const WALL_CLOCK_SAMPLE_ROUNDS: u64 = 64;
 
@@ -4209,16 +4235,19 @@ fn add_summary_checked(
     Ok(())
 }
 
-fn radix_sort_remote_envelopes(events: &mut Vec<RemoteEnvelope>) {
+/// Returns the byte passes it made.
+fn radix_sort_remote_envelopes(events: &mut Vec<RemoteEnvelope>) -> usize {
     if events.len() < 2 {
-        return;
+        return 0;
     }
     let varying_bytes = remote_envelope_varying_bytes(events);
     let mut scratch = vec![events[0]; events.len()];
+    let mut passes = 0;
     for pass in 0..REMOTE_ORDER_BYTES {
         if varying_bytes & (1_u64 << pass) == 0 {
             continue;
         }
+        passes += 1;
         let mut counts = [0_usize; 256];
         for event in events.iter() {
             counts[usize::from(remote_order_byte(event.event, pass))] += 1;
@@ -4236,6 +4265,7 @@ fn radix_sort_remote_envelopes(events: &mut Vec<RemoteEnvelope>) {
         }
         std::mem::swap(events, &mut scratch);
     }
+    passes
 }
 
 fn remote_envelope_varying_bytes(events: &[RemoteEnvelope]) -> u64 {
@@ -4503,7 +4533,17 @@ impl<'image> WorkerShard<'image> {
             frontier_updates = frontier_updates.saturating_add(1);
         }
 
-        radix_sort_remote_envelopes(&mut inbox);
+        let _sort_passes = radix_sort_remote_envelopes(&mut inbox);
+        // One visit to find the varying bytes, two per sorting pass, one to group and insert.
+        #[cfg(feature = "planner-test-hooks")]
+        count_inbound(
+            inbox.len(),
+            if inbox.len() < 2 {
+                inbox.len()
+            } else {
+                inbox.len() * (2 + 2 * _sort_passes)
+            },
+        );
         let mut offset = 0;
         while offset < inbox.len() {
             let target = inbox[offset].event.target;
@@ -5186,7 +5226,17 @@ impl<'image> WorkerShard<'image> {
         let mut frontier_updates = 0_u64;
         let heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
-        radix_sort_remote_envelopes(&mut inbox);
+        let _sort_passes = radix_sort_remote_envelopes(&mut inbox);
+        // One visit to find the varying bytes, two per sorting pass, one to group and insert.
+        #[cfg(feature = "planner-test-hooks")]
+        count_inbound(
+            inbox.len(),
+            if inbox.len() < 2 {
+                inbox.len()
+            } else {
+                inbox.len() * (2 + 2 * _sort_passes)
+            },
+        );
         let mut offset = 0;
         while offset < inbox.len() {
             let target = inbox[offset].event.target;
