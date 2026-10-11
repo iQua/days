@@ -401,45 +401,52 @@ impl RoundLists {
 }
 
 /// One worker's per-LP facts of one round, folded as it drains (`CpuRoundRecords::Totals`).
+///
+/// Counts of LPs are `u32` and every sum is `u64` (checked; busy time saturates), so the tally
+/// stays 64 B: the round reply that carries it is copied out of the reply channel.
 #[derive(Clone, Copy, Debug, Default)]
 struct RoundTally {
-    active_lps: usize,
+    active_lps: u32,
+    timed_lps: u32,
+    straggler_lps: u32,
+    /// Whether this worker executed a bulk LP (the classified path's bulk chunks). Also the niche
+    /// that keeps `ExecutedLps` as small as the tally.
+    has_bulk: bool,
     events: u64,
     messages: u64,
     max_lp_events: u64,
-    same_time_continuations: u128,
-    timed_lps: u64,
-    lp_busy_ns: u128,
+    same_time_continuations: u64,
+    lp_busy_ns: u64,
     lp_busy_max_ns: u64,
-    straggler_lps: u64,
-    bulk_lps: u64,
 }
 
 impl RoundTally {
     fn add(&mut self, executed: &ExecutedLp) -> Result<(), ExecutionError> {
-        let node = executed.work.node;
-        self.active_lps = self
-            .active_lps
-            .checked_add(1)
-            .ok_or(ExecutionError::CounterOverflow(node))?;
+        let overflow = ExecutionError::CounterOverflow(executed.work.node);
+        self.active_lps = self.active_lps.checked_add(1).ok_or(overflow)?;
         self.events = self
             .events
             .checked_add(executed.work.events_processed)
-            .ok_or(ExecutionError::CounterOverflow(node))?;
+            .ok_or(overflow)?;
         self.messages = self
             .messages
             .checked_add(executed.messages_exchanged)
-            .ok_or(ExecutionError::CounterOverflow(node))?;
+            .ok_or(overflow)?;
         self.max_lp_events = self.max_lp_events.max(executed.work.events_processed);
-        self.same_time_continuations += u128::from(executed.work.same_time_continuations);
+        self.same_time_continuations = self
+            .same_time_continuations
+            .checked_add(executed.work.same_time_continuations)
+            .ok_or(overflow)?;
         if executed.timing_sampled {
-            self.timed_lps += 1;
-            self.lp_busy_ns += u128::from(executed.timing.busy_ns);
+            self.timed_lps = self.timed_lps.checked_add(1).ok_or(overflow)?;
+            self.lp_busy_ns = self.lp_busy_ns.saturating_add(executed.timing.busy_ns);
             self.lp_busy_max_ns = self.lp_busy_max_ns.max(executed.timing.busy_ns);
         }
         match executed.timing.class {
-            WorkClass::Straggler => self.straggler_lps += 1,
-            WorkClass::Bulk => self.bulk_lps += 1,
+            WorkClass::Straggler => {
+                self.straggler_lps = self.straggler_lps.checked_add(1).ok_or(overflow)?;
+            }
+            WorkClass::Bulk => self.has_bulk = true,
         }
         Ok(())
     }
@@ -451,14 +458,24 @@ impl RoundTally {
             .active_lps
             .checked_add(other.active_lps)
             .ok_or(overflow)?;
+        self.timed_lps = self
+            .timed_lps
+            .checked_add(other.timed_lps)
+            .ok_or(overflow)?;
+        self.straggler_lps = self
+            .straggler_lps
+            .checked_add(other.straggler_lps)
+            .ok_or(overflow)?;
+        self.has_bulk |= other.has_bulk;
         self.events = self.events.checked_add(other.events).ok_or(overflow)?;
         self.messages = self.messages.checked_add(other.messages).ok_or(overflow)?;
         self.max_lp_events = self.max_lp_events.max(other.max_lp_events);
-        self.same_time_continuations += other.same_time_continuations;
-        self.timed_lps += other.timed_lps;
-        self.lp_busy_ns += other.lp_busy_ns;
+        self.same_time_continuations = self
+            .same_time_continuations
+            .checked_add(other.same_time_continuations)
+            .ok_or(overflow)?;
+        self.lp_busy_ns = self.lp_busy_ns.saturating_add(other.lp_busy_ns);
         self.lp_busy_max_ns = self.lp_busy_max_ns.max(other.lp_busy_max_ns);
-        self.straggler_lps += other.straggler_lps;
         Ok(())
     }
 }
@@ -466,14 +483,16 @@ impl RoundTally {
 /// The LPs one worker executed in a round, as it reports them: every record (`PerRound`), or a
 /// fixed-size tally (`Totals`).
 enum ExecutedLps {
-    PerLp(Vec<ExecutedLp>),
+    /// Boxed, so the `PerRound` variant costs the round reply no more than the tally.
+    #[allow(clippy::box_collection)]
+    PerLp(Box<Vec<ExecutedLp>>),
     Tally(RoundTally),
 }
 
 impl ExecutedLps {
     fn new(records: CpuRoundRecords) -> Self {
         match records {
-            CpuRoundRecords::PerRound => Self::PerLp(Vec::new()),
+            CpuRoundRecords::PerRound => Self::PerLp(Box::default()),
             CpuRoundRecords::Totals => Self::Tally(RoundTally::default()),
         }
     }
@@ -508,9 +527,9 @@ impl RoundLpsGathered {
 
     fn gather(&mut self, executed: ExecutedLps) -> Result<(), ExecutionError> {
         match executed {
-            ExecutedLps::PerLp(records) => self.per_lp.extend(records),
+            ExecutedLps::PerLp(records) => self.per_lp.extend(*records),
             ExecutedLps::Tally(tally) => {
-                if tally.bulk_lps > 0 {
+                if tally.has_bulk {
                     self.bulk_workers += 1;
                 }
                 self.tally.merge(&tally)?;
@@ -1226,54 +1245,52 @@ struct ClassifiedReturnBatch<'image> {
 }
 
 /// The owners one worker sent a remote batch to in one round: one bit per owner, held inline for
-/// up to 128 workers, so a worker's round reply carries no heap block for the coordinator to free.
+/// up to 64 workers (a 16-B value), so a round reply carries no heap block for the coordinator to
+/// free; a wider pool keeps its words behind one thin pointer.
 #[derive(Clone, Debug)]
 enum OwnerSet {
-    Inline(u128),
-    Wide(Box<[u64]>),
+    Inline(u64),
+    #[allow(clippy::box_collection)]
+    Wide(Box<Vec<u64>>),
 }
 
 impl OwnerSet {
     fn new(workers: usize) -> Self {
-        if workers <= 128 {
+        if workers <= 64 {
             Self::Inline(0)
         } else {
-            Self::Wide(vec![0; workers.div_ceil(64)].into_boxed_slice())
+            Self::Wide(Box::new(vec![0; workers.div_ceil(64)]))
         }
     }
 
     fn insert(&mut self, owner: usize) {
         match self {
-            Self::Inline(bits) => *bits |= 1_u128 << owner,
+            Self::Inline(bits) => *bits |= 1_u64 << owner,
             Self::Wide(words) => words[owner / 64] |= 1_u64 << (owner % 64),
         }
     }
 
-    fn len(&self) -> u64 {
+    fn words(&self) -> &[u64] {
         match self {
-            Self::Inline(bits) => u64::from(bits.count_ones()),
-            Self::Wide(words) => words.iter().map(|word| u64::from(word.count_ones())).sum(),
+            Self::Inline(bits) => std::slice::from_ref(bits),
+            Self::Wide(words) => words,
         }
+    }
+
+    fn len(&self) -> u64 {
+        self.words()
+            .iter()
+            .map(|word| u64::from(word.count_ones()))
+            .sum()
     }
 
     /// Calls `visit` with every owner in the set, in ascending order.
     fn for_each(&self, mut visit: impl FnMut(usize)) {
-        match self {
-            Self::Inline(bits) => {
-                let mut rest = *bits;
-                while rest != 0 {
-                    visit(rest.trailing_zeros() as usize);
-                    rest &= rest - 1;
-                }
-            }
-            Self::Wide(words) => {
-                for (index, word) in words.iter().enumerate() {
-                    let mut rest = *word;
-                    while rest != 0 {
-                        visit(index * 64 + rest.trailing_zeros() as usize);
-                        rest &= rest - 1;
-                    }
-                }
+        for (index, word) in self.words().iter().enumerate() {
+            let mut rest = *word;
+            while rest != 0 {
+                visit(index * 64 + rest.trailing_zeros() as usize);
+                rest &= rest - 1;
             }
         }
     }
@@ -1538,37 +1555,30 @@ enum OwnedWorkerReply<'image> {
         worker: usize,
         minimum_ns: Option<u64>,
     },
+    /// Kept small (`a_round_reply_fits_its_budget`): the coordinator copies every one out of the
+    /// reply channel.
     RoundComplete {
         worker: usize,
         round: u64,
         executed: ExecutedLps,
         /// Owners this worker sent a remote batch to this round.
         outbound_owners: OwnerSet,
-        /// The earliest remote event this worker sent this round.
-        outbound_minimum_ns: Option<u64>,
-        inbound_frontier_updates: u64,
-        inbound_heap_pops: u64,
-        inbound_physical_lp_probes: u64,
-        inbound_busy_ns: u64,
-        inbound_batches: u64,
-        inbound_early_batches: u64,
-        inbound_early_busy_ns: u64,
+        /// The preceding round's batches this worker merged before this round's drain.
+        inbound: InboundMergeMetrics,
         frontier_updates: u64,
         heap_pops: u64,
         physical_lp_probes: u64,
+        /// The earliest event this worker can next execute or has sent: its local minimum, and on
+        /// the unclassified path also the earliest remote event it sent this round. The least of
+        /// these over the workers is the next frontier; which owner holds a remote event does not
+        /// change it.
         minimum_ns: Option<u64>,
         busy_ns: u64,
     },
     Finished {
         worker: usize,
         lps: Vec<CpuLp<'image>>,
-        inbound_frontier_updates: u64,
-        inbound_heap_pops: u64,
-        inbound_physical_lp_probes: u64,
-        inbound_busy_ns: u64,
-        inbound_batches: u64,
-        inbound_early_batches: u64,
-        inbound_early_busy_ns: u64,
+        inbound: InboundMergeMetrics,
     },
     Failed {
         error: ExecutionError,
@@ -1930,7 +1940,6 @@ fn classified_worker_loop<'image>(
                     .map(|_| Vec::new())
                     .collect::<Vec<Vec<RemoteEnvelope>>>();
                 let mut outbound_owners = OwnerSet::new(config.workers);
-                let mut outbound_minimum_ns: Option<u64> = None;
                 for (dispatch_order, mut active) in assigned.into_iter().enumerate() {
                     let lp_started = Instant::now();
                     let started_after_ns =
@@ -2007,11 +2016,6 @@ fn classified_worker_loop<'image>(
                 for owner in 0..config.workers {
                     if !remote_by_owner[owner].is_empty() {
                         outbound_owners.insert(owner);
-                        outbound_minimum_ns = remote_by_owner[owner]
-                            .iter()
-                            .map(|envelope| envelope.event.key.time_ns)
-                            .chain(outbound_minimum_ns)
-                            .min();
                     }
                     if return_routes[owner]
                         .send(ClassifiedReturnBatch {
@@ -2068,14 +2072,7 @@ fn classified_worker_loop<'image>(
                         round,
                         executed,
                         outbound_owners,
-                        outbound_minimum_ns,
-                        inbound_frontier_updates: 0,
-                        inbound_heap_pops: 0,
-                        inbound_physical_lp_probes: 0,
-                        inbound_busy_ns: 0,
-                        inbound_batches: 0,
-                        inbound_early_batches: 0,
-                        inbound_early_busy_ns: 0,
+                        inbound: InboundMergeMetrics::default(),
                         frontier_updates,
                         heap_pops: heap_pops.saturating_add(extract_heap_pops),
                         physical_lp_probes: physical_lp_probes
@@ -2111,13 +2108,7 @@ fn classified_worker_loop<'image>(
                 let _ = replies.send(OwnedWorkerReply::Finished {
                     worker,
                     lps,
-                    inbound_frontier_updates: 0,
-                    inbound_heap_pops: 0,
-                    inbound_physical_lp_probes: 0,
-                    inbound_busy_ns: 0,
-                    inbound_batches: 0,
-                    inbound_early_batches: 0,
-                    inbound_early_busy_ns: 0,
+                    inbound: InboundMergeMetrics::default(),
                 });
                 return;
             }
@@ -2222,16 +2213,16 @@ fn owned_worker_loop<'image>(
                     }
                 };
                 let mut outbound_owners = OwnerSet::new(config.workers);
-                let mut outbound_minimum_ns: Option<u64> = None;
+                let mut next_minimum_ns = minimum_ns;
                 for (owner, envelopes) in remote_by_owner.into_iter().enumerate() {
                     if envelopes.is_empty() {
                         continue;
                     }
                     outbound_owners.insert(owner);
-                    outbound_minimum_ns = envelopes
+                    next_minimum_ns = envelopes
                         .iter()
                         .map(|envelope| envelope.event.key.time_ns)
-                        .chain(outbound_minimum_ns)
+                        .chain(next_minimum_ns)
                         .min();
                     if routes[owner]
                         .remote
@@ -2250,18 +2241,11 @@ fn owned_worker_loop<'image>(
                         round,
                         executed,
                         outbound_owners,
-                        outbound_minimum_ns,
-                        inbound_frontier_updates: inbound.frontier_updates,
-                        inbound_heap_pops: inbound.heap_pops,
-                        inbound_physical_lp_probes: inbound.physical_lp_probes,
-                        inbound_busy_ns: inbound.busy_ns,
-                        inbound_batches: inbound.batches,
-                        inbound_early_batches: inbound.early_batches,
-                        inbound_early_busy_ns: inbound.early_busy_ns,
+                        inbound,
                         frontier_updates,
                         heap_pops,
                         physical_lp_probes,
-                        minimum_ns,
+                        minimum_ns: next_minimum_ns,
                         busy_ns: elapsed_ns(started),
                     })
                     .is_err()
@@ -2293,13 +2277,7 @@ fn owned_worker_loop<'image>(
                 let _ = replies.send(OwnedWorkerReply::Finished {
                     worker,
                     lps,
-                    inbound_frontier_updates: inbound.frontier_updates,
-                    inbound_heap_pops: inbound.heap_pops,
-                    inbound_physical_lp_probes: inbound.physical_lp_probes,
-                    inbound_busy_ns: inbound.busy_ns,
-                    inbound_batches: inbound.batches,
-                    inbound_early_batches: inbound.early_batches,
-                    inbound_early_busy_ns: inbound.early_busy_ns,
+                    inbound,
                 });
                 return;
             }
@@ -2307,10 +2285,11 @@ fn owned_worker_loop<'image>(
     }
 }
 
+/// What a worker's merges of inbound owner batches did. A merge pops no frontier entry, so it has
+/// no heap-pop count.
 #[derive(Clone, Copy, Default)]
 struct InboundMergeMetrics {
     frontier_updates: u64,
-    heap_pops: u64,
     physical_lp_probes: u64,
     busy_ns: u64,
     batches: u64,
@@ -2464,8 +2443,8 @@ fn merge_static_owner_batch(
     let started = Instant::now();
     let (frontier_updates, heap_pops, physical_lp_probes) =
         shard.merge_static_remote(batch.envelopes, remote_floor_ns, placement)?;
+    debug_assert_eq!(heap_pops, 0, "a merge pops no frontier entry");
     metrics.frontier_updates = metrics.frontier_updates.saturating_add(frontier_updates);
-    metrics.heap_pops = metrics.heap_pops.saturating_add(heap_pops);
     metrics.physical_lp_probes = metrics
         .physical_lp_probes
         .saturating_add(physical_lp_probes);
@@ -2843,7 +2822,6 @@ fn run_owned_static_coordinator<'image>(
         inbound_busy_by_worker.fill(0);
         let mut executed_lps = RoundLpsGathered::new();
         let mut inbound_frontier_updates = 0_u64;
-        let mut inbound_frontier_heap_pops = 0_u64;
         let mut inbound_physical_lp_probes = 0_u64;
         let mut inbound_batches = 0_u64;
         let mut inbound_early_batches = 0_u64;
@@ -2859,14 +2837,7 @@ fn run_owned_static_coordinator<'image>(
                     round,
                     executed,
                     outbound_owners,
-                    outbound_minimum_ns,
-                    inbound_frontier_updates: inbound_updates,
-                    inbound_heap_pops,
-                    inbound_physical_lp_probes: inbound_probes,
-                    inbound_busy_ns,
-                    inbound_batches: worker_inbound_batches,
-                    inbound_early_batches: worker_early_batches,
-                    inbound_early_busy_ns: worker_early_busy_ns,
+                    inbound,
                     frontier_updates: updates,
                     heap_pops,
                     physical_lp_probes: probes,
@@ -2874,15 +2845,7 @@ fn run_owned_static_coordinator<'image>(
                     busy_ns,
                 } if round == round_number && !completed[worker] => {
                     completed[worker] = true;
-                    // The next frontier is the least of every worker's local minimum and every
-                    // remote event sent this round; which owner holds a remote event does not
-                    // change that minimum. A classified round has already merged its remote
-                    // events into their owners.
-                    minima[worker] = if classified {
-                        minimum_ns
-                    } else {
-                        minimum_ns.into_iter().chain(outbound_minimum_ns).min()
-                    };
+                    minima[worker] = minimum_ns;
                     worker_busy_ns[worker] = busy_ns;
                     executed_lps.gather(executed)?;
                     owner_batch_messages = owner_batch_messages
@@ -2901,17 +2864,15 @@ fn run_owned_static_coordinator<'image>(
                         }
                     }
                     inbound_frontier_updates =
-                        inbound_frontier_updates.saturating_add(inbound_updates);
-                    inbound_frontier_heap_pops =
-                        inbound_frontier_heap_pops.saturating_add(inbound_heap_pops);
+                        inbound_frontier_updates.saturating_add(inbound.frontier_updates);
                     inbound_physical_lp_probes =
-                        inbound_physical_lp_probes.saturating_add(inbound_probes);
-                    inbound_busy_by_worker[worker] = inbound_busy_ns;
-                    inbound_batches = inbound_batches.saturating_add(worker_inbound_batches);
+                        inbound_physical_lp_probes.saturating_add(inbound.physical_lp_probes);
+                    inbound_busy_by_worker[worker] = inbound.busy_ns;
+                    inbound_batches = inbound_batches.saturating_add(inbound.batches);
                     inbound_early_batches =
-                        inbound_early_batches.saturating_add(worker_early_batches);
+                        inbound_early_batches.saturating_add(inbound.early_batches);
                     inbound_early_busy_ns =
-                        inbound_early_busy_ns.saturating_add(worker_early_busy_ns);
+                        inbound_early_busy_ns.saturating_add(inbound.early_busy_ns);
                     frontier_updates = frontier_updates.saturating_add(updates);
                     frontier_heap_pops = frontier_heap_pops.saturating_add(heap_pops);
                     physical_lp_probes = physical_lp_probes.saturating_add(probes);
@@ -2931,10 +2892,6 @@ fn run_owned_static_coordinator<'image>(
                 .semantic
                 .frontier_updates
                 .saturating_add(inbound_frontier_updates);
-            previous.semantic.frontier_heap_pops = previous
-                .semantic
-                .frontier_heap_pops
-                .saturating_add(inbound_frontier_heap_pops);
             previous.semantic.physical_lp_probes = previous
                 .semantic
                 .physical_lp_probes
@@ -3073,9 +3030,8 @@ fn run_owned_static_coordinator<'image>(
     let mut lps = Vec::with_capacity(image.nodes.len());
     let mut finished = vec![false; config.workers];
     let mut inbound_frontier_updates = 0_u64;
-    let mut inbound_frontier_heap_pops = 0_u64;
     let mut inbound_physical_lp_probes = 0_u64;
-    let mut inbound_busy_by_worker = vec![0_u64; config.workers];
+    inbound_busy_by_worker.fill(0);
     let mut inbound_batches = 0_u64;
     let mut inbound_early_batches = 0_u64;
     let mut inbound_early_busy_ns = 0_u64;
@@ -3084,25 +3040,18 @@ fn run_owned_static_coordinator<'image>(
             OwnedWorkerReply::Finished {
                 worker,
                 lps: worker_lps,
-                inbound_frontier_updates: inbound_updates,
-                inbound_heap_pops,
-                inbound_physical_lp_probes: inbound_probes,
-                inbound_busy_ns,
-                inbound_batches: worker_inbound_batches,
-                inbound_early_batches: worker_early_batches,
-                inbound_early_busy_ns: worker_early_busy_ns,
+                inbound,
             } if !finished[worker] => {
                 finished[worker] = true;
                 lps.extend(worker_lps);
-                inbound_frontier_updates = inbound_frontier_updates.saturating_add(inbound_updates);
-                inbound_frontier_heap_pops =
-                    inbound_frontier_heap_pops.saturating_add(inbound_heap_pops);
+                inbound_frontier_updates =
+                    inbound_frontier_updates.saturating_add(inbound.frontier_updates);
                 inbound_physical_lp_probes =
-                    inbound_physical_lp_probes.saturating_add(inbound_probes);
-                inbound_busy_by_worker[worker] = inbound_busy_ns;
-                inbound_batches = inbound_batches.saturating_add(worker_inbound_batches);
-                inbound_early_batches = inbound_early_batches.saturating_add(worker_early_batches);
-                inbound_early_busy_ns = inbound_early_busy_ns.saturating_add(worker_early_busy_ns);
+                    inbound_physical_lp_probes.saturating_add(inbound.physical_lp_probes);
+                inbound_busy_by_worker[worker] = inbound.busy_ns;
+                inbound_batches = inbound_batches.saturating_add(inbound.batches);
+                inbound_early_batches = inbound_early_batches.saturating_add(inbound.early_batches);
+                inbound_early_busy_ns = inbound_early_busy_ns.saturating_add(inbound.early_busy_ns);
             }
             OwnedWorkerReply::Failed { error } => return Err(error),
             _ => return Err(ExecutionError::WorkerChannelDisconnected),
@@ -3117,10 +3066,6 @@ fn run_owned_static_coordinator<'image>(
             .semantic
             .frontier_updates
             .saturating_add(inbound_frontier_updates);
-        last.semantic.frontier_heap_pops = last
-            .semantic
-            .frontier_heap_pops
-            .saturating_add(inbound_frontier_heap_pops);
         last.semantic.physical_lp_probes = last
             .semantic
             .physical_lp_probes
@@ -3215,20 +3160,24 @@ fn tallied_round_lps(gathered: &RoundLpsGathered, classified: bool) -> RoundLps 
         lp_work: Vec::new(),
         lp_timings: Vec::new(),
         events_processed: tally.events,
-        active_lp_count: tally.active_lps,
+        active_lp_count: tally.active_lps as usize,
         max_work: tally.max_lp_events,
         messages_exchanged: tally.messages,
         lp_time_parallel_efficiency: efficiency_of(
-            tally.lp_busy_ns,
+            u128::from(tally.lp_busy_ns),
             tally.lp_busy_max_ns,
-            tally.active_lps,
+            tally.active_lps as usize,
         ),
         lists: RoundLists {
             max_lp_events: tally.max_lp_events,
-            same_time_continuations: tally.same_time_continuations,
-            timed_lps: tally.timed_lps,
-            lp_busy_ns: tally.lp_busy_ns,
-            straggler_lps: if classified { tally.straggler_lps } else { 0 },
+            same_time_continuations: u128::from(tally.same_time_continuations),
+            timed_lps: u64::from(tally.timed_lps),
+            lp_busy_ns: u128::from(tally.lp_busy_ns),
+            straggler_lps: if classified {
+                u64::from(tally.straggler_lps)
+            } else {
+                0
+            },
             bulk_chunks: if classified { gathered.bulk_workers } else { 0 },
         },
     }
@@ -4991,12 +4940,12 @@ fn a_round_reply_fits_its_budget() {
 
 #[test]
 fn owner_sets_hold_every_owner_inline_and_wide() {
-    for workers in [1, 2, 64, 128, 129, 200] {
+    for workers in [1, 2, 63, 64, 65, 128, 129, 200] {
         let owners = (0..workers)
             .filter(|owner| owner % 3 != 1)
             .collect::<Vec<_>>();
         let mut set = OwnerSet::new(workers);
-        assert_eq!(matches!(set, OwnerSet::Inline(_)), workers <= 128);
+        assert_eq!(matches!(set, OwnerSet::Inline(_)), workers <= 64);
         for owner in owners.iter().rev() {
             set.insert(*owner);
             set.insert(*owner);
