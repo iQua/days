@@ -932,7 +932,8 @@ pub(crate) fn recompute_pause_parked(image: &SimulationImage, state: &mut crate:
 
 /// An upper bound on the device transitions one RoCE queue pair can still cause, beyond what its
 /// estimated packets contribute (P15). Its timers: pacing ticks (at most one per remaining grid
-/// point, restarts included: a restart lands on a grid point and at most one tick is pending)
+/// point, D3 restarts included: such a restart lands on a grid point and at most one tick is
+/// pending; plus the off-grid restarts of a windowed pair, P18 F2, `roce_restart_ticks`)
 /// and timeout firings (the Mellanox-form controller has no timer event, P16) (each re-arms `rto_ns`
 /// later, so at most one per `rto_ns` until the stop time; none with the timeout off). Its
 /// packets: at most one data packet per grid tick, each answered by at most an ACK or NACK (P16:
@@ -946,6 +947,8 @@ pub(crate) fn roce_transition_bound(
 ) -> usize {
     let stop = image.stop_time_ns;
     let pacing = crate::validate::roce_grid_ticks(image, generator, roce);
+    // P18 window-throttle F2: a window-parked pacer that feedback restarts ticks off the grid.
+    let restarts = crate::validate::roce_restart_ticks(roce, pacing);
     let timeouts = stop.checked_div(roce.rto_ns).map_or(0, |fires| fires + 1);
     let hops = image
         .flows
@@ -958,6 +961,7 @@ pub(crate) fn roce_transition_bound(
         .saturating_mul(1_u64.saturating_add(hops.saturating_mul(3)));
     usize::try_from(
         pacing
+            .saturating_add(restarts)
             .saturating_add(timeouts)
             .saturating_add(packet_transitions),
     )
@@ -2418,6 +2422,9 @@ mod tests {
             reverse_route: vec![crate::LinkId(2), crate::LinkId(3)],
         });
         let mut roce = roce_generator();
+        // Without a window first: every tick lies on the grid.
+        roce.window_bytes = 0;
+        roce.variable_window = false;
         let mut generator = generator_state(FlowGeneratorKind::Roce(roce));
         generator.next_emission.departure_time_ns = 0;
         // 11 grid ticks (0, 16, ..., 160), 4 timeout firings
@@ -2430,6 +2437,23 @@ mod tests {
         assert_eq!(
             roce_transition_bound(&image, &generator, roce),
             11 + 11 * 2 * 7
+        );
+        // P18 F2: with a window, feedback restarts a window-parked pacer off the grid, after a
+        // blocked grid tick (11), a blocked restarted tick (one per unacknowledged packet) or the
+        // park the pair is in now.
+        roce.window_bytes = 2 * roce.pacer.mtu_bytes;
+        // (180 - 17) / 17, rounded up: 10.
+        let unacknowledged =
+            usize::try_from((roce.pacer.total_bytes - roce.snd_una).div_ceil(roce.pacer.mtu_bytes))
+                .unwrap();
+        assert_eq!(
+            roce_transition_bound(&image, &generator, roce),
+            11 + (11 + unacknowledged) + 11 * 2 * 7
+        );
+        roce.window_parked = true;
+        assert_eq!(
+            roce_transition_bound(&image, &generator, roce),
+            11 + (11 + unacknowledged + 1) + 11 * 2 * 7
         );
     }
 }
