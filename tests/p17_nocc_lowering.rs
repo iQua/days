@@ -322,10 +322,12 @@ fn every_roce_fixture_lowers_to_the_image_it_lowered_to_on_main() {
             208_670,
             0x07f5_58f6_aea3_833f,
         ),
+        // P18 ackfix re-tuned the fixture (its background pair starts at 100 us, so a stage still
+        // releases on a paused class under decision D16b): was 230,900 B, 0x311d_0dcd_00ad_7c02.
         (
             "configs/p15/roce_ring_release_paused.toml",
-            230_900,
-            0x311d_0dcd_00ad_7c02,
+            230_915,
+            0x63c7_1f96_4689_e058,
         ),
         (
             "configs/p15/roce_tcp_mixed_collectives.toml",
