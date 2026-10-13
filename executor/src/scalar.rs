@@ -6743,30 +6743,39 @@ impl<'image> TransitionState<'image> {
             )
         };
         let position = if packet.kind.is_roce_control() {
+            // After the leading run of control packets whose key is not greater, counted from the
+            // head: the control packets lead the queue, so this costs the queued control packets
+            // (usually none or one), never the data behind them (window-throttle design §3.5).
+            // Every backend counts the same run (the device kernels' `source_queue_insert`).
             #[cfg(feature = "planner-test-hooks")]
             let mut inspected = 0_u64;
-            // After the last control packet whose key is not greater: past every non-control one.
-            let position = queue.iter().rposition(|queued| {
-                #[cfg(feature = "planner-test-hooks")]
-                {
-                    inspected += 1;
-                }
-                self.packets.get(queued).is_some_and(|resident| {
-                    resident.descriptor.kind.is_roce_control() && queued_key(resident) <= key
+            let position = queue
+                .iter()
+                .position(|queued| {
+                    #[cfg(feature = "planner-test-hooks")]
+                    {
+                        inspected += 1;
+                    }
+                    !self.packets.get(queued).is_some_and(|resident| {
+                        resident.descriptor.kind.is_roce_control() && queued_key(resident) <= key
+                    })
                 })
-            });
+                .unwrap_or(queue.len());
             #[cfg(feature = "planner-test-hooks")]
             note_control_insert(inspected, queue.len());
             position
         } else {
-            // A queued control packet ranks first, so the scan stops at it.
-            queue.iter().rposition(|queued| {
-                self.packets.get(queued).is_some_and(|resident| {
-                    resident.descriptor.kind.is_roce_control() || queued_key(resident) <= key
+            // After the last packet from the tail whose key is not greater; a queued control
+            // packet ranks first, so the scan stops at it.
+            queue
+                .iter()
+                .rposition(|queued| {
+                    self.packets.get(queued).is_some_and(|resident| {
+                        resident.descriptor.kind.is_roce_control() || queued_key(resident) <= key
+                    })
                 })
-            })
-        }
-        .map_or(0, |position| position + 1);
+                .map_or(0, |position| position + 1)
+        };
         let state = self.host_state_mut(node)?;
         if position < state.queue.len() {
             state.queue.insert(position, payload);
