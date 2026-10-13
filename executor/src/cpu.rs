@@ -21,31 +21,6 @@ use crate::{
 
 const TIME_AFTER_U64_MAX: u128 = 1_u128 << 64;
 
-/// Test hook: remote envelopes merged into owner queues, and envelope visits the merges made.
-#[cfg(feature = "planner-test-hooks")]
-static INBOUND_ENVELOPES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-#[cfg(feature = "planner-test-hooks")]
-static INBOUND_ENVELOPE_VISITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(feature = "planner-test-hooks")]
-fn count_inbound(envelopes: usize, visits: usize) {
-    use std::sync::atomic::Ordering::Relaxed;
-    INBOUND_ENVELOPES.fetch_add(envelopes as u64, Relaxed);
-    INBOUND_ENVELOPE_VISITS.fetch_add(visits as u64, Relaxed);
-}
-
-/// Test hook: the remote envelopes CPU workers merged into owner queues since the last call, and
-/// the envelope visits those merges made (sorting, grouping and inserting), process-wide; resets
-/// both to zero.
-#[cfg(feature = "planner-test-hooks")]
-#[doc(hidden)]
-pub fn take_cpu_inbound_merge_counts_for_testing() -> (u64, u64) {
-    use std::sync::atomic::Ordering::Relaxed;
-    (
-        INBOUND_ENVELOPES.swap(0, Relaxed),
-        INBOUND_ENVELOPE_VISITS.swap(0, Relaxed),
-    )
-}
 const WALL_CLOCK_SAMPLE_ROUNDS: u64 = 64;
 
 /// LP count per dispatch request.
@@ -4796,6 +4771,183 @@ fn target_interleaved_outbox_image() -> SimulationImage {
     }
 }
 
+/// The executor's unit-test binary counts the allocations each thread makes, for the merge
+/// allocation guard below. Library builds and integration tests do not see it.
+#[cfg(test)]
+mod test_allocations {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn allocations() -> u64 {
+        ALLOCATIONS.with(Cell::get)
+    }
+
+    struct ThreadCounting;
+
+    // SAFETY: every method forwards to `System` unchanged and only adds bookkeeping.
+    unsafe impl GlobalAlloc for ThreadCounting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            // SAFETY: forwarded with the caller's layout.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            // SAFETY: forwarded with the caller's layout.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+            // SAFETY: forwarded with the caller's pointer and layout.
+            unsafe { System.dealloc(pointer, layout) }
+        }
+
+        unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            // SAFETY: forwarded with the caller's pointer, layout and size.
+            unsafe { System.realloc(pointer, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: ThreadCounting = ThreadCounting;
+}
+
+/// A one-worker shard over `target_interleaved_outbox_image`'s three LPs, its placement, and one
+/// remote envelope per receiving LP (1 and 2) from LP 0's first drain, to copy batches from.
+#[cfg(test)]
+fn merge_test_shard(
+    image: &SimulationImage,
+) -> (WorkerShard<'_>, StaticPlacement, [RemoteEnvelope; 2]) {
+    let mut source = build_lps(image, ObservationMode::Summary)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    let (_, outbox) = source.drain(4, None, None, 0, 0).unwrap();
+    let template = |target: u64| {
+        *outbox
+            .iter()
+            .find(|envelope| envelope.event.target == NodeId(target))
+            .expect("LP 0 sends to LPs 1 and 2")
+    };
+    let templates = [template(1), template(2)];
+    let lps = build_lps(image, ObservationMode::Summary).unwrap();
+    let config = CpuConfig {
+        workers: 1,
+        ..CpuConfig::default()
+    };
+    let (mut shards, placement) = partition_static_ownership(lps, image, config).unwrap();
+    (shards.remove(0), placement, templates)
+}
+
+/// `count` envelopes for LPs 1 and 2 alternately, with fresh keys from `first_seq`; with
+/// `distinct_payloads`, each carries its own packet identity.
+#[cfg(test)]
+fn merge_test_batch(
+    templates: [RemoteEnvelope; 2],
+    count: u64,
+    first_seq: u64,
+    distinct_payloads: bool,
+) -> Vec<RemoteEnvelope> {
+    (0..count)
+        .map(|index| {
+            let mut envelope = templates[(index % 2) as usize];
+            let seq = first_seq + index;
+            envelope.event.key.time_ns = 1_000 + seq;
+            envelope.event.key.origin_seq = seq;
+            if distinct_payloads {
+                envelope.event.payload = PayloadId(1_000_000 + seq);
+                envelope.packet.id = envelope.event.payload;
+            }
+            envelope
+        })
+        .collect()
+}
+
+/// A deterministic shuffle (xorshift Fisher-Yates).
+#[cfg(test)]
+fn merge_test_shuffle(batch: &mut [RemoteEnvelope], mut state: u64) {
+    for index in (1..batch.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        batch.swap(index, (state % (index as u64 + 1)) as usize);
+    }
+}
+
+/// P18 W1: an owner merges a batch in arrival order. The same batch, shuffled, leaves every LP
+/// with the same queue (drained in key order), the same resident packets, the same frontier and
+/// the same frontier counts as the batch in target-then-key order.
+#[cfg(test)]
+#[test]
+fn a_shuffled_batch_merges_to_the_same_queues_stores_and_frontier() {
+    let image = target_interleaved_outbox_image();
+    let outcome = |order: &dyn Fn(&mut Vec<RemoteEnvelope>)| {
+        let (mut shard, placement, templates) = merge_test_shard(&image);
+        let mut batch = merge_test_batch(templates, 600, 100, true);
+        let payloads = batch
+            .iter()
+            .map(|envelope| envelope.event.payload)
+            .collect::<Vec<_>>();
+        order(&mut batch);
+        let counts = shard
+            .merge_static_remote(&mut batch, 0, &placement)
+            .unwrap();
+        let mut probes = 0;
+        let mut pops = 0;
+        let frontier = shard.frontier.peek_min(&mut pops, &mut probes);
+        let mut queues = Vec::new();
+        let mut packets = Vec::new();
+        for lp in shard.lps.iter_mut().map(|lp| lp.as_mut().unwrap()) {
+            for payload in &payloads {
+                packets.push(lp.transitions.packet_descriptor(*payload).ok());
+            }
+            queues.push(std::mem::take(&mut lp.futures).into_sorted_vec().unwrap());
+        }
+        (counts, frontier, queues, packets)
+    };
+    let sorted = outcome(&|batch| batch.sort_by_key(|e| (e.event.target, e.event.key)));
+    for seed in [1, 7, 0x2545_f491_4f6c_dd1d] {
+        let shuffled = outcome(&|batch| merge_test_shuffle(batch, seed));
+        assert_eq!(shuffled.0, sorted.0, "frontier counts, seed {seed}");
+        assert_eq!(shuffled.1, sorted.1, "frontier minimum, seed {seed}");
+        assert_eq!(shuffled.2, sorted.2, "LP queues, seed {seed}");
+        assert_eq!(shuffled.3, sorted.3, "resident packets, seed {seed}");
+    }
+    assert!(sorted.2.iter().map(Vec::len).sum::<usize>() >= 600);
+}
+
+/// P18 W1: a merge does no work beside the inserts. Once an LP's queue and store hold their
+/// capacity and packets, merging a shuffled 1,000-envelope batch allocates nothing: a sort of the
+/// batch (std's stable sort takes a scratch buffer) would fail this.
+#[cfg(test)]
+#[test]
+fn a_warm_merge_allocates_nothing() {
+    let image = target_interleaved_outbox_image();
+    let (mut shard, placement, templates) = merge_test_shard(&image);
+    let mut first = merge_test_batch(templates, 1_000, 100, false);
+    shard
+        .merge_static_remote(&mut first, 0, &placement)
+        .unwrap();
+    for lp in shard.lps.iter_mut().map(|lp| lp.as_mut().unwrap()) {
+        while lp.futures.pop().unwrap().is_some() {}
+    }
+    let mut second = merge_test_batch(templates, 1_000, 5_000, false);
+    merge_test_shuffle(&mut second, 3);
+    let before = test_allocations::allocations();
+    shard
+        .merge_static_remote(&mut second, 0, &placement)
+        .unwrap();
+    let allocations = test_allocations::allocations() - before;
+    assert_eq!(allocations, 0, "a warm merge of 1,000 envelopes allocated");
+}
+
 #[cfg(test)]
 #[test]
 fn one_lp_outbox_is_event_key_ordered_not_target_major() {
@@ -5203,8 +5355,6 @@ impl<'image> WorkerShard<'image> {
         let heap_pops = 0_u64;
         let mut physical_lp_probes = 0_u64;
         debug_assert!(self.merge_touched.is_empty());
-        #[cfg(feature = "planner-test-hooks")]
-        count_inbound(inbox.len(), inbox.len());
         let merged = self.merge_envelopes(inbox, remote_floor_ns, &locate, &mut physical_lp_probes);
         inbox.clear();
         // The touched LPs are cleared even when the merge failed, so the scratch stays empty.

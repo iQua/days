@@ -62,9 +62,6 @@ pub mod time;
 pub mod validate;
 
 pub use aqm_trace::{AqmTraceError, aqm_transitions_csv};
-#[cfg(feature = "planner-test-hooks")]
-#[doc(hidden)]
-pub use cpu::take_cpu_inbound_merge_counts_for_testing;
 pub use cpu::{
     ChunkGranularity, CpuConfig, CpuFaultInjection, CpuFaultKind, CpuRoundMetrics, CpuRoundRecords,
     CpuRun, CpuRunTotals, LpExecutionTiming, LpWorkEstimate, StaticPartitionPolicy, WorkClass,

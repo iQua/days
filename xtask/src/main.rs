@@ -202,14 +202,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 3,
-        purpose: "validator flow-index equality hook, the P16 H1 per-host stage-width probe and the P18 CPU inbound-merge visit counter are exported only for standard tests",
-    },
-    AllowedFeatureGate {
-        path: "cpu.rs",
-        predicate: r#"feature = "planner-test-hooks""#,
-        count: 5,
-        purpose: "the P18 CPU inbound-merge visit counter exists only for standard tests: its two process-wide counters, their increment, their take, and the increment's one call in the merge",
+        count: 2,
+        purpose: "validator flow-index equality hook and the P16 H1 per-host stage-width probe are exported only for standard tests",
     },
     AllowedFeatureGate {
         path: "stage_sizing.rs",
