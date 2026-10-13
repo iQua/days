@@ -23,6 +23,28 @@ const TIME_AFTER_U64_MAX: u128 = 1_u128 << 64;
 
 const WALL_CLOCK_SAMPLE_ROUNDS: u64 = 64;
 
+/// Test hook (P18 W2): batch buffers the static path allocated because no buffer had come back
+/// from the owner, and returned buffers it dropped, process-wide.
+#[cfg(feature = "planner-test-hooks")]
+static BATCH_BUFFER_COUNTS: [std::sync::atomic::AtomicU64; 2] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "planner-test-hooks")]
+fn count_batch_buffer(index: usize) {
+    BATCH_BUFFER_COUNTS[index].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test hook: (fresh batch buffers, dropped returned buffers) since the last call; resets both.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn take_cpu_batch_buffer_counts_for_testing() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        BATCH_BUFFER_COUNTS[0].swap(0, Relaxed),
+        BATCH_BUFFER_COUNTS[1].swap(0, Relaxed),
+    )
+}
+
 /// LP count per dispatch request.
 ///
 /// `Static` computes `ceil(active_bulk_LPs / bulk_workers)` each round. `Fixed` uses the supplied
@@ -2268,6 +2290,8 @@ fn owned_worker_loop<'image>(
                     // the owner has returned none, one allocation sized like this batch.
                     let mut next = std::mem::take(&mut shard.returned_buffers[owner]);
                     if next.capacity() == 0 {
+                        #[cfg(feature = "planner-test-hooks")]
+                        count_batch_buffer(0);
                         next = Vec::with_capacity(shard.outboxes[owner].len());
                     }
                     let envelopes = std::mem::replace(&mut shard.outboxes[owner], next);
@@ -5302,6 +5326,10 @@ impl<'image> WorkerShard<'image> {
         buffer.clear();
         if buffer.capacity() > 4 * used {
             buffer.shrink_to(2 * used);
+        }
+        #[cfg(feature = "planner-test-hooks")]
+        if slot.capacity() != 0 {
+            count_batch_buffer(1);
         }
         *slot = buffer;
     }
