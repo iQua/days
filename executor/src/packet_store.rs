@@ -511,4 +511,87 @@ mod tests {
         assert_eq!(std::mem::size_of::<PacketStore<Packet>>(), 24);
         assert_eq!(std::mem::size_of::<Bucket>(), 16);
     }
+
+    /// The probes a lookup of `payload` takes in `store`'s index, counted as `Slab::find` walks
+    /// it: the home bucket, then each bucket after it until the payload or an empty bucket.
+    fn probes_to_find(store: &PacketStore<Packet>, payload: PayloadId) -> u64 {
+        let Repr::Large(slab) = &store.0 else {
+            return 0;
+        };
+        let mask = slab.mask();
+        let mut index = bucket_of(payload.0, slab.shift);
+        let mut probes = 1;
+        while slab.buckets[index].slot != EMPTY && slab.buckets[index].payload != payload.0 {
+            index = (index + 1) & mask;
+            probes += 1;
+        }
+        probes
+    }
+
+    /// P18 ackfix: a store's lookups stay short when its sources' packets turn over in sliding
+    /// windows, as a Scalar run's do. Sixteen sources of a 1,280-node image (nodes 0, 8, ..., 120,
+    /// as on the dp1 corpus slice) keep 219 consecutive sequences each resident (3,504 packets);
+    /// each round every source retires its oldest packet, sources its next and looks up four of
+    /// its resident ones. With the index grown only past 7/8 full, 3,504 packets sit at 0.86 of
+    /// 4,096 buckets and linear probing walks long runs: 12.1 probes per lookup (9.7 with a
+    /// splitmix64 hash instead of Fibonacci hashing), which made the dp1 slice's Scalar run +15%
+    /// instructions once F1 left fewer packets resident. The store must also drain in payload
+    /// order whatever its layout.
+    #[test]
+    fn sliding_source_windows_keep_lookups_short() {
+        const NODES: u64 = 1_280;
+        const WINDOW: u64 = 219;
+        let sources = (0..16_u64).map(|index| index * 8).collect::<Vec<_>>();
+        let payload = |node: u64, sequence: u64| PayloadId(sequence * NODES + node);
+        let mut store = PacketStore::new();
+        for &node in &sources {
+            for sequence in 0..WINDOW {
+                let packet = Packet {
+                    payload: payload(node, sequence),
+                    value: sequence,
+                };
+                assert!(store.insert(packet).is_none());
+            }
+        }
+        let (mut lookups, mut probes) = (0_u64, 0_u64);
+        for round in 0..300_u64 {
+            for &node in &sources {
+                let oldest = payload(node, round);
+                probes += probes_to_find(&store, oldest);
+                assert!(store.remove(&oldest).is_some());
+                let next = payload(node, round + WINDOW);
+                probes += probes_to_find(&store, next);
+                assert!(
+                    store
+                        .insert(Packet {
+                            payload: next,
+                            value: round
+                        })
+                        .is_none()
+                );
+                for back in [0, 37, 74, 111] {
+                    let resident = payload(node, round + WINDOW - back);
+                    probes += probes_to_find(&store, resident);
+                    assert!(store.get(&resident).is_some());
+                }
+                lookups += 6;
+            }
+        }
+        let per_lookup = probes as f64 / lookups as f64;
+        assert!(
+            probes <= 2 * lookups,
+            "{probes} probes for {lookups} lookups ({per_lookup:.2} per lookup)"
+        );
+        let mut expected = sources
+            .iter()
+            .flat_map(|&node| (300..300 + WINDOW).map(move |sequence| payload(node, sequence)))
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let drained = store
+            .into_sorted()
+            .into_iter()
+            .map(|packet| packet.payload)
+            .collect::<Vec<_>>();
+        assert_eq!(drained, expected, "the drain is in payload order");
+    }
 }
