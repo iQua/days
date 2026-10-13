@@ -6743,12 +6743,21 @@ impl<'image> TransitionState<'image> {
             )
         };
         let position = if packet.kind.is_roce_control() {
+            #[cfg(feature = "planner-test-hooks")]
+            let mut inspected = 0_u64;
             // After the last control packet whose key is not greater: past every non-control one.
-            queue.iter().rposition(|queued| {
+            let position = queue.iter().rposition(|queued| {
+                #[cfg(feature = "planner-test-hooks")]
+                {
+                    inspected += 1;
+                }
                 self.packets.get(queued).is_some_and(|resident| {
                     resident.descriptor.kind.is_roce_control() && queued_key(resident) <= key
                 })
-            })
+            });
+            #[cfg(feature = "planner-test-hooks")]
+            note_control_insert(inspected, queue.len());
+            position
         } else {
             // A queued control packet ranks first, so the scan stops at it.
             queue.iter().rposition(|queued| {
@@ -7742,6 +7751,47 @@ fn settle_roce_sender(
     let outstanding = generator.bytes_emitted - roce.snd_una;
     generator.feedback.outstanding_bytes = outstanding;
     generator.feedback.unacknowledged_bytes = outstanding;
+}
+
+#[cfg(feature = "planner-test-hooks")]
+std::thread_local! {
+    /// Test-only (P18 ackfix): the control-packet insertions into host queues on this thread
+    /// (a Scalar run's), the queued packets each inspected, and the deepest queue one met.
+    static CONTROL_INSERTS: std::cell::Cell<ControlInsertScans> =
+        const { std::cell::Cell::new(ControlInsertScans { inserts: 0, inspected: 0, deepest_queue: 0 }) };
+}
+
+/// Test-only (P18 ackfix, window-throttle design §3.5): what placing control packets (RoCE ACKs
+/// and NACKs, DCQCN CNPs) in host queues cost on this thread.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ControlInsertScans {
+    /// Control packets placed in a host queue.
+    pub inserts: u64,
+    /// Queued packets inspected to place them.
+    pub inspected: u64,
+    /// The longest queue one was placed in.
+    pub deepest_queue: u64,
+}
+
+#[cfg(feature = "planner-test-hooks")]
+fn note_control_insert(inspected: u64, queue_len: usize) {
+    CONTROL_INSERTS.with(|cell| {
+        let mut scans = cell.get();
+        scans.inserts += 1;
+        scans.inspected += inspected;
+        scans.deepest_queue = scans.deepest_queue.max(queue_len as u64);
+        cell.set(scans);
+    });
+}
+
+/// Test-only (P18 ackfix): this thread's control-packet insertions since the last call; resets
+/// them.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn take_control_insert_scans_for_testing() -> ControlInsertScans {
+    CONTROL_INSERTS.take()
 }
 
 /// Restarts a parked pacer that has packets to send again, on its next grid point after `now_ns`

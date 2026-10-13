@@ -368,3 +368,38 @@ fn the_cnp_first_fixture_matches_cpu_at_one_to_four_workers() {
         assert!(cpu.result == scalar, "CPU with {workers} workers differs");
     }
 }
+
+/// Window-throttle design §3.5: placing a control packet in a host queue inspects the queued
+/// control packets ahead of it, not the queued data behind them. `roce_ack_first` without its
+/// window, with 4 MB per pair and a 50 ms run: each pacer pushes data at the line rate, so every
+/// ACK its host sends deepens that host's queue, which ends up hundreds of packets deep.
+#[cfg(feature = "test")]
+#[test]
+fn placing_a_control_packet_inspects_the_queued_control_packets_not_the_data() {
+    let text = std::fs::read_to_string(repo_path(ACK_FIRST)).unwrap();
+    let mut deep = text.clone();
+    for (from, to, count) in [
+        ("window_bytes = 16000\n", "", 2),
+        ("size = 400000\n", "size = 4000000\n", 2),
+        ("duration = 0.01\n", "duration = 0.05\n", 1),
+    ] {
+        assert_eq!(deep.matches(from).count(), count, "{from}");
+        deep = deep.replace(from, to);
+    }
+    let directory = tempfile::TempDir::new().unwrap();
+    let path = directory.path().join("roce_ack_first_deep.toml");
+    std::fs::write(&path, deep).unwrap();
+    let image = compile_config(&path).expect("the deep variant lowers");
+    let _ = days_executor::take_control_insert_scans_for_testing();
+    run_scalar_with_observations(&image, None, ObservationMode::Summary).expect("it runs");
+    let scans = days_executor::take_control_insert_scans_for_testing();
+    println!("record=p18_control_insert_scans {scans:?}");
+    assert!(
+        scans.inserts > 1_000 && scans.deepest_queue >= 100,
+        "the variant queues ACKs into deep host queues: {scans:?}"
+    );
+    assert!(
+        scans.inspected <= 2 * scans.inserts,
+        "placing a control packet inspected the queued data: {scans:?}"
+    );
+}
