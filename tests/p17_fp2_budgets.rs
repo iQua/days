@@ -11,7 +11,9 @@
 //!
 //! **What is measured.** The allocations this thread makes during one whole Scalar run, which runs
 //! on the calling thread, of `configs/p17/nocc_gbn_lossy.toml`: RoCE queue pairs on a lossy
-//! fabric, 21,615 departed packets. The fixture has no PFC queue, so no debug-only check
+//! fabric, 22,192 departed packets (21,615 before P18's decision D16b put the ACKs ahead of their
+//! host's queued data; the slab tree then makes 87 allocations, 103 before). The fixture has no
+//! PFC queue, so no debug-only check
 //! allocates, and the count is the same in debug and release builds (measured at all three trees
 //! below). The count is a pure function
 //! of the code, the scenario and the toolchain's container implementations.
@@ -92,7 +94,7 @@ fn scalar_run_allocations() -> (u128, u64) {
         "record=p17_fp2_scalar_run_allocations fixture={FIXTURE} departed_packets={departed} \
          allocations={allocations}"
     );
-    assert_eq!(departed, 21_615, "the fixture's run changed");
+    assert_eq!(departed, 22_192, "the fixture's run changed");
     (departed, allocations)
 }
 
