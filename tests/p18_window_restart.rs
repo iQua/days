@@ -18,7 +18,6 @@ use days_executor::{
 use tempfile::TempDir;
 
 #[path = "support/aicb.rs"]
-#[allow(dead_code)]
 mod aicb;
 
 const WINDOW: &str = "configs/p16/dcqcn_mlx_window.toml";
