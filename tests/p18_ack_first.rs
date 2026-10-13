@@ -8,12 +8,13 @@ use std::path::{Path, PathBuf};
 
 use days::scenario::compile_config;
 use days_executor::{
-    Backend, CpuConfig, MechanismTransitionRecord, NodeId, ObservationMode, PacketKind, PayloadId,
-    RoceTransitionRecord, RunResult, SimulationImage, run_cpu_with_observations,
-    run_scalar_with_observations, serialization_time_ns, validate,
+    ArrivalDisposition, Backend, CpuConfig, MechanismTransitionRecord, NodeId, ObservationMode,
+    PacketKind, PayloadId, RoceTransitionRecord, RunResult, SimulationImage,
+    run_cpu_with_observations, run_scalar_with_observations, serialization_time_ns, validate,
 };
 
 const ACK_FIRST: &str = "configs/p18/roce_ack_first.toml";
+const CNP_FIRST: &str = "configs/p18/dcqcn_cnp_first.toml";
 
 fn repo_path(relative: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(relative)
@@ -273,5 +274,97 @@ fn a_checkpoint_with_an_ack_queued_ahead_of_data_resumes_exactly() {
             cpu.result == finished,
             "CPU with {workers} workers differs from Scalar after the checkpoint"
         );
+    }
+}
+
+/// A DCQCN CNP is a control packet too: queued while its host's data waits, it departs ahead of
+/// every packet that had not started service. Its queue entry is the delivery of the data packet
+/// that triggered it; a host allocates payload sequences in sourcing order, so a smaller payload
+/// of the same host was queued earlier.
+#[test]
+fn a_dcqcn_cnp_queued_behind_data_departs_first() {
+    let image = lower(CNP_FIRST);
+    let result = run_full(&image);
+    let node_count = image.nodes.len() as u64;
+    let mut first_departure = BTreeMap::<PayloadId, u64>::new();
+    for departure in &result.departures {
+        first_departure
+            .entry(departure.payload)
+            .and_modify(|time_ns| *time_ns = (*time_ns).min(departure.time_ns))
+            .or_insert(departure.time_ns);
+    }
+    let delivered = result
+        .arrivals
+        .iter()
+        .filter(|arrival| arrival.disposition == ArrivalDisposition::Delivered)
+        .map(|arrival| (arrival.payload, arrival.time_ns))
+        .collect::<BTreeMap<_, _>>();
+    // (payload, control, queued at for a CNP, service start, departure) per source host.
+    let mut hosts = BTreeMap::<u64, Vec<(PayloadId, Option<u64>, u64, u64)>>::new();
+    for packet in &result.observed_packets {
+        let Some(&departed_ns) = first_departure.get(&packet.id) else {
+            continue;
+        };
+        let host = packet.id.0 % node_count;
+        let link = image
+            .links
+            .iter()
+            .find(|link| link.source == NodeId(host))
+            .expect("a source host's egress link");
+        let started_ns =
+            departed_ns - serialization_time_ns(packet.size_bytes, link.rate_bps).unwrap();
+        let queued_ns = match packet.kind {
+            PacketKind::DcqcnCnp(header) => Some(delivered[&header.trigger_payload]),
+            _ => None,
+        };
+        hosts
+            .entry(host)
+            .or_default()
+            .push((packet.id, queued_ns, started_ns, departed_ns));
+    }
+    let mut exercised = 0;
+    let mut cnps = 0;
+    for (host, packets) in &hosts {
+        for &(cnp, queued_ns, _, cnp_departed_ns) in packets {
+            let Some(queued_ns) = queued_ns else {
+                continue;
+            };
+            cnps += 1;
+            for &(other, other_queued, started_ns, departed_ns) in packets {
+                if other_queued.is_some() || started_ns <= queued_ns {
+                    continue;
+                }
+                assert!(
+                    cnp_departed_ns < departed_ns,
+                    "host {host}: the CNP {cnp:?} queued at {queued_ns} departs after {other:?}, \
+                     which starts service at {started_ns}"
+                );
+                exercised += usize::from(other < cnp);
+            }
+        }
+    }
+    assert!(cnps > 0, "the incast marks and host 0 sends CNPs");
+    assert!(
+        exercised > 0,
+        "some CNP is queued while older data of its host waits"
+    );
+}
+
+#[test]
+fn the_cnp_first_fixture_matches_cpu_at_one_to_four_workers() {
+    let image = lower(CNP_FIRST);
+    let scalar = run_full(&image);
+    for workers in 1..=4 {
+        let cpu = run_cpu_with_observations(
+            &image,
+            None,
+            CpuConfig {
+                workers,
+                ..CpuConfig::default()
+            },
+            ObservationMode::Full,
+        )
+        .unwrap_or_else(|error| panic!("CPU with {workers} workers: {error}"));
+        assert!(cpu.result == scalar, "CPU with {workers} workers differs");
     }
 }

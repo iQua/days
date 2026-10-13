@@ -1,0 +1,88 @@
+# P18 ackfix (window-throttle design F1, decision D16b): DCQCN CNPs lead the host NIC queue.
+# Hosts 2 and 3 each send an unreliable DCQCN flow to host 0 at the 1 Gbps line rate, so host 0's
+# switch port marks (ECN at 2,000 B) and host 0's notification point answers with CNPs, while host
+# 0 sends its own DCQCN flow to host 2 at line rate, so its NIC queue holds its own data when a
+# CNP is queued.
+# Contract (tests/p18_ack_first.rs): a CNP is served ahead of the data its host had queued and not
+# yet started; CPU and the devices match Scalar.
+seed = 42
+edges = [[0, 1], [1, 2], [1, 3]]
+hosts = [0, 2, 3]
+duration = 0.002
+
+[switch]
+port_rate = 1000000000
+capacity = 1000
+discipline = "FIFO"
+drop = "TailDrop"
+ecn_capacity_bytes = 1_000_000
+ecn = { kmin_bytes = 2_000, kmax_bytes = 2_000, pmax = 1 }
+
+[[flow]]
+flow_type = "DCQCN"
+priority = 0
+graph = [[2, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200_000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+rp_timer_ns = 50000
+cnp_interval_ns = 4000
+pacing_interval_ns = 1000
+cnp_priority = 0
+
+[[flow]]
+flow_type = "DCQCN"
+priority = 0
+graph = [[3, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200_000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+rp_timer_ns = 50000
+cnp_interval_ns = 4000
+pacing_interval_ns = 1000
+cnp_priority = 0
+
+[[flow]]
+flow_type = "DCQCN"
+priority = 0
+graph = [[0, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 200_000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.dcqcn]
+rate_gbps = 1.0
+min_rate_gbps = 0.01
+max_rate_gbps = 1.0
+g = 0.00390625
+ai_rate_gbps = 0.005
+hai_rate_gbps = 0.05
+rp_timer_ns = 50000
+cnp_interval_ns = 4000
+pacing_interval_ns = 1000
+cnp_priority = 0
