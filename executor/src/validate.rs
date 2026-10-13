@@ -6428,8 +6428,9 @@ pub(crate) fn roce_grid_ticks(
 /// Every tick but such a restart lies at least one interval after the tick before it, so at most
 /// [`roce_grid_ticks`] of them remain. Each restart follows the window-blocked tick that parked
 /// the pacer: a future grid tick, the park the pair is in now, or a restarted tick that found the
-/// window still closed, whose own restart needs another ACK that moves `snd_una` by a packet, at
-/// most one per unacknowledged packet. None without a window, or with no tick left.
+/// window still closed. Such a tick was restarted by an ACK that moved `snd_una` by at least a
+/// packet (a NACK's restart rewinds `next_psn` to `snd_una`, which opens the window), so there are
+/// at most as many as unacknowledged packets. None without a window, or with no tick left.
 pub(crate) fn roce_restart_ticks(roce: crate::RoceGenerator, grid_ticks: u64) -> u64 {
     if roce.window_bytes == 0 || grid_ticks == 0 {
         return 0;
