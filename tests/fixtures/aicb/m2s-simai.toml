@@ -1,0 +1,35 @@
+# P18 diet-host: the P17 profile's M2s scenario (days-gpu evidence/P17/profile/tooling/scenarios/
+# base-m2s.toml): the M2s MoE trace (128 GPUs, TP2, EP32) on SimAI's 128g fabric, SimAI
+# fidelity. The trace is not committed; `tests/p18_image_pins.rs` copies the file named by
+# `DAYS_AICB_M2S` next to this scenario.
+seed = 7
+duration = 0.5
+
+[topology]
+category = "SpectrumX"
+
+[topology.spectrum_x]
+gpus = 128
+gpus_per_server = 8
+nics_per_asw = 64
+psws = 64
+gpu_type = "A100"
+nic_rate_bps = 100000000000
+uplink_rate_bps = 400000000000
+nvlink_rate_bps = 2400000000000
+link_delay_ns = 500
+nvlink_delay_ns = 25
+
+[workload.aicb]
+trace = "m2s_tp2ep32.txt"
+trace_sha256 = "fee71765a63249d26e41da718950c61c6e08bf7f9b53de7efe3dd542c47448e8"
+fidelity = "simai"
+expert_routing = "uniform"
+
+[workload.aicb.simai]
+conf = "SimAI.conf"
+conf_sha256 = "1fe56bee9c2a0e0f27fdbe816c2c51c9254b5d5a6c5e05adaac347a758e77fcf"
+topology = "Spectrum-X_128g_8gps_100Gbps_A100"
+send_lat_us = 3
+nvls_enable = true
+pxn_enable = false

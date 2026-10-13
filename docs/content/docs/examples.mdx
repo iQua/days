@@ -54,7 +54,7 @@ cargo run --release --bin days -- --engine scalar \
   configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml
 ```
 
-On a device, the default channel-stream cap of 2,048 events can exceed device memory for this fixture; `--channel-events-per-stream 256` lowers the starting cap. Capacity is refuse-or-run, so the cap changes memory use and retries, never the result.
+On a device, the default channel-stream cap of 512 events can exceed device memory for this fixture; `--channel-events-per-stream 256` lowers the starting cap. Capacity is refuse-or-run, so the cap changes memory use and retries, never the result.
 
 ## Capacity warm start
 

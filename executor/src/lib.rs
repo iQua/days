@@ -23,6 +23,8 @@ mod device_event_record;
 ))]
 mod device_mechanism;
 mod device_pfc;
+#[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
+mod device_plane;
 mod device_scheduler;
 pub mod device_sizing;
 #[cfg(any(
@@ -45,6 +47,7 @@ mod merge_audit;
 pub mod metal;
 pub mod model;
 mod packet_store;
+pub mod phase_marks;
 #[cfg(any(feature = "cuda", all(feature = "metal", target_vendor = "apple")))]
 mod planner_capacity;
 mod roce;
@@ -183,7 +186,7 @@ pub use tcp::{CUBIC_WINDOW_SCALE, TcpCongestionControl, TcpPhase};
 pub use tcp_trace::{TcpTraceError, tcp_transitions_csv};
 pub use time::{TimeError, link_arrival_time_ns, serialization_time_ns};
 pub use validate::{
-    Backend, RateSourceLookahead, ValidationError, pfc_line_rate_bytes,
+    Backend, RateSourceLookahead, RunImage, ValidatedImage, ValidationError, pfc_line_rate_bytes,
     pfc_required_headroom_bytes, rate_source_lookahead, validate,
 };
 #[cfg(feature = "planner-test-hooks")]

@@ -434,6 +434,24 @@ fn assert_0695_initial_plan(
     assert_eq!(staging(&legacy) % EVENT_WORDS, 0);
     let staging_slots = staging(&legacy) / EVENT_WORDS;
     let p18_staging_bytes = (staging_slots * 12 - 1 + staging_slots) * std::mem::size_of::<u64>();
+    // P18 c9: the `routes` plane stores each distinct route once; the repeated route words are
+    // DERIVED from the image as every forward and reverse route's words less the distinct ones.
+    let every_route_words = image
+        .flows
+        .iter()
+        .map(|flow| flow.route.len() + flow.reverse_route.len())
+        .sum::<usize>();
+    let distinct_route_words = image
+        .flows
+        .iter()
+        .flat_map(|flow| [flow.route.as_slice(), flow.reverse_route.as_slice()])
+        .filter(|route| !route.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(<[_]>::len)
+        .sum::<usize>();
+    let p18_shared_route_bytes =
+        (every_route_words - distinct_route_words) * std::mem::size_of::<u64>();
     assert_eq!(
         strict.total_device_bytes,
         expected_total_device_bytes
@@ -442,10 +460,12 @@ fn assert_0695_initial_plan(
             + p15_roce_params_bytes
             + p16_stage_params_bytes
             - p17_generator_id_bytes
-            - p18_staging_bytes,
+            - p18_staging_bytes
+            - p18_shared_route_bytes,
         "{backend} initial plan bytes, pre-T21 anchor plus the derived round-scratch region, \
          the P14 PFC-offset params word, the P15 RoCE-offset params word and the P16 \
-         stage-offset params word, less the P17 generator stream ids and the P18 staging",
+         stage-offset params word, less the P17 generator stream ids, the P18 staging and the \
+         P18 repeated routes",
     );
 }
 

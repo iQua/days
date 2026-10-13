@@ -8,12 +8,16 @@
 //! pre-T20h lowering hashes, so a parallel scatter that silently reordered a route would be caught
 //! against bytes that predate this task.
 
-use std::fmt;
 use std::path::PathBuf;
 
 use days::scenario::{compile_config, compile_config_with_route_workers};
 use days::topos::route::{RouteWorkers, route_chunk_count, route_chunk_len};
 use days_executor::SimulationImage;
+
+#[path = "support/image_fnv.rs"]
+mod image_fnv;
+
+use image_fnv::{ImageFingerprint, fingerprint};
 
 /// `(fixture, expected flow count, frozen pre-T20h `{:#?}` FNV-1a-64 when one exists)`.
 ///
@@ -49,46 +53,6 @@ const DEFAULT_CORPUS: &[(&str, usize, Option<u64>)] = &[
 
 const K32_TCP_FIXTURE: &str = "configs/benchmarks/tcp/fattree_k32_tcp_reno_f8192.toml";
 const FRONTIER_FIXTURE: &str = "configs/benchmarks/lookahead/rq9_frontier_closed_k32.toml";
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ImageFingerprint {
-    flows: usize,
-    debug_bytes: usize,
-    debug_fnv1a64: u64,
-}
-
-/// Streams `{:#?}` through an FNV-1a-64 accumulator without materializing the Debug text.
-///
-/// The frontier image formats to hundreds of megabytes, so the fingerprint must never be taken
-/// over an intermediate `String`.
-fn fingerprint(image: &SimulationImage) -> ImageFingerprint {
-    struct Fnv1a64 {
-        hash: u64,
-        bytes: usize,
-    }
-
-    impl fmt::Write for Fnv1a64 {
-        fn write_str(&mut self, value: &str) -> fmt::Result {
-            self.bytes += value.len();
-            self.hash = value.bytes().fold(self.hash, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
-            });
-            Ok(())
-        }
-    }
-
-    let mut accumulator = Fnv1a64 {
-        hash: 0xcbf2_9ce4_8422_2325,
-        bytes: 0,
-    };
-    fmt::write(&mut accumulator, format_args!("{image:#?}"))
-        .expect("formatting into the image hasher should succeed");
-    ImageFingerprint {
-        flows: image.flows.len(),
-        debug_bytes: accumulator.bytes,
-        debug_fnv1a64: accumulator.hash,
-    }
-}
 
 fn fixture_path(fixture: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(fixture)

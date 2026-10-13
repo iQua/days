@@ -12,7 +12,8 @@ use days_executor::{
     PfcIngressState, PfcQueueState, RateGenerator, RemoteChannel, RoceCongestionControl,
     RoceGenerator, RocePacer, RoceReceiverState, ScheduledEmission, SchedulerKind, SimulationImage,
     StageDependencies, StagePredecessors, StageRole, SwitchQueueState, SwitchState,
-    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, event_phase, validate,
+    TcpCongestionControl, TcpDataHeader, TcpGenerator, TcpReceiverState, ValidatedImage,
+    event_phase,
 };
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
@@ -737,7 +738,7 @@ struct FlowSetKey {
 struct CollectiveKey {
     /// The collective's position in its workload's realized issue order (P16 ruling C2): the
     /// leading field, so canonical flow order, and with it SimAI's per-pair ECMP port ordinals
-    /// (`simai_ecmp_route_tables`), follow issue order. `None` for every collective that does not
+    /// (`SimAiEcmpRouter`), follow issue order. `None` for every collective that does not
     /// set it, which sort first and keep their order. Held as `ordinal + 1` in a `NonZeroU32`, which
     /// fits the key's padding (`stage_group_keys_keep_their_size`); `Some` orders as the ordinal.
     issue_ordinal: Option<std::num::NonZeroU32>,
@@ -853,14 +854,48 @@ impl FlowInput {
     }
 }
 
-/// The predecessors of one kind of a stage, by flow key: inline when there is at most one, so a
+/// The flow key of a stage, in the 32 B form a predecessor list holds (P18 c3): a predecessor is
+/// always a collective or compute stage, never an explicit or set flow, so it needs neither of
+/// [`FlowKey`]'s semantic keys (184 B with them). The mapping to [`FlowKey`] is one-to-one, so equality here
+/// is equality of the flow keys.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StageKey {
+    Collective {
+        collective: u64,
+        duplicate_ordinal: u64,
+        stage: CollectiveStagePosition,
+    },
+    Compute {
+        compute: u64,
+        rank: u32,
+    },
+}
+
+impl StageKey {
+    fn flow_key(self) -> FlowKey {
+        match self {
+            Self::Collective {
+                collective,
+                duplicate_ordinal,
+                stage,
+            } => FlowKey::CollectiveStage {
+                collective,
+                duplicate_ordinal,
+                stage,
+            },
+            Self::Compute { compute, rank } => FlowKey::ComputeStage { compute, rank },
+        }
+    }
+}
+
+/// The predecessors of one kind of a stage, by stage key: inline when there is at most one, so a
 /// stage that is not a join allocates nothing for them.
 #[derive(Clone, Debug, Default)]
 enum PredecessorKeys {
     #[default]
     None,
-    One(FlowKey),
-    Many(Vec<FlowKey>),
+    One(StageKey),
+    Many(Vec<StageKey>),
 }
 
 impl PredecessorKeys {
@@ -871,7 +906,7 @@ impl PredecessorKeys {
     /// Appends `key`; under `dedup` only when it is not already listed. Returns whether it was
     /// appended. Only a zero-send all-to-all rank's release (`collective_completion`) dedups: the
     /// ordinary paths name each group once, so their keys are distinct and they pay nothing.
-    fn insert(&mut self, key: FlowKey, dedup: bool) -> bool {
+    fn insert(&mut self, key: StageKey, dedup: bool) -> bool {
         let listed = dedup
             && match self {
                 Self::None => false,
@@ -884,7 +919,7 @@ impl PredecessorKeys {
         !listed
     }
 
-    fn push(&mut self, key: FlowKey) {
+    fn push(&mut self, key: StageKey) {
         *self = match std::mem::take(self) {
             Self::None => Self::One(key),
             Self::One(first) => Self::Many(vec![first, key]),
@@ -898,17 +933,14 @@ impl PredecessorKeys {
     /// The image form: a join's flows are sorted and appended to `joins` as one run.
     fn resolve(
         &self,
-        flow_ids: &BTreeMap<FlowKey, u64>,
+        flows: &CanonicalFlowIds<'_>,
         joins: &mut Vec<FlowId>,
     ) -> Result<StagePredecessors, CompileError> {
         Ok(match self {
             Self::None => StagePredecessors::None,
-            Self::One(key) => StagePredecessors::One(FlowId(flow_ids[key])),
+            Self::One(key) => StagePredecessors::One(flows.id(*key)),
             Self::Many(keys) => {
-                let mut flows = keys
-                    .iter()
-                    .map(|key| FlowId(flow_ids[key]))
-                    .collect::<Vec<_>>();
+                let mut flows = keys.iter().map(|key| flows.id(*key)).collect::<Vec<_>>();
                 flows.sort_unstable();
                 flows.dedup();
                 let first = u32::try_from(joins.len()).map_err(|_| {
@@ -940,9 +972,10 @@ struct ComputeStageInput {
 
 /// One flow to lower, before the canonical sort assigns its dense identifier.
 ///
-/// The stage sidecars are boxed: most flows have neither, and a sidecar held by value (448 B for a
-/// collective stage, 416 B for a compute stage, each with its predecessors' full `FlowKey`s) would
-/// be paid by every flow and moved by every step of the flow sort. Boxed, a flow without stages
+/// The stage sidecars are boxed: most flows have neither, and a sidecar held by value (144 B for a
+/// collective stage, 96 B for a compute stage; 448 B and 416 B before P18 c3, when they held their
+/// predecessors' full `FlowKey`s) would be paid by every flow and moved by every step of the flow
+/// sort. Boxed, a flow without stages
 /// pays one null pointer per sidecar; `tests::flow_input_carries_its_stage_sidecars_out_of_line`
 /// bounds the size.
 #[derive(Clone, Debug)]
@@ -956,13 +989,44 @@ struct FlowInput {
     compute: Option<Box<ComputeStageInput>>,
 }
 
+/// The dense flow identities of the canonically sorted flows (P18 c3): flow `i` of the sorted
+/// table is `FlowId(i)`, since [`canonical_flows`] sorts the flows by their distinct keys and
+/// [`CanonicalFlowIds::new`] checks that the keys strictly increase. A predecessor's identity is
+/// its key's position, found by binary search, with no key-to-id map.
+struct CanonicalFlowIds<'a> {
+    flows: &'a [FlowInput],
+}
+
+impl<'a> CanonicalFlowIds<'a> {
+    fn new(flows: &'a [FlowInput]) -> Result<Self, CompileError> {
+        if let Some(pair) = flows.windows(2).find(|pair| pair[0].key >= pair[1].key) {
+            return Err(CompileError::Invalid(format!(
+                "lowered flows are not in strictly increasing canonical key order at {:?}",
+                pair[1].key
+            )));
+        }
+        u64::try_from(flows.len()).map_err(|_| CompileError::Id)?;
+        Ok(Self { flows })
+    }
+
+    fn id(&self, key: StageKey) -> FlowId {
+        let key = key.flow_key();
+        let index = self
+            .flows
+            .binary_search_by(|flow| flow.key.cmp(&key))
+            .expect("every stage predecessor is a lowered flow");
+        FlowId(index as u64)
+    }
+}
+
 /// One host's generator and stage tables as lowering builds them.
 ///
 /// The stage table stays unallocated until the host's first stage generator arrives, is then
 /// back-filled with `None` for the generators before it, and grows with every later generator. A
 /// host without a stage therefore leaves lowering with an empty table and no stage allocation, and
 /// both tables move into the host state without a copy: the canonical shapes of
-/// `HostState::stages`.
+/// `HostState::stages`. Both are allocated at the host's exact generator count (P18 c3), counted
+/// before the flows are lowered, so the image carries no growth slack.
 #[derive(Default)]
 struct HostTables {
     generators: Vec<FlowGeneratorState>,
@@ -970,13 +1034,34 @@ struct HostTables {
 }
 
 impl HostTables {
+    fn with_capacity(generators: usize) -> Self {
+        Self {
+            generators: Vec::with_capacity(generators),
+            stages: Vec::new(),
+        }
+    }
+
     fn push(&mut self, (generator, stage): (FlowGeneratorState, Option<CollectiveStage>)) {
         if stage.is_some() || !self.stages.is_empty() {
+            if self.stages.capacity() == 0 {
+                // Every later generator of the host appends a stage row too.
+                self.stages.reserve_exact(self.generators.capacity());
+            }
             self.stages.resize(self.generators.len(), None);
             self.stages.push(stage);
         }
         self.generators.push(generator);
     }
+}
+
+/// Per host, how many generators it sources and how many receivers of each kind it holds: the
+/// exact sizes of its image tables, counted in one pass before lowering fills them (P18 c3).
+#[derive(Default)]
+struct HostTableCounts {
+    generators: usize,
+    tcp_receivers: usize,
+    dcqcn_receivers: usize,
+    roce_receivers: usize,
 }
 
 /// Lowers one Days configuration file into one heterogeneous semantic image.
@@ -996,7 +1081,8 @@ pub fn compile_config_with_route_workers(
     path: impl AsRef<Path>,
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
-    compile_scenario(path.as_ref(), route_workers, None)
+    compile_scenario(path.as_ref(), route_workers, None, Backend::Scalar)
+        .map(ValidatedImage::into_image)
 }
 
 /// Lowers a TOML scenario's topology, switch and link configuration (and any stage groups it
@@ -1006,7 +1092,13 @@ pub fn compile_config_with_workload(
     workload: &super::workload::Workload,
     route_workers: RouteWorkers,
 ) -> Result<SimulationImage, CompileError> {
-    compile_scenario(path.as_ref(), route_workers, Some(workload))
+    compile_scenario(
+        path.as_ref(),
+        route_workers,
+        Some(workload),
+        Backend::Scalar,
+    )
+    .map(ValidatedImage::into_image)
 }
 
 /// [`compile_config_with_route_workers`], with the run manifest of an AICB scenario
@@ -1016,11 +1108,23 @@ pub fn compile_config_with_manifest(
     path: impl AsRef<Path>,
     route_workers: RouteWorkers,
 ) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    compile_config_validated(path, route_workers, Backend::Scalar)
+        .map(|(image, manifest)| (image.into_image(), manifest))
+}
+
+/// [`compile_config_with_manifest`], validated once for the backend that will run the image
+/// (P18 c4): for a device backend, the Scalar validation every lowering runs plus the device's
+/// own refusals ([`ValidatedImage`]). A device entry given the result does not validate again.
+pub fn compile_config_validated(
+    path: impl AsRef<Path>,
+    route_workers: RouteWorkers,
+    backend: Backend,
+) -> Result<(ValidatedImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
     let path = path.as_ref();
     let content = read_scenario(path)?;
-    match compile_text(&content, route_workers, None) {
+    match compile_text(&content, route_workers, None, backend) {
         Err(CompileError::Parse(_)) if crate::workload::aicb::is_aicb_scenario(&content) => {
-            compile_aicb(path, &content, route_workers)
+            compile_aicb(path, &content, route_workers, backend)
         }
         other => other.map(|image| (image, None)),
     }
@@ -1040,14 +1144,15 @@ fn compile_scenario(
     path: &Path,
     route_workers: RouteWorkers,
     workload: Option<&super::workload::Workload>,
-) -> Result<SimulationImage, CompileError> {
+    backend: Backend,
+) -> Result<ValidatedImage, CompileError> {
     let content = read_scenario(path)?;
-    match compile_text(&content, route_workers, workload) {
+    match compile_text(&content, route_workers, workload, backend) {
         // An AICB scenario has no `[switch]` of its own, so it does not parse as an ordinary one.
         Err(CompileError::Parse(_))
             if workload.is_none() && crate::workload::aicb::is_aicb_scenario(&content) =>
         {
-            compile_aicb(path, &content, route_workers).map(|(image, _)| image)
+            compile_aicb(path, &content, route_workers, backend).map(|(image, _)| image)
         }
         other => other,
     }
@@ -1059,10 +1164,16 @@ fn compile_aicb(
     path: &Path,
     content: &str,
     route_workers: RouteWorkers,
-) -> Result<(SimulationImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
+    backend: Backend,
+) -> Result<(ValidatedImage, Option<crate::workload::aicb::AicbManifest>), CompileError> {
     let prepared = crate::workload::aicb::prepare(path, content)
         .map_err(|error| CompileError::Invalid(format!("AICB scenario: {error}")))?;
-    let image = compile_text(&prepared.text, route_workers, Some(&prepared.workload))?;
+    let image = compile_text(
+        &prepared.text,
+        route_workers,
+        Some(&prepared.workload),
+        backend,
+    )?;
     Ok((image, Some(prepared.manifest)))
 }
 
@@ -1070,7 +1181,8 @@ fn compile_text(
     content: &str,
     route_workers: RouteWorkers,
     workload: Option<&super::workload::Workload>,
-) -> Result<SimulationImage, CompileError> {
+    backend: Backend,
+) -> Result<ValidatedImage, CompileError> {
     crate::validate_config_text(content).map_err(CompileError::Unsupported)?;
 
     let source: SourceConfig =
@@ -1086,9 +1198,11 @@ fn compile_text(
     let (graph, hosts, profile) = build_graph_with_profile_from_str(content)?;
 
     let image = lower(model, &graph, hosts, profile, route_workers)?;
-    validate(&image, Backend::Scalar).map_err(|error| {
+    days_executor::phase_marks::mark("lowered", 0);
+    let image = ValidatedImage::new(image, backend).map_err(|error| {
         CompileError::Invalid(format!("lowered image failed validation: {error}"))
     })?;
+    days_executor::phase_marks::mark("compile_validated", 0);
     Ok(image)
 }
 
@@ -3874,7 +3988,8 @@ fn lower(
         });
     }
     let ids = StableIds::new(node_keys, link_keys.iter().copied())?;
-    let flow_ids = dense_ids(flows.iter().map(|flow| flow.key.clone()))?;
+    // Flow `i` of the sorted table is `FlowId(i)`; predecessors resolve by key position.
+    let flow_ids = CanonicalFlowIds::new(&flows)?;
     // Compute stages and stage notifies send nothing over the fabric and have no route; every
     // other flow is routed.
     let routed_flows = flows
@@ -3882,8 +3997,10 @@ fn lower(
         .enumerate()
         .filter(|(_, flow)| flow.compute.is_none() && flow.notify_delay_ns().is_none());
     // SimAI's ECMP picks the feedback path by its own hash, so its reverse routes are not the
-    // reversed forward routes; every other policy reverses the forward switch path.
-    let mut reverse_route_table = None;
+    // reversed forward routes; every other policy reverses the forward switch path. SimAI's routes
+    // are computed in the descriptor pass below, one flow at a time (P18 c3); the other policies'
+    // tables are consumed by it in flow order, so no route map outlives it.
+    let mut simai_router = None;
     let route_table = match model.routing {
         RoutingPolicy::ShortestPath => compute_shortest_path_route_table_with(
             graph,
@@ -3904,12 +4021,8 @@ fn lower(
                         .to_owned(),
                 ));
             };
-            let (forward, reverse) = simai_ecmp_route_tables(
-                rail,
-                routed_flows.map(|(index, flow)| (index, flow.source, flow.target)),
-            );
-            reverse_route_table = Some(reverse);
-            Ok(forward)
+            simai_router = Some(SimAiEcmpRouter::new(rail));
+            Ok(BTreeMap::new())
         }
         RoutingPolicy::FatTreeEcmp => compute_fat_tree_ecmp_route_table(
             graph,
@@ -3946,13 +4059,14 @@ fn lower(
                 .to_owned(),
         ),
     })?;
+    let mut table_routes = route_table.into_iter();
     let flow_descriptors = flows
         .iter()
         .enumerate()
         .map(|(index, flow)| {
             if flow.compute.is_some() || flow.notify_delay_ns().is_some() {
                 return FlowDescriptor {
-                    id: FlowId(flow_ids[&flow.key]),
+                    id: FlowId(index as u64),
                     source: ids.node(LpKey::Host(flow.source)),
                     target: ids.node(LpKey::Host(flow.target)),
                     priority: flow.priority,
@@ -3961,19 +4075,34 @@ fn lower(
                     reverse_route: Vec::new(),
                 };
             }
-            let switch_path = &route_table[&index];
-            let reverse_switch_path = match &reverse_route_table {
-                Some(reverse) => reverse[&index].clone(),
-                None => switch_path.iter().rev().copied().collect::<Vec<_>>(),
+            let (route, reverse_route) = match &mut simai_router {
+                Some(router) => {
+                    let (forward, reverse) = router.route(flow.source, flow.target);
+                    (
+                        image_route(flow.source, flow.target, forward.as_slice(), &ids),
+                        image_route(flow.target, flow.source, reverse.as_slice(), &ids),
+                    )
+                }
+                None => {
+                    let (routed, switch_path) = table_routes
+                        .next()
+                        .expect("the route table holds every routed flow");
+                    debug_assert_eq!(routed, index, "route tables are keyed in flow order");
+                    let reverse_switch_path = switch_path.iter().rev().copied().collect::<Vec<_>>();
+                    (
+                        image_route(flow.source, flow.target, &switch_path, &ids),
+                        image_route(flow.target, flow.source, &reverse_switch_path, &ids),
+                    )
+                }
             };
             FlowDescriptor {
-                id: FlowId(flow_ids[&flow.key]),
+                id: FlowId(index as u64),
                 source: ids.node(LpKey::Host(flow.source)),
                 target: ids.node(LpKey::Host(flow.target)),
                 priority: flow.priority,
                 feedback_priority: flow.traffic.feedback_priority(flow.priority, &roce_keys),
-                route: image_route(flow.source, flow.target, switch_path, &ids),
-                reverse_route: image_route(flow.target, flow.source, &reverse_switch_path, &ids),
+                route,
+                reverse_route,
             }
         })
         .collect::<Vec<_>>();
@@ -4000,8 +4129,34 @@ fn lower(
     let node_count = u64::try_from(nodes.len())
         .map_err(|_| CompileError::Invalid("node count exceeds u64".to_owned()))?;
 
+    // The exact size of every host's tables. A stage notify has no receiver state: its one
+    // arrival carries the whole chunk.
+    let mut table_counts = BTreeMap::<LpKey, HostTableCounts>::new();
+    for flow in &flows {
+        table_counts
+            .entry(LpKey::Host(flow.source))
+            .or_default()
+            .generators += 1;
+        if flow.notify_delay_ns().is_some() {
+            continue;
+        }
+        if matches!(flow.traffic.kind, TrafficKind::Constant) {
+            continue;
+        }
+        let counts = table_counts.entry(LpKey::Host(flow.target)).or_default();
+        match flow.traffic.kind {
+            TrafficKind::Roce(_) => counts.roce_receivers += 1,
+            TrafficKind::Tcp(_) => counts.tcp_receivers += 1,
+            TrafficKind::Dcqcn(_) => counts.dcqcn_receivers += 1,
+            TrafficKind::Constant => {}
+        }
+    }
     // Each host's generator table and stage table.
-    let mut generators_by_source = BTreeMap::<LpKey, HostTables>::new();
+    let mut generators_by_source = table_counts
+        .iter()
+        .filter(|(_, counts)| counts.generators != 0)
+        .map(|(&host, counts)| (host, HostTables::with_capacity(counts.generators)))
+        .collect::<BTreeMap<_, _>>();
     let mut payload_sequences = BTreeMap::<LpKey, u64>::new();
     let mut initial_packets = Vec::with_capacity(flows.len());
     let mut initial_event_inputs = Vec::<(LpKey, u64, FlowId, PayloadId, EventKind)>::new();
@@ -4079,38 +4234,41 @@ fn lower(
             };
             let (identity, dependencies) =
                 collective_stage_record(stage, &flow_ids, &mut stage_joins)?;
-            generators_by_source.entry(source).or_default().push((
-                FlowGeneratorState {
-                    flow: descriptor.id,
-                    packets_emitted: 0,
-                    bytes_emitted: 0,
-                    next_emission,
-                    rng_state: generator_seed(
-                        model.seed,
-                        &flow.key,
-                        &collective_table,
-                        &compute_table,
-                        &roce_keys,
-                    ),
-                    feedback: GeneratorFeedbackState {
-                        arrivals: 0,
-                        outstanding_bytes: 0,
-                        unacknowledged_bytes: 0,
+            generators_by_source
+                .get_mut(&source)
+                .expect("every source host's tables were counted")
+                .push((
+                    FlowGeneratorState {
+                        flow: descriptor.id,
+                        packets_emitted: 0,
+                        bytes_emitted: 0,
+                        next_emission,
+                        rng_state: generator_seed(
+                            model.seed,
+                            &flow.key,
+                            &collective_table,
+                            &compute_table,
+                            &roce_keys,
+                        ),
+                        feedback: GeneratorFeedbackState {
+                            arrivals: 0,
+                            outstanding_bytes: 0,
+                            unacknowledged_bytes: 0,
+                        },
+                        kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                            // A stage notify's lane latency (the image's one record of it per message).
+                            first_departure_ns: lane_ns,
+                            interval_ns: lead_ns,
+                            packet_size_bytes: stage.chunk_bytes,
+                            termination: GeneratorTermination::Bytes(stage.chunk_bytes),
+                        }),
                     },
-                    kind: FlowGeneratorKind::Constant(ConstantGenerator {
-                        // A stage notify's lane latency (the image's one record of it per message).
-                        first_departure_ns: lane_ns,
-                        interval_ns: lead_ns,
-                        packet_size_bytes: stage.chunk_bytes,
-                        termination: GeneratorTermination::Bytes(stage.chunk_bytes),
+                    Some(CollectiveStage {
+                        role: StageRole::Collective(identity),
+                        dependencies,
+                        activated: root,
                     }),
-                },
-                Some(CollectiveStage {
-                    role: StageRole::Collective(identity),
-                    dependencies,
-                    activated: root,
-                }),
-            ));
+                ));
             continue;
         }
         if let Some(compute) = &flow.compute {
@@ -4164,48 +4322,51 @@ fn lower(
             };
             let local = compute.local.resolve(&flow_ids, &mut stage_joins)?;
             let inbound = compute.inbound.resolve(&flow_ids, &mut stage_joins)?;
-            generators_by_source.entry(source).or_default().push((
-                FlowGeneratorState {
-                    flow: descriptor.id,
-                    packets_emitted: 0,
-                    bytes_emitted: 0,
-                    next_emission,
-                    rng_state: generator_seed(
-                        model.seed,
-                        &flow.key,
-                        &collective_table,
-                        &compute_table,
-                        &roce_keys,
-                    ),
-                    feedback: GeneratorFeedbackState {
-                        arrivals: 0,
-                        outstanding_bytes: 0,
-                        unacknowledged_bytes: 0,
+            generators_by_source
+                .get_mut(&source)
+                .expect("every source host's tables were counted")
+                .push((
+                    FlowGeneratorState {
+                        flow: descriptor.id,
+                        packets_emitted: 0,
+                        bytes_emitted: 0,
+                        next_emission,
+                        rng_state: generator_seed(
+                            model.seed,
+                            &flow.key,
+                            &collective_table,
+                            &compute_table,
+                            &roce_keys,
+                        ),
+                        feedback: GeneratorFeedbackState {
+                            arrivals: 0,
+                            outstanding_bytes: 0,
+                            unacknowledged_bytes: 0,
+                        },
+                        kind: FlowGeneratorKind::Constant(ConstantGenerator {
+                            first_departure_ns: 0,
+                            interval_ns: compute.duration_ns,
+                            packet_size_bytes: 0,
+                            termination: GeneratorTermination::Bytes(0),
+                        }),
                     },
-                    kind: FlowGeneratorKind::Constant(ConstantGenerator {
-                        first_departure_ns: 0,
-                        interval_ns: compute.duration_ns,
-                        packet_size_bytes: 0,
-                        termination: GeneratorTermination::Bytes(0),
+                    Some(CollectiveStage {
+                        role: StageRole::Compute(ComputeStage {
+                            compute_id: compute.compute_id,
+                            group_size: compute.group_size,
+                            rank: compute.rank,
+                            duration_ns: compute.duration_ns,
+                        }),
+                        dependencies: StageDependencies {
+                            local,
+                            inbound,
+                            inbound_predecessor_bytes: compute.inbound_predecessor_bytes,
+                            inbound_bytes_received: 0,
+                            local_completed: 0,
+                        },
+                        activated: root,
                     }),
-                },
-                Some(CollectiveStage {
-                    role: StageRole::Compute(ComputeStage {
-                        compute_id: compute.compute_id,
-                        group_size: compute.group_size,
-                        rank: compute.rank,
-                        duration_ns: compute.duration_ns,
-                    }),
-                    dependencies: StageDependencies {
-                        local,
-                        inbound,
-                        inbound_predecessor_bytes: compute.inbound_predecessor_bytes,
-                        inbound_bytes_received: 0,
-                        local_completed: 0,
-                    },
-                    activated: root,
-                }),
-            ));
+                ));
             continue;
         }
         let emission_count = packet_count(&flow.traffic);
@@ -4359,118 +4520,136 @@ fn lower(
             .as_deref()
             .map(|stage| collective_stage_record(stage, &flow_ids, &mut stage_joins))
             .transpose()?;
-        generators_by_source.entry(source).or_default().push((
-            FlowGeneratorState {
-                // Every collective stage is a TCP or RoCE generator whose dependencies live in this record;
-                // compute stages build theirs in the compute branch above.
-                flow: descriptor.id,
-                packets_emitted: 0,
-                bytes_emitted: 0,
-                next_emission,
-                rng_state: generator_seed(
-                    model.seed,
-                    &flow.key,
-                    &collective_table,
-                    &compute_table,
-                    &roce_keys,
-                ),
-                feedback: GeneratorFeedbackState {
-                    arrivals: 0,
-                    outstanding_bytes: 0,
-                    unacknowledged_bytes: 0,
-                },
-                kind: {
-                    match flow.traffic.kind {
-                        TrafficKind::Constant => FlowGeneratorKind::Constant(ConstantGenerator {
-                            first_departure_ns: flow.traffic.initial_delay_ns,
-                            interval_ns: flow.traffic.interval_ns,
-                            packet_size_bytes: flow.traffic.packet_size_bytes,
-                            termination: match flow.traffic.termination {
-                                Termination::Bytes(bytes) => GeneratorTermination::Bytes(bytes),
-                                Termination::DurationNs(duration_ns) => {
-                                    GeneratorTermination::DurationNs(duration_ns)
-                                }
-                            },
-                        }),
-                        TrafficKind::Tcp(algorithm) => {
-                            let Termination::Bytes(total_bytes) = flow.traffic.termination else {
-                                unreachable!("TCP validation requires byte termination")
-                            };
-                            let control = match algorithm {
-                                TcpAlgorithm::Reno => {
-                                    TcpCongestionControl::reno(flow.traffic.packet_size_bytes)
-                                }
-                                TcpAlgorithm::Cubic => {
-                                    TcpCongestionControl::cubic(flow.traffic.packet_size_bytes)
-                                }
-                            };
-                            FlowGeneratorKind::Tcp(TcpGenerator::new(
-                                total_bytes,
-                                flow.traffic.packet_size_bytes,
-                                40,
-                                control,
-                            ))
-                        }
-                        TrafficKind::Dcqcn(config) => {
-                            let Termination::Bytes(total_bytes) = flow.traffic.termination else {
-                                unreachable!("DCQCN validation requires byte termination")
-                            };
-                            let controller = lowered_dcqcn_controller(config);
-                            FlowGeneratorKind::Dcqcn(DcqcnGenerator {
-                                rate: RateGenerator {
-                                    first_pacing_time_ns: flow.traffic.initial_delay_ns,
-                                    pacing_interval_ns: config.pacing_interval_ns,
+        generators_by_source
+            .get_mut(&source)
+            .expect("every source host's tables were counted")
+            .push((
+                FlowGeneratorState {
+                    // Every collective stage is a TCP or RoCE generator whose dependencies live in this record;
+                    // compute stages build theirs in the compute branch above.
+                    flow: descriptor.id,
+                    packets_emitted: 0,
+                    bytes_emitted: 0,
+                    next_emission,
+                    rng_state: generator_seed(
+                        model.seed,
+                        &flow.key,
+                        &collective_table,
+                        &compute_table,
+                        &roce_keys,
+                    ),
+                    feedback: GeneratorFeedbackState {
+                        arrivals: 0,
+                        outstanding_bytes: 0,
+                        unacknowledged_bytes: 0,
+                    },
+                    kind: {
+                        match flow.traffic.kind {
+                            TrafficKind::Constant => {
+                                FlowGeneratorKind::Constant(ConstantGenerator {
+                                    first_departure_ns: flow.traffic.initial_delay_ns,
+                                    interval_ns: flow.traffic.interval_ns,
                                     packet_size_bytes: flow.traffic.packet_size_bytes,
+                                    termination: match flow.traffic.termination {
+                                        Termination::Bytes(bytes) => {
+                                            GeneratorTermination::Bytes(bytes)
+                                        }
+                                        Termination::DurationNs(duration_ns) => {
+                                            GeneratorTermination::DurationNs(duration_ns)
+                                        }
+                                    },
+                                })
+                            }
+                            TrafficKind::Tcp(algorithm) => {
+                                let Termination::Bytes(total_bytes) = flow.traffic.termination
+                                else {
+                                    unreachable!("TCP validation requires byte termination")
+                                };
+                                let control = match algorithm {
+                                    TcpAlgorithm::Reno => {
+                                        TcpCongestionControl::reno(flow.traffic.packet_size_bytes)
+                                    }
+                                    TcpAlgorithm::Cubic => {
+                                        TcpCongestionControl::cubic(flow.traffic.packet_size_bytes)
+                                    }
+                                };
+                                FlowGeneratorKind::Tcp(TcpGenerator::new(
                                     total_bytes,
-                                    rate_numerator_bits_per_second: config.initial_rate_bps,
-                                    rate_denominator: 1,
-                                    credit_quanta: 0,
-                                },
-                                controller,
-                                cnp_size_bytes: 64,
-                            })
+                                    flow.traffic.packet_size_bytes,
+                                    40,
+                                    control,
+                                ))
+                            }
+                            TrafficKind::Dcqcn(config) => {
+                                let Termination::Bytes(total_bytes) = flow.traffic.termination
+                                else {
+                                    unreachable!("DCQCN validation requires byte termination")
+                                };
+                                let controller = lowered_dcqcn_controller(config);
+                                FlowGeneratorKind::Dcqcn(DcqcnGenerator {
+                                    rate: RateGenerator {
+                                        first_pacing_time_ns: flow.traffic.initial_delay_ns,
+                                        pacing_interval_ns: config.pacing_interval_ns,
+                                        packet_size_bytes: flow.traffic.packet_size_bytes,
+                                        total_bytes,
+                                        rate_numerator_bits_per_second: config.initial_rate_bps,
+                                        rate_denominator: 1,
+                                        credit_quanta: 0,
+                                    },
+                                    controller,
+                                    cnp_size_bytes: 64,
+                                })
+                            }
+                            TrafficKind::Roce(_) => {
+                                let roce = roce.expect("a RoCE flow carries its key");
+                                let pacer = pacer.expect("a RoCE flow carries its pacer");
+                                let Termination::Bytes(total_bytes) = flow.traffic.termination
+                                else {
+                                    unreachable!("RoCE validation requires byte termination")
+                                };
+                                FlowGeneratorKind::Roce(RoceGenerator {
+                                    pacer: RocePacer {
+                                        first_pacing_time_ns: anchor_ns,
+                                        pacing_interval_ns: pacer.interval_ns,
+                                        mtu_bytes: flow.traffic.packet_size_bytes,
+                                        total_bytes,
+                                        credit_quanta: 0,
+                                    },
+                                    controller: pacer.controller,
+                                    pacing_timer_payload: next_emission.payload,
+                                    next_psn: 0,
+                                    snd_una: 0,
+                                    rto_deadline_ns: 0,
+                                    rto_ns: roce.retransmit_timeout_ns,
+                                    pacer_armed: !gated_roce,
+                                    window_bytes: roce.window_bytes,
+                                    variable_window: roce.variable_window,
+                                    window_parked: false,
+                                    congestion_control: pacer.congestion_control,
+                                })
+                            }
                         }
-                        TrafficKind::Roce(_) => {
-                            let roce = roce.expect("a RoCE flow carries its key");
-                            let pacer = pacer.expect("a RoCE flow carries its pacer");
-                            let Termination::Bytes(total_bytes) = flow.traffic.termination else {
-                                unreachable!("RoCE validation requires byte termination")
-                            };
-                            FlowGeneratorKind::Roce(RoceGenerator {
-                                pacer: RocePacer {
-                                    first_pacing_time_ns: anchor_ns,
-                                    pacing_interval_ns: pacer.interval_ns,
-                                    mtu_bytes: flow.traffic.packet_size_bytes,
-                                    total_bytes,
-                                    credit_quanta: 0,
-                                },
-                                controller: pacer.controller,
-                                pacing_timer_payload: next_emission.payload,
-                                next_psn: 0,
-                                snd_una: 0,
-                                rto_deadline_ns: 0,
-                                rto_ns: roce.retransmit_timeout_ns,
-                                pacer_armed: !gated_roce,
-                                window_bytes: roce.window_bytes,
-                                variable_window: roce.variable_window,
-                                window_parked: false,
-                                congestion_control: pacer.congestion_control,
-                            })
-                        }
-                    }
+                    },
                 },
-            },
-            collective_stage.map(|(identity, dependencies)| CollectiveStage {
-                role: StageRole::Collective(identity),
-                dependencies,
-                activated: collective_ready && emission_count != 0,
-            }),
-        ));
+                collective_stage.map(|(identity, dependencies)| CollectiveStage {
+                    role: StageRole::Collective(identity),
+                    dependencies,
+                    activated: collective_ready && emission_count != 0,
+                }),
+            ));
     }
-    initial_packets.sort_by_key(|packet| packet.id);
+    // Payload identities are distinct, so the unstable sort gives the stable sort's order without
+    // its scratch buffer (P18 c3).
+    initial_packets.sort_unstable_by_key(|packet| packet.id);
+    // Reserved for one packet per flow, filled only by flows that start with one: the image keeps
+    // what it holds and no more. The join runs grew by doubling. (P18 c3.)
+    initial_packets.shrink_to_fit();
+    stage_joins.shrink_to_fit();
 
     let mut origin_sequences = BTreeMap::<LpKey, u64>::new();
-    initial_event_inputs.sort_by(|left, right| {
+    // A flow has at most one initial event, so (source, time, flow) is distinct and the unstable
+    // sort gives the stable sort's order without its scratch buffer (P18 c3).
+    initial_event_inputs.sort_unstable_by(|left, right| {
         left.0
             .cmp(&right.0)
             .then_with(|| left.1.cmp(&right.1))
@@ -4496,13 +4675,26 @@ fn lower(
             payload,
         });
     }
-    initial_events.sort_by_key(|event| event.key);
+    // Event keys are distinct (origin sequences are per origin node), so unstable is stable here.
+    initial_events.sort_unstable_by_key(|event| event.key);
 
+    // Each target host's receivers, in canonical `FlowId` order, each table at its exact counted
+    // length: one allocation per host and kind it receives, none elsewhere.
     let mut tcp_receivers_by_target = BTreeMap::<LpKey, Vec<TcpReceiverState>>::new();
     let mut dcqcn_receivers_by_target = BTreeMap::<LpKey, Vec<DcqcnReceiverState>>::new();
-    // Every receiver with its target, then one exact-length slice per target host: one
-    // allocation per host that receives queue pairs.
-    let mut roce_receivers = Vec::<(LpKey, RoceReceiverState)>::new();
+    let mut roce_receivers_by_target = BTreeMap::<LpKey, Vec<RoceReceiverState>>::new();
+    for (&host, counts) in &table_counts {
+        if counts.tcp_receivers != 0 {
+            tcp_receivers_by_target.insert(host, Vec::with_capacity(counts.tcp_receivers));
+        }
+        if counts.dcqcn_receivers != 0 {
+            dcqcn_receivers_by_target.insert(host, Vec::with_capacity(counts.dcqcn_receivers));
+        }
+        if counts.roce_receivers != 0 {
+            roce_receivers_by_target.insert(host, Vec::with_capacity(counts.roce_receivers));
+        }
+    }
+    drop(table_counts);
     for (flow, descriptor) in flows.iter().zip(&flow_descriptors) {
         if flow.notify_delay_ns().is_some() {
             // A stage notify needs no receiver state: its one arrival carries the whole chunk.
@@ -4513,9 +4705,10 @@ fn lower(
             let Termination::Bytes(total_bytes) = flow.traffic.termination else {
                 unreachable!("RoCE validation requires byte termination")
             };
-            roce_receivers.push((
-                LpKey::Host(flow.target),
-                RoceReceiverState {
+            roce_receivers_by_target
+                .get_mut(&LpKey::Host(flow.target))
+                .expect("every RoCE target's receivers were counted")
+                .push(RoceReceiverState {
                     flow: descriptor.id,
                     total_bytes,
                     expected_psn: 0,
@@ -4525,19 +4718,18 @@ fn lower(
                     nack_interval_ns: roce.nack_interval_ns,
                     last_nack: None,
                     duplicate_ack: roce.duplicate_ack,
-                },
-            ));
+                });
         }
         if matches!(flow.traffic.kind, TrafficKind::Tcp(_)) {
             tcp_receivers_by_target
-                .entry(LpKey::Host(flow.target))
-                .or_default()
+                .get_mut(&LpKey::Host(flow.target))
+                .expect("every TCP target's receivers were counted")
                 .push(TcpReceiverState::new(descriptor.id, 40));
         }
         if let TrafficKind::Dcqcn(config) = flow.traffic.kind {
             dcqcn_receivers_by_target
-                .entry(LpKey::Host(flow.target))
-                .or_default()
+                .get_mut(&LpKey::Host(flow.target))
+                .expect("every DCQCN target's receivers were counted")
                 .push(DcqcnReceiverState {
                     flow: descriptor.id,
                     cnp_interval_ns: config.cnp_interval_ns,
@@ -4547,15 +4739,6 @@ fn lower(
         }
     }
 
-    // Stable: each target keeps its receivers in canonical `FlowId` order.
-    roce_receivers.sort_by_key(|(target, _)| *target);
-    let mut roce_receivers_by_target = BTreeMap::<LpKey, Box<[RoceReceiverState]>>::new();
-    for group in roce_receivers.chunk_by(|left, right| left.0 == right.0) {
-        roce_receivers_by_target.insert(
-            group[0].0,
-            group.iter().map(|(_, receiver)| *receiver).collect(),
-        );
-    }
     let mut host_states = host_topology_ids
         .iter()
         .map(|host| {
@@ -4580,8 +4763,11 @@ fn lower(
                 dcqcn_receivers: dcqcn_receivers_by_target
                     .remove(&node_key)
                     .unwrap_or_default(),
-                // One allocation on a host that receives queue pairs, none elsewhere.
-                roce_receivers: roce_receivers_by_target.remove(&node_key),
+                // One allocation on a host that receives queue pairs, none elsewhere; at its exact
+                // length, so the boxed slice keeps the allocation.
+                roce_receivers: roce_receivers_by_target
+                    .remove(&node_key)
+                    .map(Vec::into_boxed_slice),
                 pfc: None,
                 next_origin_seq: origin_sequences.get(&node_key).copied().unwrap_or(0),
                 next_payload_seq: payload_sequences.get(&node_key).copied().unwrap_or(0),
@@ -4919,18 +5105,38 @@ fn lower(
 /// ([`RailProfile::data_psw`], [`RailProfile::feedback_psw`]). GPUs sharing an ASW cross no PSW.
 /// The ordinal stands in for SimAI's run-time issue order (statistically equivalent, ruled; the
 /// canonical order is the stage keys' order, which the collective lowering fixes).
-fn simai_ecmp_route_tables(
+///
+/// The router is called once per routed flow, in canonical flow order, by the descriptor pass
+/// (P18 c3): it keeps only the per-pair counters, not a route map over every flow.
+struct SimAiEcmpRouter {
     rail: RailProfile,
-    flows: impl Iterator<Item = (usize, u64, u64)>,
-) -> (
-    BTreeMap<usize, Vec<NodeIndex>>,
-    BTreeMap<usize, Vec<NodeIndex>>,
-) {
-    let mut ordinals = BTreeMap::<(u64, u64), u64>::new();
-    let mut forward = BTreeMap::new();
-    let mut reverse = BTreeMap::new();
-    for (index, source, target) in flows {
-        let ordinal = ordinals.entry((source, target)).or_default();
+    ordinals: BTreeMap<(u64, u64), u64>,
+}
+
+/// A switch path of at most three switches (ASW, PSW, ASW), held inline.
+struct SwitchPath {
+    nodes: [NodeIndex; 3],
+    len: usize,
+}
+
+impl SwitchPath {
+    fn as_slice(&self) -> &[NodeIndex] {
+        &self.nodes[..self.len]
+    }
+}
+
+impl SimAiEcmpRouter {
+    fn new(rail: RailProfile) -> Self {
+        Self {
+            rail,
+            ordinals: BTreeMap::new(),
+        }
+    }
+
+    /// The forward and feedback switch paths of the next message from `source` to `target`.
+    fn route(&mut self, source: u64, target: u64) -> (SwitchPath, SwitchPath) {
+        let rail = self.rail;
+        let ordinal = self.ordinals.entry((source, target)).or_default();
         let sport = RailProfile::simai_sport(*ordinal);
         *ordinal += 1;
         // Rail host identities are GPU ids below `rail.gpus`, a `u32`.
@@ -4938,29 +5144,30 @@ fn simai_ecmp_route_tables(
         let (source_asw, target_asw) = (rail.asw_of(source), rail.asw_of(target));
         let node = |index: u32| NodeIndex::new(index as usize);
         let path = |from: u32, psw: Option<u32>, to: u32| match psw {
-            None => vec![node(from)],
-            Some(psw) => vec![node(from), node(rail.psw_index(psw)), node(to)],
+            None => SwitchPath {
+                nodes: [node(from); 3],
+                len: 1,
+            },
+            Some(psw) => SwitchPath {
+                nodes: [node(from), node(rail.psw_index(psw)), node(to)],
+                len: 3,
+            },
         };
-        forward.insert(
-            index,
+        (
             path(source_asw, rail.data_psw(source, target, sport), target_asw),
-        );
-        reverse.insert(
-            index,
             path(
                 target_asw,
                 rail.feedback_psw(source, target, sport),
                 source_asw,
             ),
-        );
+        )
     }
-    (forward, reverse)
 }
 
 /// The stage identity and pristine prerequisite state of one collective stage.
 fn collective_stage_record(
     stage: &CollectiveStageInput,
-    flow_ids: &BTreeMap<FlowKey, u64>,
+    flow_ids: &CanonicalFlowIds<'_>,
     stage_joins: &mut Vec<FlowId>,
 ) -> Result<(CollectiveStageIdentity, StageDependencies), CompileError> {
     Ok((
@@ -5191,9 +5398,18 @@ fn canonical_flows(
     collectives.sort();
     computes.sort();
 
+    // The flow table is reserved at its exact final length (P18 c3): explicit flows and set
+    // members here, collective and compute stages once their count is known below. A table grown
+    // by doubling held up to twice its flows (23.7 GB at 2,048 GPUs, whose 33.7 M flows just pass
+    // 2^25), and each regrowth copied it.
+    let set_members = flow_sets.iter().try_fold(explicit.len(), |total, set| {
+        usize::try_from(set.flow_count)
+            .ok()
+            .and_then(|count| total.checked_add(count))
+    });
     let mut flows = Vec::new();
     flows
-        .try_reserve_exact(explicit.len())
+        .try_reserve_exact(set_members.unwrap_or(explicit.len()))
         .map_err(|error| CompileError::Invalid(format!("flow table is too large: {error}")))?;
     let mut explicit_duplicates = BTreeMap::<ExplicitFlowKey, u64>::new();
     for semantic in explicit {
@@ -5350,6 +5566,23 @@ fn canonical_flows(
         layouts: &layouts,
         computes: &computes,
     };
+    let stages = collectives
+        .iter()
+        .map(|semantic| {
+            collective_stage_count(
+                semantic,
+                plan.layout(collective_ordinal(&collective_table, semantic)),
+            )
+        })
+        .chain(computes.iter().map(|compute| compute.hosts.len() as u64))
+        .try_fold(0_u64, u64::checked_add)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or_else(|| {
+            CompileError::Invalid("stage count exceeds the platform index domain".to_owned())
+        })?;
+    flows
+        .try_reserve_exact(stages)
+        .map_err(|error| CompileError::Invalid(format!("stage table is too large: {error}")))?;
     let mut collective_duplicates = vec![0_u64; collective_table.len()];
     let mut next_collective_id = 0_u64;
     let mut seeded = Vec::new();
@@ -5400,7 +5633,14 @@ fn canonical_flows(
         }
     }
 
-    flows.sort_by(|left, right| left.key.cmp(&right.key));
+    debug_assert_eq!(
+        flows.len(),
+        flows.capacity(),
+        "the flow table was reserved at its exact length"
+    );
+    // Keys are distinct (duplicates carry their ordinals), so the unstable sort gives the stable
+    // sort's order without its scratch buffer; `CanonicalFlowIds::new` checks the distinctness.
+    flows.sort_unstable_by(|left, right| left.key.cmp(&right.key));
     Ok(CanonicalFlows {
         flows,
         collectives: collective_table,
@@ -5459,6 +5699,33 @@ fn ring_phases(algorithm: CollectiveAlgorithm) -> &'static [CollectivePhase] {
 /// Whether a collective expands to any stage.
 fn collective_has_stages(semantic: &CollectiveKey) -> bool {
     semantic.flow_count > 1
+}
+
+/// How many stages [`expand_collective`] pushes for `semantic`, computed without expanding it, so
+/// the flow table can be reserved at its exact length: a ring's phases × channels × n × (n - 1),
+/// an all-to-all's ordered pairs with bytes, a send/recv's one message.
+fn collective_stage_count(semantic: &CollectiveKey, layout: &CollectiveLayout) -> u64 {
+    let Termination::Bytes(total_bytes) = semantic.traffic.termination else {
+        unreachable!("collective validation requires byte termination")
+    };
+    if !collective_has_stages(semantic) || total_bytes == 0 {
+        return 0;
+    }
+    let n = semantic.flow_count;
+    match semantic.algorithm {
+        CollectiveAlgorithm::AllToAll => {
+            let size = n as usize;
+            (0..size)
+                .flat_map(|rank| (1..size).map(move |step| (rank, (rank + step) % size)))
+                .filter(|&(rank, target)| layout.pair_bytes[rank * size + target] != 0)
+                .count() as u64
+        }
+        CollectiveAlgorithm::SendRecv => 1,
+        _ => (ring_phases(semantic.algorithm).len() as u64)
+            .saturating_mul(layout.channels() as u64)
+            .saturating_mul(n)
+            .saturating_mul(n - 1),
+    }
 }
 
 /// The message structure of one collective key, computed once for its expansion and for the
@@ -5627,7 +5894,7 @@ fn collective_completion(
 ) -> Result<u64, CompileError> {
     let semantic = &plan.collectives[ordinal as usize];
     let layout = plan.layout(ordinal);
-    let key = |phase, channel, rank, step| FlowKey::CollectiveStage {
+    let key = |phase, channel, rank, step| StageKey::Collective {
         collective: ordinal,
         duplicate_ordinal: 0,
         stage: CollectiveStagePosition {
@@ -5815,7 +6082,7 @@ fn follow_groups(
         match plan.groups[name] {
             StageGroup::Compute(predecessor) => {
                 local.insert(
-                    FlowKey::ComputeStage {
+                    StageKey::Compute {
                         compute: compute_ordinal(plan.computes, predecessor),
                         rank,
                     },
@@ -5858,7 +6125,7 @@ fn expand_collective(
     let after_ranks = AfterRanks::new(plan, semantic.after.as_ref(), &semantic.sources);
     let group_size = u32::try_from(n)
         .map_err(|_| CompileError::Invalid("collective group size exceeds u32".to_owned()))?;
-    let stage_key = |stage: CollectiveStagePosition| FlowKey::CollectiveStage {
+    let stage_key = |stage: CollectiveStagePosition| StageKey::Collective {
         collective,
         duplicate_ordinal,
         stage,
@@ -5881,7 +6148,7 @@ fn expand_collective(
         let mut traffic = semantic.traffic.clone();
         traffic.termination = Termination::Bytes(chunk_bytes);
         flows.push(FlowInput {
-            key: stage_key(position),
+            key: stage_key(position).flow_key(),
             source: semantic.sources[position.rank as usize],
             target,
             priority: semantic.priority,
@@ -6646,6 +6913,26 @@ mod tests {
     /// priority 1 = 369, padded to 376 B.
     ///
     /// Layout is the compiler's choice, so the bound is an upper bound on 64-bit targets.
+    /// P18 c3 Stage A: a stage's predecessors are 32 B stage keys, not full `FlowKey`s, so the
+    /// boxed sidecars shrank from 448 B (collective) and 416 B (compute) to 144 B and 96 B. On the
+    /// P16 MoE smoke, where nearly every flow is a stage, the sidecars were 0.2 GB of the 1.1 GB
+    /// lowering peak. Upper bounds on 64-bit targets.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn stage_sidecars_hold_compact_predecessor_keys() {
+        use super::{CollectiveStageInput, ComputeStageInput, PredecessorKeys, StageKey};
+        assert!(std::mem::size_of::<StageKey>() <= 32);
+        assert!(std::mem::size_of::<PredecessorKeys>() <= 32);
+        let (collective, compute) = (
+            std::mem::size_of::<CollectiveStageInput>(),
+            std::mem::size_of::<ComputeStageInput>(),
+        );
+        assert!(
+            collective <= 144 && compute <= 96,
+            "stage sidecars grew to {collective} B and {compute} B: keep predecessors as stage keys"
+        );
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn flow_input_carries_its_stage_sidecars_out_of_line() {

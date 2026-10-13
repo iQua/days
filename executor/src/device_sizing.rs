@@ -771,13 +771,17 @@ pub fn size_default_device_plan(
     let stream_state_words = stream_state_words(image)?.max(1);
     let inbound_producer_words = inbound_producer_words(image, notify.as_ref());
 
+    // P18 c9: identical routes are stored once (`device_plane::RoutePlane`).
     let route_words = image
         .flows
         .iter()
-        .try_fold(0_usize, |total, flow| {
+        .flat_map(|flow| [flow.route.as_slice(), flow.reverse_route.as_slice()])
+        .filter(|route| !route.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .try_fold(0_usize, |total, route| {
             total
-                .checked_add(flow.route.len())
-                .and_then(|words| words.checked_add(flow.reverse_route.len()))
+                .checked_add(route.len())
                 .ok_or_else(|| sizing_error("route plane overflows usize"))
         })?
         .max(1);

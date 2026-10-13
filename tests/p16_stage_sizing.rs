@@ -153,6 +153,12 @@ fn projected_tcp_state_is_the_planners_allocation() {
 /// P17 merge moves every image by a derived amount, applied in the test: the LP stream lists no
 /// longer store the generator stream ids, one 8-byte word per distinct generator flow
 /// ([`p17_generator_id_bytes`]).
+///
+/// P18 c9 likewise: the `routes` plane stores each distinct route once, so every image shrinks by
+/// its repeated route words ([`p18_shared_route_bytes`]); complete state is unchanged
+/// (`days-gpu/evidence/P18/diet-host/`). P18 ring writes, independently, drops the streams plan's
+/// remote staging plane and its per-slot channel ids ([`p18_staging_bytes`]); the two touch
+/// disjoint planes, so their derived amounts add.
 const STAGELESS_PLAN_BYTES: &[(&str, usize, usize)] = &[
     (
         "configs/benchmarks/baseline/fattree_k4_f8_st.toml",
@@ -198,6 +204,26 @@ fn p18_staging_bytes(legacy: &DeviceSizingReport) -> usize {
     (slots * 12 - 1 + slots) * std::mem::size_of::<u64>()
 }
 
+/// P18 c9: the bytes of the routes the `routes` plane no longer repeats: every flow's forward and
+/// reverse route words, less the distinct non-empty routes' words.
+fn p18_shared_route_bytes(image: &SimulationImage) -> usize {
+    let every = image
+        .flows
+        .iter()
+        .map(|flow| flow.route.len() + flow.reverse_route.len())
+        .sum::<usize>();
+    let distinct = image
+        .flows
+        .iter()
+        .flat_map(|flow| [flow.route.as_slice(), flow.reverse_route.as_slice()])
+        .filter(|route| !route.is_empty())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .map(<[_]>::len)
+        .sum::<usize>();
+    (every - distinct) * std::mem::size_of::<u64>()
+}
+
 #[test]
 fn stageless_windowless_plans_keep_their_bytes() {
     for &(relative, metal, cuda) in STAGELESS_PLAN_BYTES {
@@ -208,7 +234,8 @@ fn stageless_windowless_plans_keep_their_bytes() {
         {
             let expected = if backend == "Metal" { metal } else { cuda }
                 - p17_generator_id_bytes(&image)
-                - p18_staging_bytes(&legacy);
+                - p18_staging_bytes(&legacy)
+                - p18_shared_route_bytes(&image);
             assert_eq!(
                 plane_words(&exact, "remote_staging"),
                 1,

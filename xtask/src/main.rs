@@ -124,8 +124,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"any(feature = "cuda", all(feature = "metal", target_vendor = "apple"))"#,
-        count: 2,
-        purpose: "shared planner lookup tables exist only when a device planner is built; P14's `RoundKernel` selection type is exported only with a device backend, the only builds with two `days_round` builds to select between",
+        count: 3,
+        purpose: "shared planner lookup tables exist only when a device planner is built; P14's `RoundKernel` selection type is exported only with a device backend, the only builds with two `days_round` builds to select between; P18's shared plane construction (all-zero plane lengths, c2a) exists only for the two device planners",
     },
     AllowedFeatureGate {
         path: "lib.rs",
@@ -204,6 +204,12 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
         predicate: r#"feature = "planner-test-hooks""#,
         count: 2,
         purpose: "validator flow-index equality hook and the P16 H1 per-host stage-width probe are exported only for standard tests",
+    },
+    AllowedFeatureGate {
+        path: "phase_marks.rs",
+        predicate: r#"feature = "planner-test-hooks""#,
+        count: 3,
+        purpose: "P18 diet-host's per-thread phase hook (its slot, the call in `mark` and its setter) exists only for memory-accounting tests and probes; in production builds `mark` is empty",
     },
     AllowedFeatureGate {
         path: "stage_sizing.rs",

@@ -12,7 +12,7 @@ pub const STOCK_CAPACITY_CAPS: days_executor::DeviceCapacityCaps =
     days_executor::DeviceCapacityCaps {
         fallback_fel_events_per_lp: Some(16_384),
         queue_packets_per_lp: Some(2_048),
-        channel_events_per_stream: Some(2_048),
+        channel_events_per_stream: Some(512),
         remote_staging_events_per_lp: Some(2_048),
         outbox_events_total: Some(2_000_000),
         tcp_receiver_ranges_per_flow: Some(64),

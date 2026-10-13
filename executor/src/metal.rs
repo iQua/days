@@ -32,6 +32,7 @@ use crate::device_event_record::{
     decode_event_record, stored_event_words, stream_event_class,
 };
 use crate::device_mechanism::RoundKernel;
+use crate::device_plane::ZeroPlane;
 use crate::device_scheduler::{
     QUEUE_META_WORDS, prepare_device_schedulers, restore_device_scheduler,
 };
@@ -41,9 +42,9 @@ use crate::{
     ArrivalDisposition, Backend, CapacityRetryRecord, CapacityWarmStart, DeviceCapacityCaps,
     DeviceCapacityFloors, Event, EventKey, EventKind, FlowGeneratorKind, FlowId, GeneratorStatus,
     GeneratorTermination, NodeId, NodeKind, ObservationMode, PacketArrivalObservation,
-    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunResult, RunSummary,
+    PacketDeparture, PacketDescriptor, PacketKind, PayloadId, RunImage, RunResult, RunSummary,
     SimulationImage, TcpAckHeader, TcpCongestionControl, TcpDataHeader, TcpPhase, TcpReceiveRange,
-    TcpTimerState, validate,
+    TcpTimerState,
 };
 
 const LANES: usize = 1_024;
@@ -983,8 +984,8 @@ pub struct MetalRun {
 /// Metal execution is serialized process-wide: one executor executes at a time, and concurrent
 /// callers queue until execution and readback complete. The compiled executor is cached
 /// process-wide.
-pub fn run_metal(
-    image: &SimulationImage,
+pub fn run_metal<'image>(
+    image: impl Into<RunImage<'image>>,
     exclusive_horizon_ns: Option<u64>,
     config: MetalConfig,
 ) -> Result<MetalRun, MetalError> {
@@ -1001,8 +1002,8 @@ pub fn run_metal(
 /// Metal execution is serialized process-wide: one executor executes at a time, and concurrent
 /// callers queue until execution and readback complete. Executor construction may proceed
 /// concurrently.
-pub fn run_metal_with_observations(
-    image: &SimulationImage,
+pub fn run_metal_with_observations<'image>(
+    image: impl Into<RunImage<'image>>,
     exclusive_horizon_ns: Option<u64>,
     config: MetalConfig,
     observation_mode: ObservationMode,
@@ -1210,9 +1211,9 @@ impl MetalExecutor {
     }
 
     /// Runs with summary observations under the process-wide Metal execution envelope.
-    pub fn run(
+    pub fn run<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
     ) -> Result<MetalRun, MetalError> {
@@ -1230,9 +1231,9 @@ impl MetalExecutor {
     }
 
     /// Runs with explicit observation retention under the process-wide Metal execution envelope.
-    pub fn run_with_observations(
+    pub fn run_with_observations<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
@@ -1258,9 +1259,9 @@ impl MetalExecutor {
     /// semantics (the T20g invariant), so a warm start moves a run between "refuses once, then
     /// runs" and "runs immediately" and never between two answers. See
     /// [`CapacityWarmStart`] for the argument in full.
-    pub fn run_with_observations_warm_started(
+    pub fn run_with_observations_warm_started<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
@@ -1275,9 +1276,9 @@ impl MetalExecutor {
         )
     }
 
-    fn run_with_observations_mode(
+    fn run_with_observations_mode<'image>(
         &self,
-        image: &SimulationImage,
+        image: impl Into<RunImage<'image>>,
         exclusive_horizon_ns: Option<u64>,
         config: MetalConfig,
         observation_mode: ObservationMode,
@@ -1289,8 +1290,13 @@ impl MetalExecutor {
             crate::device_pfc::take_resume_scan_counts_for_testing();
             crate::merge_audit::reset();
         }
-        validate(image, Backend::Metal)
+        // P18 c4: an image validated for this backend at compile is not validated again.
+        let mut run_image = image.into();
+        run_image
+            .validate_for(Backend::Metal)
             .map_err(|error| MetalError::Validation(error.to_string()))?;
+        crate::phase_marks::mark("validated", 0);
+        let image = run_image.image();
         validate_config(config)?;
         let round_kernel = selected_round_kernel(image, config);
 
@@ -1309,6 +1315,7 @@ impl MetalExecutor {
         let mut retry_trace = Vec::new();
         loop {
             let attempt = (|| {
+                let image = run_image.image();
                 let plan = MetalPlan::new_with_entity_capacity_floors(
                     image,
                     exclusive_horizon_ns,
@@ -1317,6 +1324,7 @@ impl MetalExecutor {
                     &mut channel_capacity_floors,
                     &mut tcp_capacity_floors,
                 )?;
+                crate::phase_marks::mark("planned", 0);
                 // The plain kernel has no device-side stop: the host refuses it, before upload, on
                 // any plan holding state a mechanism transition would act on.
                 if round_kernel == RoundKernel::Plain {
@@ -1335,11 +1343,15 @@ impl MetalExecutor {
                     .into());
                 }
                 let buffers = MetalBuffers::new(&self.direct.device, plan)?;
+                crate::phase_marks::mark("uploaded", planned_bytes);
                 let _execution_guard = metal_device_execution_guard();
                 let timing = self.direct.run(&buffers, attempt_config, round_kernel)?;
+                crate::phase_marks::mark("executed", planned_bytes);
                 #[cfg(feature = "metal-test-hooks")]
                 panic_after_execution_if_requested();
-                buffers.finish(&self.direct, image, observation_mode, timing)
+                let run = buffers.finish(&self.direct, &mut run_image, observation_mode, timing)?;
+                crate::phase_marks::mark("read_back", planned_bytes);
+                Ok(run)
             })();
             match attempt {
                 Ok(mut run) => {
@@ -1479,7 +1491,8 @@ pub fn assert_metal_planner_bit_equal_for_testing(
     config: MetalConfig,
     observation_mode: ObservationMode,
 ) -> Result<(), MetalError> {
-    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Metal)
+        .map_err(|error| MetalError::Validation(error.to_string()))?;
     validate_config(config)?;
     let (packet_counts, feedback_counts) = flow_packet_counts(image)?;
     let data_counts = packet_counts
@@ -1532,7 +1545,8 @@ pub fn mechanism_plane_words_metal_for_testing(
     image: &SimulationImage,
     config: MetalConfig,
 ) -> Result<crate::MechanismPlaneWords, MetalError> {
-    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Metal)
+        .map_err(|error| MetalError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = MetalPlan::new(image, None, config, ObservationMode::Summary)?;
     let pfc_offset = plan.params[PARAM_PFC_OFFSET];
@@ -1579,7 +1593,8 @@ pub fn size_metal_plan_for_testing(
     config: MetalConfig,
     observation_mode: ObservationMode,
 ) -> Result<crate::DeviceSizingReport, MetalError> {
-    validate(image, Backend::Metal).map_err(|error| MetalError::Validation(error.to_string()))?;
+    crate::validate(image, Backend::Metal)
+        .map_err(|error| MetalError::Validation(error.to_string()))?;
     validate_config(config)?;
     let plan = MetalPlan::new(image, exclusive_horizon_ns, config, observation_mode)?;
     let words = plan.plane_words();
@@ -1696,7 +1711,9 @@ impl MetalPlan {
             queue_records: &self.queue_records,
             in_service: &self.in_service,
             stream_state: &self.stream_state,
-            stream_records: &self.stream_records,
+            // P18 c2a: the stream rings are all zero at upload and every stream's count is 0, so
+            // the check reads no record; a count it would read fails closed as a malformed plan.
+            stream_records: &[],
             stream_count: self.stream_layout.stream_count,
             service_stream_base: self.stream_layout.service_stream_base,
             generator_stream_base: self.stream_layout.generator_stream_base,
@@ -1732,21 +1749,21 @@ struct MetalPlan {
     queue_meta: Vec<u64>,
     queue_records: Vec<u64>,
     in_service: Vec<u64>,
-    outbox: Vec<u64>,
-    worklist: Vec<u64>,
-    summary: Vec<u64>,
-    observed: Vec<u64>,
-    departures: Vec<u64>,
-    arrivals: Vec<u64>,
-    lp_state: Vec<u64>,
+    outbox: ZeroPlane,
+    worklist: ZeroPlane,
+    summary: ZeroPlane,
+    observed: ZeroPlane,
+    departures: ZeroPlane,
+    arrivals: ZeroPlane,
+    lp_state: ZeroPlane,
     remote_meta: Vec<u64>,
-    remote_staging: Vec<u64>,
+    remote_staging: ZeroPlane,
     observation_meta: Vec<u64>,
     inbound_meta: Vec<u64>,
     inbound_producers: Vec<u64>,
-    merge_cursors: Vec<u64>,
+    merge_cursors: ZeroPlane,
     stream_state: Vec<u64>,
-    stream_records: Vec<u64>,
+    stream_records: ZeroPlane,
     scheduler_state: Vec<u64>,
     tcp_state: Vec<u64>,
     stream_layout: StreamLayout,
@@ -1776,7 +1793,7 @@ struct StreamLayout {
 
 struct PreparedStreams {
     state: Vec<u64>,
-    records: Vec<u64>,
+    records: ZeroPlane,
     layout: StreamLayout,
     memory_layout: MetalMemoryLayout,
     channel_stream_capacity_distribution: Vec<crate::ChannelStreamCapacityLevel>,
@@ -2324,22 +2341,19 @@ impl MetalPlan {
             )?;
         }
 
-        let mut routes = Vec::new();
+        // P18 c9: identical routes share one copy in the `routes` plane.
+        let mut routes = crate::device_plane::RoutePlane::new();
         let mut flows = vec![0_u64; image.flows.len().max(1) * FLOW_WORDS];
         for flow in &image.flows {
             let offset = flow.id.0 as usize * FLOW_WORDS;
             flows[offset] = flow.source.0;
             flows[offset + 1] = flow.target.0;
-            flows[offset + 2] = routes.len() as u64;
+            flows[offset + 2] = routes.place(&flow.route);
             flows[offset + 3] = flow.route.len() as u64;
-            routes.extend(flow.route.iter().map(|link| link.0));
-            flows[offset + 4] = routes.len() as u64;
+            flows[offset + 4] = routes.place(&flow.reverse_route);
             flows[offset + 5] = flow.reverse_route.len() as u64;
-            routes.extend(flow.reverse_route.iter().map(|link| link.0));
         }
-        if routes.is_empty() {
-            routes.push(0);
-        }
+        let routes = routes.into_words();
         let mut links = vec![0_u64; image.links.len().max(1) * LINK_WORDS];
         for link in &image.links {
             let offset = link.id.0 as usize * LINK_WORDS;
@@ -2564,18 +2578,18 @@ impl MetalPlan {
             queue_meta,
             queue_records,
             in_service,
-            outbox: zero_words(outbox_records, EVENT_WORDS)?,
-            worklist: vec![0_u64; worklist_capacity],
-            summary: vec![0_u64; node_count.max(1) * SUMMARY_COUNTERS * 2],
-            observed: zero_words(observation_slots, OBSERVED_WORDS)?,
-            departures: zero_words(observation_slots, DEPARTURE_WORDS)?,
-            arrivals: zero_words(observation_slots, ARRIVAL_WORDS)?,
-            lp_state: vec![0_u64; node_count.max(1) * LP_STATE_WORDS],
+            outbox: zero_plane(outbox_records, EVENT_WORDS)?,
+            worklist: ZeroPlane::words(worklist_capacity),
+            summary: ZeroPlane::words(node_count.max(1) * SUMMARY_COUNTERS * 2),
+            observed: zero_plane(observation_slots, OBSERVED_WORDS)?,
+            departures: zero_plane(observation_slots, DEPARTURE_WORDS)?,
+            arrivals: zero_plane(observation_slots, ARRIVAL_WORDS)?,
+            lp_state: ZeroPlane::words(node_count.max(1) * LP_STATE_WORDS),
             remote_meta,
-            remote_staging: zero_words(remote_staging_slots, EVENT_WORDS)?,
+            remote_staging: zero_plane(remote_staging_slots, EVENT_WORDS)?,
             observation_meta,
             inbound_meta,
-            merge_cursors: vec![0_u64; inbound_producers.len().max(1)],
+            merge_cursors: ZeroPlane::words(inbound_producers.len()),
             inbound_producers,
             stream_state: streams.state,
             stream_records: streams.records,
@@ -3028,7 +3042,7 @@ fn prepare_streams(
             .ok_or_else(|| MetalError::Validation("round scratch size overflows usize".into()))?;
         return Ok(PreparedStreams {
             state: vec![0; round_scratch_words.max(1)],
-            records: vec![0],
+            records: ZeroPlane::words(1),
             layout: StreamLayout {
                 round_scratch_offset: 0,
                 ..StreamLayout::default()
@@ -3069,13 +3083,24 @@ fn prepare_streams(
     if let Some(capacity) = config.max_channel_events_per_stream {
         channel_caps.fill(capacity.max(config.capacity_floors.channel_events_per_stream));
     } else {
+        // P18 c1: the cap bounds the data rings. A notify lane holds at most its host pair's
+        // unfired notifies, a count lowering fixes, so it keeps that exact capacity.
+        let floor = config.capacity_floors.channel_events_per_stream;
+        let lanes = notify
+            .map_or(&[][..], |notify| &notify.lanes)
+            .iter()
+            .map(|&(channel, _)| (channel, channel_caps[channel].max(floor)))
+            .collect::<Vec<_>>();
         for capacity in &mut channel_caps {
             *capacity = crate::device_capacity::bound_derived_capacity(
                 *capacity,
                 config.capacity_caps.channel_events_per_stream,
-                config.capacity_floors.channel_events_per_stream,
+                floor,
                 0,
             );
+        }
+        for (channel, capacity) in lanes {
+            channel_caps[channel] = capacity;
         }
     }
     for (stream, capacity) in channel_caps.iter_mut().enumerate() {
@@ -3250,7 +3275,7 @@ fn prepare_streams(
 
     Ok(PreparedStreams {
         state,
-        records: vec![0; stream_record_words.max(1)],
+        records: ZeroPlane::words(stream_record_words),
         layout: StreamLayout {
             stream_count,
             channel_count,
@@ -3595,6 +3620,12 @@ fn zero_words(records: usize, words: usize) -> Result<Vec<u64>, MetalError> {
         .checked_mul(words)
         .ok_or_else(|| MetalError::Validation("device buffer size overflows usize".into()))?;
     Ok(vec![0; length.max(1)])
+}
+
+/// An all-zero plane of `records` records of `words` words (P18 c2a): its length only.
+fn zero_plane(records: usize, words: usize) -> Result<ZeroPlane, MetalError> {
+    ZeroPlane::records(records, words)
+        .ok_or_else(|| MetalError::Validation("device buffer size overflows usize".into()))
 }
 
 fn encode_tcp_generator(tcp: crate::TcpGenerator, row: &mut [u64]) {
@@ -4055,9 +4086,21 @@ fn queue_push_host(
     Ok(())
 }
 
+/// Where one uploaded plane's words come from (P18 c2a).
+enum PlaneSource {
+    Host(Vec<u64>),
+    Zero(ZeroPlane),
+}
+
 struct SharedBuffer {
     raw: RawMetalBuffer,
     words: usize,
+}
+
+impl Drop for SharedBuffer {
+    fn drop(&mut self) {
+        crate::phase_marks::mark("device_free", self.words * std::mem::size_of::<u64>());
+    }
 }
 
 impl SharedBuffer {
@@ -4079,10 +4122,28 @@ impl SharedBuffer {
                 words.len(),
             );
         }
+        crate::phase_marks::mark("device_alloc", bytes);
         Ok(Self {
             raw,
             words: words.len(),
         })
+    }
+
+    /// Allocates an all-zero plane without staging a host buffer of zeros (P18 c2a). The buffer is
+    /// cleared in place rather than relying on a fresh allocation being zero.
+    fn zeroed(
+        device: &ProtocolObject<dyn MTLDevice>,
+        plane: ZeroPlane,
+    ) -> Result<Self, MetalError> {
+        let buffer = Self::uninitialized(device, plane.len())?;
+        unsafe {
+            std::ptr::write_bytes(
+                buffer.raw.contents().as_ptr().cast::<u64>(),
+                0,
+                buffer.words,
+            );
+        }
+        Ok(buffer)
     }
 
     /// Allocates `words` device words without staging a host-side zero buffer.
@@ -4103,6 +4164,7 @@ impl SharedBuffer {
             .ok_or_else(|| {
                 MetalError::Unavailable(format!("failed to allocate {bytes}-byte shared buffer"))
             })?;
+        crate::phase_marks::mark("device_alloc", bytes);
         Ok(Self { raw, words })
     }
 
@@ -4161,6 +4223,27 @@ struct DominantArenaDiagnosticLayout {
     resume_scan_offset: usize,
     /// P17 merge: the merge-audit rows in `stream_state`.
     merge_audit_offset: usize,
+}
+
+/// Planes readback never reads (P18 3(b)): control (screened first), flows, routes, links,
+/// outbox, worklist, remote metadata and staging, inbound metadata and producers, merge cursors.
+const UNREAD_PLANES: [usize; 11] = [0, 4, 5, 6, 12, 13, 19, 20, 22, 23, 24];
+
+/// The planes readback reads whole or in a metadata prefix, before the gathered arenas.
+const WHOLE_PLANES: [usize; 11] = [1, 2, 3, 7, 9, 11, 14, 18, 21, 25, 27];
+
+/// A plane readback has not released yet.
+fn live_plane(planes: &[Option<SharedBuffer>], index: usize) -> &SharedBuffer {
+    planes[index]
+        .as_ref()
+        .expect("readback reads only planes it has not released")
+}
+
+/// Releases readback's planes `indices` (P18 3(b)).
+fn release_planes(planes: &mut [Option<SharedBuffer>], indices: &[usize]) {
+    for &index in indices {
+        planes[index] = None;
+    }
 }
 
 impl MetalBuffers {
@@ -4255,38 +4338,45 @@ impl MetalBuffers {
             plan.params[14] != 0,
         );
         let tcp_state = SharedBuffer::new(device, plan.tcp_state)?;
-        let planes = vec![
-            plan.control,
-            plan.params,
-            plan.node_state,
-            plan.generators,
-            plan.flows,
-            plan.routes,
-            plan.links,
-            plan.fel_meta,
-            plan.fel_records,
-            plan.queue_meta,
-            plan.queue_records,
-            plan.in_service,
-            plan.outbox,
-            plan.worklist,
-            plan.summary,
-            plan.observed,
-            plan.departures,
-            plan.arrivals,
-            plan.lp_state,
-            plan.remote_meta,
-            plan.remote_staging,
-            plan.observation_meta,
-            plan.inbound_meta,
-            plan.inbound_producers,
-            plan.merge_cursors,
-            plan.stream_state,
-            plan.stream_records,
-            plan.scheduler_state,
+        // P18 c2a: an all-zero plane is allocated and zeroed on the device; only the planes the
+        // planner wrote cross from the host.
+        let host = PlaneSource::Host;
+        let zero = PlaneSource::Zero;
+        let planes = [
+            host(plan.control),
+            host(plan.params),
+            host(plan.node_state),
+            host(plan.generators),
+            host(plan.flows),
+            host(plan.routes),
+            host(plan.links),
+            host(plan.fel_meta),
+            host(plan.fel_records),
+            host(plan.queue_meta),
+            host(plan.queue_records),
+            host(plan.in_service),
+            zero(plan.outbox),
+            zero(plan.worklist),
+            zero(plan.summary),
+            zero(plan.observed),
+            zero(plan.departures),
+            zero(plan.arrivals),
+            zero(plan.lp_state),
+            host(plan.remote_meta),
+            zero(plan.remote_staging),
+            host(plan.observation_meta),
+            host(plan.inbound_meta),
+            host(plan.inbound_producers),
+            zero(plan.merge_cursors),
+            host(plan.stream_state),
+            zero(plan.stream_records),
+            host(plan.scheduler_state),
         ]
         .into_iter()
-        .map(|words| SharedBuffer::new(device, words))
+        .map(|source| match source {
+            PlaneSource::Host(words) => SharedBuffer::new(device, words),
+            PlaneSource::Zero(plane) => SharedBuffer::zeroed(device, plane),
+        })
         .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             planes,
@@ -4359,12 +4449,13 @@ impl MetalBuffers {
     }
 
     fn finish(
-        &self,
+        self,
         direct: &DirectMetal,
-        image: &SimulationImage,
+        run_image: &mut RunImage<'_>,
         observation_mode: ObservationMode,
         timing: MetalTiming,
     ) -> Result<MetalRun, AttemptFailure> {
+        let image = run_image.image();
         // T20l fix 1: screen the attempt BEFORE the result arena crosses the bus.
         //
         // The control plane is a few dozen words; the result arena is 18.6-19.2 GB at the RQ9
@@ -4435,6 +4526,14 @@ impl MetalBuffers {
             );
         }
 
+        // P18 3(b): readback copies out only what the decode reads and releases each plane as soon
+        // as its words are on the host, so the decode, which builds the result, runs with the
+        // device plan freed rather than beside it. A plane readback never reads is released now;
+        // the rest after their reads below.
+        let tcp_state = self.tcp_state;
+        let mut planes = self.planes.into_iter().map(Some).collect::<Vec<_>>();
+        release_planes(&mut planes, &UNREAD_PLANES);
+
         // T20l fix 2: on a SUCCESSFUL attempt, copy the LIVE regions rather than the arena.
         //
         // T20l phase 1 §4.2 measured this readback at 2,394,309,899 words (19.15 GB) on the RQ9
@@ -4465,22 +4564,22 @@ impl MetalBuffers {
         // Byte-identity: the gather reproduces the decode's own slot arithmetic (see
         // `device_compaction`), so the same records reach the same decoders in the same order.
         // Nothing about WHICH words are decoded changes; only which words cross the bus.
-        let params = self.planes[1].read();
-        let node_state = self.planes[2].read();
-        let generators = self.planes[3].read();
-        let fel_meta = self.planes[7].read();
-        let queue_meta = self.planes[9].read();
-        let in_service = self.planes[11].read();
-        let summary_words = self.planes[14].read();
-        let lp_state = self.planes[18].read();
-        let observation_meta = self.planes[21].read();
+        let params = live_plane(&planes, 1).read();
+        let node_state = live_plane(&planes, 2).read();
+        let generators = live_plane(&planes, 3).read();
+        let fel_meta = live_plane(&planes, 7).read();
+        let queue_meta = live_plane(&planes, 9).read();
+        let in_service = live_plane(&planes, 11).read();
+        let summary_words = live_plane(&planes, 14).read();
+        let lp_state = live_plane(&planes, 18).read();
+        let observation_meta = live_plane(&planes, 21).read();
         // Only the per-stream ring metadata prefix of `stream_state` is decoded; the LP stream
         // lists, outbound metadata, channel batches, staging channels and channel targets that
         // follow it are device scratch. At the frontier that prefix is 1,667,976 of the plane's
         // 52,426,754 words. The extent is the planner's own `stream_count` — the same bound the
         // decode loop below already walks — not an inferred one.
         let stream_meta_range = metadata_region(
-            self.planes[25].words,
+            live_plane(&planes, 25).words,
             0,
             self.stream_layout
                 .stream_count
@@ -4489,44 +4588,41 @@ impl MetalBuffers {
         )
         .map_err(compaction_error)?;
         let stream_state =
-            self.planes[25].read_range(stream_meta_range.start, stream_meta_range.len());
-        let scheduler_state = self.planes[27].read();
+            live_plane(&planes, 25).read_range(stream_meta_range.start, stream_meta_range.len());
+        let scheduler_state = live_plane(&planes, 27).read();
+        release_planes(&mut planes, &WHOLE_PLANES);
 
         let node_count = image.nodes.len();
         let flow_count = image.flows.len();
         let receiver_base = params[PARAM_RECEIVER_OFFSET] as usize;
         let ledger_meta_offset = params[PARAM_LEDGER_META_OFFSET] as usize;
         let receiver_range = metadata_region(
-            self.tcp_state.words,
+            tcp_state.words,
             receiver_base,
             flow_count.saturating_mul(TCP_RECEIVER_WORDS),
             "per-flow TCP receiver state",
         )
         .map_err(compaction_error)?;
-        let receiver_state = self
-            .tcp_state
-            .read_range(receiver_range.start, receiver_range.len());
+        let receiver_state = tcp_state.read_range(receiver_range.start, receiver_range.len());
         let ledger_meta_range = metadata_region(
-            self.tcp_state.words,
+            tcp_state.words,
             ledger_meta_offset,
             flow_count.saturating_mul(TCP_LEDGER_META_WORDS),
             "per-flow TCP ledger metadata",
         )
         .map_err(compaction_error)?;
-        let ledger_meta = self
-            .tcp_state
-            .read_range(ledger_meta_range.start, ledger_meta_range.len());
+        let ledger_meta = tcp_state.read_range(ledger_meta_range.start, ledger_meta_range.len());
         // P16 G1: the stage rows, read only when the plan holds a stage region (a stageless image
         // issues the same reads as before).
         let stage_rows = if params[PARAM_STAGE_OFFSET] != NONE {
             let range = metadata_region(
-                self.tcp_state.words,
+                tcp_state.words,
                 params[PARAM_STAGE_OFFSET] as usize,
                 crate::device_stage::stage_row_words(image),
                 "stage region rows",
             )
             .map_err(compaction_error)?;
-            Some(self.tcp_state.read_range(range.start, range.len()))
+            Some(tcp_state.read_range(range.start, range.len()))
         } else {
             None
         };
@@ -4534,13 +4630,13 @@ impl MetalBuffers {
         // the same reads as before).
         let roce_region = if params[PARAM_ROCE_OFFSET] != NONE {
             let range = metadata_region(
-                self.tcp_state.words,
+                tcp_state.words,
                 params[PARAM_ROCE_OFFSET] as usize,
                 crate::device_mechanism::roce_region_words(image),
                 "RoCE receiver region",
             )
             .map_err(compaction_error)?;
-            Some(self.tcp_state.read_range(range.start, range.len()))
+            Some(tcp_state.read_range(range.start, range.len()))
         } else {
             None
         };
@@ -4549,7 +4645,7 @@ impl MetalBuffers {
             "FEL record",
             CompactionShape::Linear,
             EVENT_WORDS,
-            self.planes[8].words,
+            live_plane(&planes, 8).words,
             node_count,
             |lp| {
                 let base = lp * ARENA_META_WORDS;
@@ -4565,7 +4661,7 @@ impl MetalBuffers {
             "queue record",
             CompactionShape::Ring,
             EVENT_WORDS,
-            self.planes[10].words,
+            live_plane(&planes, 10).words,
             node_count,
             |lp| {
                 let base = lp * QUEUE_META_WORDS;
@@ -4580,21 +4676,21 @@ impl MetalBuffers {
         let channel_stream_plan = stream_compaction_plan(
             "channel stream record",
             CHANNEL_EVENT_WORDS,
-            self.planes[26].words,
+            live_plane(&planes, 26).words,
             0..self.stream_layout.service_stream_base,
             &stream_state,
         )?;
         let service_stream_plan = stream_compaction_plan(
             "service stream record",
             SERVICE_EVENT_WORDS,
-            self.planes[26].words,
+            live_plane(&planes, 26).words,
             self.stream_layout.service_stream_base..self.stream_layout.generator_stream_base,
             &stream_state,
         )?;
         let generator_stream_plan = stream_compaction_plan(
             "generator stream record",
             GENERATOR_EVENT_WORDS,
-            self.planes[26].words,
+            live_plane(&planes, 26).words,
             self.stream_layout.generator_stream_base..self.stream_layout.stream_count,
             &stream_state,
         )?;
@@ -4615,7 +4711,7 @@ impl MetalBuffers {
                     }
                 })
                 .collect(),
-            self.tcp_state.words,
+            tcp_state.words,
         )
         .map_err(compaction_error)?;
         let receiver_range_plan = CompactionPlan::new(
@@ -4633,7 +4729,7 @@ impl MetalBuffers {
                     }
                 })
                 .collect(),
-            self.tcp_state.words,
+            tcp_state.words,
         )
         .map_err(compaction_error)?;
         let observation_plans = [
@@ -4646,7 +4742,7 @@ impl MetalBuffers {
                 arena,
                 CompactionShape::Linear,
                 record_words,
-                self.planes[plane].words,
+                live_plane(&planes, plane).words,
                 if observation_mode == ObservationMode::Full {
                     node_count
                 } else {
@@ -4669,16 +4765,16 @@ impl MetalBuffers {
         };
 
         let gathered = direct.compact(&[
-            (&self.planes[8], &fel_plan),
-            (&self.planes[10], &queue_plan),
-            (&self.planes[26], &channel_stream_plan),
-            (&self.planes[26], &service_stream_plan),
-            (&self.planes[26], &generator_stream_plan),
-            (&self.tcp_state, &ledger_plan),
-            (&self.tcp_state, &receiver_range_plan),
-            (&self.planes[15], &observed_plan),
-            (&self.planes[16], &departure_plan),
-            (&self.planes[17], &arrival_plan),
+            (live_plane(&planes, 8), &fel_plan),
+            (live_plane(&planes, 10), &queue_plan),
+            (live_plane(&planes, 26), &channel_stream_plan),
+            (live_plane(&planes, 26), &service_stream_plan),
+            (live_plane(&planes, 26), &generator_stream_plan),
+            (&tcp_state, &ledger_plan),
+            (&tcp_state, &receiver_range_plan),
+            (live_plane(&planes, 15), &observed_plan),
+            (live_plane(&planes, 16), &departure_plan),
+            (live_plane(&planes, 17), &arrival_plan),
         ])?;
         let [
             fel_records,
@@ -4694,19 +4790,25 @@ impl MetalBuffers {
         ]: [Vec<u64>; 10] = gathered
             .try_into()
             .expect("compaction returns one buffer per request");
+        // Every word the decode reads is on the host: the device plan is released before it.
+        drop(planes);
+        drop(tcp_state);
 
-        let mut host_states = image.host_states.clone();
+        // P18 c5: the result's host and switch states are the run image's own, moved out of a
+        // validated image the run consumes, or a clone of a borrowed one; the decoders below read
+        // the input states only through them, each before writing it.
+        let (mut host_states, mut switch_states) = run_image.take_states();
+        let image = run_image.image();
         // P16 G1: stage state first, so the queue-pair decoder knows which anchors a release moved
         // and the parked-set recomputation sees the decoded releases (design note §1.5).
-        if let Some(rows) = &stage_rows {
-            crate::device_stage::decode_stage_rows(rows, image, &mut host_states).map_err(
-                |_| MetalError::DeviceExecution {
+        let released = match &stage_rows {
+            None => Vec::new(),
+            Some(rows) => crate::device_stage::decode_stage_rows(rows, image, &mut host_states)
+                .map_err(|_| MetalError::DeviceExecution {
                     code: 96,
                     node: None,
-                },
-            )?;
-        }
-        let mut switch_states = image.switch_states.clone();
+                })?,
+        };
         let mut resident = self
             .orphan_packets
             .iter()
@@ -4747,8 +4849,7 @@ impl MetalBuffers {
                     state.sourced_packets = node_state[base + 7];
                     state.departed_packets = node_state[base + 8];
                     state.received_packets = node_state[base + 9];
-                    let input = &image.host_states[node.state_slot as usize];
-                    for (position, generator) in state.generators.iter_mut().enumerate() {
+                    for generator in &mut state.generators {
                         let offset = generator.flow.0 as usize * GENERATOR_WORDS;
                         generator.packets_emitted = generators[offset + 2];
                         generator.bytes_emitted = generators[offset + 3];
@@ -4815,10 +4916,10 @@ impl MetalBuffers {
                                 crate::device_mechanism::decode_roce_generator(
                                     &generators[offset..offset + GENERATOR_WORDS],
                                     roce,
-                                    crate::device_stage::released_during_run(
-                                        input.stage(position),
-                                        state.stages.get(position).copied().flatten(),
-                                    ),
+                                    released
+                                        .get(generator.flow.0 as usize)
+                                        .copied()
+                                        .unwrap_or(false),
                                 )
                                 .map_err(|_| {
                                     MetalError::DeviceExecution {
