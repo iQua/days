@@ -1268,16 +1268,28 @@ struct OwnerIngress {
 
 #[derive(Clone)]
 struct StaticOwnerRoute {
-    remote: Sender<StaticOwnerBatch>,
+    remote: Sender<OwnerMessage>,
 }
 
 struct StaticOwnerIngress {
-    remote: Receiver<StaticOwnerBatch>,
+    remote: Receiver<OwnerMessage>,
+}
+
+/// What a static worker's owner inbox carries.
+enum OwnerMessage {
+    /// Remote events for LPs this worker owns.
+    Batch(StaticOwnerBatch),
+    /// The emptied buffer of a batch this worker sent to `owner`, handed back as soon as `owner`
+    /// merged it: the next batch to `owner` reuses it, so no buffer is freed on another thread.
+    Returned {
+        owner: usize,
+        buffer: Vec<RemoteEnvelope>,
+    },
 }
 
 struct StaticOwnerBatch {
     round: u64,
-    /// The sending worker: the owner returns the emptied buffer to it in a later batch.
+    /// The sending worker, to which the owner hands the emptied buffer back.
     source: usize,
     envelopes: Vec<RemoteEnvelope>,
 }
@@ -1518,9 +1530,9 @@ struct WorkerShard<'image> {
     drain_scratch: DrainScratch,
     /// This round's outbound envelopes, one buffer per owner (static path).
     outboxes: Vec<Vec<RemoteEnvelope>>,
-    /// Emptied batch buffers from each source worker, sent back to that worker as the next batch
-    /// to it (static path). Buffers move between workers only inside messages.
-    returned_buffers: Vec<Vec<RemoteEnvelope>>,
+    /// Emptied buffers of batches this worker sent, handed back by each owner, at most two per
+    /// owner (static path). Buffers move between workers only inside messages.
+    returned_buffers: Vec<Vec<Vec<RemoteEnvelope>>>,
 }
 
 struct StaticPlacement {
@@ -2238,6 +2250,7 @@ fn owned_worker_loop<'image>(
             &mut shard,
             &commands,
             &ingress,
+            routes,
             &mut pending_batches,
             completed_round,
             placement,
@@ -2288,12 +2301,14 @@ fn owned_worker_loop<'image>(
                     }
                     // Send this round's buffer, and keep the one the owner returned last; while
                     // the owner has returned none, one allocation sized like this batch.
-                    let mut next = std::mem::take(&mut shard.returned_buffers[owner]);
-                    if next.capacity() == 0 {
-                        #[cfg(feature = "planner-test-hooks")]
-                        count_batch_buffer(0);
-                        next = Vec::with_capacity(shard.outboxes[owner].len());
-                    }
+                    let next = match shard.returned_buffers[owner].pop() {
+                        Some(buffer) => buffer,
+                        None => {
+                            #[cfg(feature = "planner-test-hooks")]
+                            count_batch_buffer(0);
+                            Vec::with_capacity(shard.outboxes[owner].len())
+                        }
+                    };
                     let envelopes = std::mem::replace(&mut shard.outboxes[owner], next);
                     outbound_owners.insert(owner);
                     next_minimum_ns = envelopes
@@ -2303,11 +2318,11 @@ fn owned_worker_loop<'image>(
                         .min();
                     if route
                         .remote
-                        .send(StaticOwnerBatch {
+                        .send(OwnerMessage::Batch(StaticOwnerBatch {
                             round,
                             source: shard.worker,
                             envelopes,
-                        })
+                        }))
                         .is_err()
                     {
                         let _ = replies.send(OwnedWorkerReply::Failed {
@@ -2391,6 +2406,7 @@ fn receive_owned_command_and_merge(
     shard: &mut WorkerShard<'_>,
     commands: &Receiver<OwnedWorkerCommand>,
     ingress: &StaticOwnerIngress,
+    routes: &[StaticOwnerRoute],
     pending_batches: &mut VecDeque<StaticOwnerBatch>,
     completed_round: Option<(u64, u128)>,
     placement: &StaticPlacement,
@@ -2413,28 +2429,39 @@ fn receive_owned_command_and_merge(
             .pop_front()
             .expect("pending batch count was captured");
         if batch.round == completed_round {
-            merge_static_owner_batch(shard, batch, remote_floor_ns, placement, true, &mut metrics)?;
+            merge_static_owner_batch(
+                shard,
+                batch,
+                remote_floor_ns,
+                placement,
+                true,
+                &mut metrics,
+                routes,
+            )?;
         } else {
             pending_batches.push_back(batch);
         }
     }
+    let inbox = OwnerInbox {
+        completed_round,
+        remote_floor_ns,
+        placement,
+        routes,
+    };
+    // Everything already queued first, so a buffer handed back before this wait is kept now.
+    while let Ok(message) = ingress.remote.try_recv() {
+        inbox.take(shard, message, true, &mut metrics, pending_batches)?;
+    }
 
     for _ in 0..spin_before_park {
-        while let Ok(batch) = ingress.remote.try_recv() {
-            if batch.round == completed_round {
-                merge_static_owner_batch(
-                    shard,
-                    batch,
-                    remote_floor_ns,
-                    placement,
-                    command.is_none(),
-                    &mut metrics,
-                )?;
-            } else if batch.round == completed_round.saturating_add(1) {
-                pending_batches.push_back(batch);
-            } else {
-                return Err(ExecutionError::WorkerChannelDisconnected);
-            }
+        while let Ok(message) = ingress.remote.try_recv() {
+            inbox.take(
+                shard,
+                message,
+                command.is_none(),
+                &mut metrics,
+                pending_batches,
+            )?;
         }
         if command.is_none() {
             match commands.try_recv() {
@@ -2477,25 +2504,62 @@ fn receive_owned_command_and_merge(
                 return Err(ExecutionError::WorkerChannelDisconnected);
             }
         } else if selected.index() == ingress_index {
-            let batch = selected
+            let message = selected
                 .recv(&ingress.remote)
                 .map_err(|_| ExecutionError::WorkerChannelDisconnected)?;
-            if batch.round == completed_round {
+            inbox.take(
+                shard,
+                message,
+                command.is_none(),
+                &mut metrics,
+                pending_batches,
+            )?;
+        } else {
+            unreachable!("the static wait selects only command and owner-inbox channels");
+        }
+    }
+}
+
+/// A static worker's view of its owner inbox while it waits for the next command.
+struct OwnerInbox<'wait> {
+    completed_round: u64,
+    remote_floor_ns: u128,
+    placement: &'wait StaticPlacement,
+    routes: &'wait [StaticOwnerRoute],
+}
+
+impl OwnerInbox<'_> {
+    /// A batch of the completed round is merged, a batch of the next round is held, and a
+    /// handed-back buffer is kept for the next batch to its owner.
+    fn take(
+        &self,
+        shard: &mut WorkerShard<'_>,
+        message: OwnerMessage,
+        early: bool,
+        metrics: &mut InboundMergeMetrics,
+        pending_batches: &mut VecDeque<StaticOwnerBatch>,
+    ) -> Result<(), ExecutionError> {
+        match message {
+            OwnerMessage::Returned { owner, buffer } => {
+                shard.keep_returned(owner, buffer);
+                Ok(())
+            }
+            OwnerMessage::Batch(batch) if batch.round == self.completed_round => {
                 merge_static_owner_batch(
                     shard,
                     batch,
-                    remote_floor_ns,
-                    placement,
-                    command.is_none(),
-                    &mut metrics,
-                )?;
-            } else if batch.round == completed_round.saturating_add(1) {
-                pending_batches.push_back(batch);
-            } else {
-                return Err(ExecutionError::WorkerChannelDisconnected);
+                    self.remote_floor_ns,
+                    self.placement,
+                    early,
+                    metrics,
+                    self.routes,
+                )
             }
-        } else {
-            unreachable!("the static wait selects only command and owner-inbox channels");
+            OwnerMessage::Batch(batch) if batch.round == self.completed_round.saturating_add(1) => {
+                pending_batches.push_back(batch);
+                Ok(())
+            }
+            OwnerMessage::Batch(_) => Err(ExecutionError::WorkerChannelDisconnected),
         }
     }
 }
@@ -2519,6 +2583,7 @@ fn merge_static_owner_batch(
     placement: &StaticPlacement,
     early: bool,
     metrics: &mut InboundMergeMetrics,
+    routes: &[StaticOwnerRoute],
 ) -> Result<(), ExecutionError> {
     let started = Instant::now();
     let StaticOwnerBatch {
@@ -2530,7 +2595,7 @@ fn merge_static_owner_batch(
     let carried = envelopes.len();
     let (frontier_updates, heap_pops, physical_lp_probes) =
         shard.merge_static_remote(&mut envelopes, remote_floor_ns, placement)?;
-    shard.return_buffer(source, envelopes, carried);
+    shard.give_back(source, envelopes, carried, routes);
     debug_assert_eq!(heap_pops, 0, "a merge pops no frontier entry");
     metrics.frontier_updates = metrics.frontier_updates.saturating_add(frontier_updates);
     metrics.physical_lp_probes = metrics
@@ -4998,8 +5063,9 @@ fn a_returned_batch_buffer_keeps_its_capacity_unless_far_larger_than_its_batch()
             envelopes,
         };
         let mut metrics = InboundMergeMetrics::default();
-        merge_static_owner_batch(&mut shard, batch, 0, &placement, true, &mut metrics).unwrap();
-        let kept = shard.returned_buffers[0].capacity();
+        merge_static_owner_batch(&mut shard, batch, 0, &placement, true, &mut metrics, &[])
+            .unwrap();
+        let kept = shard.returned_buffers[0][0].capacity();
         assert!(
             (least..=most).contains(&kept),
             "a {length}-envelope batch in a {capacity}-envelope buffer kept {kept}"
@@ -5315,23 +5381,45 @@ impl<'image> WorkerShard<'image> {
         })
     }
 
-    /// Keeps an emptied batch buffer, which carried `carried` envelopes, for the next batch to
-    /// `source`. A buffer more than four times its batch (or 64 envelopes) is cut to twice that,
-    /// so a burst does not pin memory after it.
-    fn return_buffer(&mut self, source: usize, mut buffer: Vec<RemoteEnvelope>, carried: usize) {
-        let Some(slot) = self.returned_buffers.get_mut(source) else {
-            return;
-        };
+    /// Hands an emptied batch buffer, which carried `carried` envelopes, back to its `source`:
+    /// kept here when this worker sent it to itself, otherwise sent in a message. A buffer more
+    /// than four times its batch (or 64 envelopes) is first cut to twice that, so a burst does
+    /// not pin memory after it.
+    fn give_back(
+        &mut self,
+        source: usize,
+        mut buffer: Vec<RemoteEnvelope>,
+        carried: usize,
+        routes: &[StaticOwnerRoute],
+    ) {
         let used = carried.max(64);
         buffer.clear();
         if buffer.capacity() > 4 * used {
             buffer.shrink_to(2 * used);
         }
-        #[cfg(feature = "planner-test-hooks")]
-        if slot.capacity() != 0 {
+        if source == self.worker {
+            self.keep_returned(source, buffer);
+        } else if let Some(route) = routes.get(source) {
+            // A source that has already finished drops the message, and the buffer with it.
+            let _ = route.remote.send(OwnerMessage::Returned {
+                owner: self.worker,
+                buffer,
+            });
+        }
+    }
+
+    /// Keeps a handed-back buffer for the next batch to `owner`; beyond two per owner it is
+    /// dropped.
+    fn keep_returned(&mut self, owner: usize, buffer: Vec<RemoteEnvelope>) {
+        let Some(kept) = self.returned_buffers.get_mut(owner) else {
+            return;
+        };
+        if kept.len() < 2 {
+            kept.push(buffer);
+        } else {
+            #[cfg(feature = "planner-test-hooks")]
             count_batch_buffer(1);
         }
-        *slot = buffer;
     }
 
     fn merge_static_remote(
