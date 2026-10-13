@@ -13,6 +13,15 @@
 //! The index hashes with a fixed multiply-shift (`bucket_of`), so even the layout is a pure
 //! function of the operations.
 //!
+//! **Load.** The index doubles before it is more than half full (P18 ackfix). A Scalar run's
+//! sources keep sliding windows of consecutive sequences resident, which multiply-shift hashing
+//! lays out as shifted copies of one lattice, and linear probing turns a nearly full index of
+//! them into long runs: at the earlier 7/8 bound the dp1 corpus slice took 8.1 probes per lookup
+//! and +15% instructions once fewer packets stayed resident. At half full lookups take about one
+//! probe. The cost is index memory: the 16-B buckets come to 32 to 64 B per resident packet
+//! rather than 18 to 37 B, and a store takes its growth steps (one allocation each) at lower
+//! high-water counts.
+//!
 //! **Exactness.** The store answers point lookups only and has no iteration API; the one way out
 //! is `into_sorted`, which consumes it and returns the packets in ascending payload order, the
 //! order of the `BTreeMap` it replaces. No output can depend on the layout.
@@ -63,7 +72,7 @@ enum Slot<V> {
 }
 
 struct Slab<V> {
-    /// The index: a power-of-two count of buckets, at most 7/8 full.
+    /// The index: a power-of-two count of buckets, at most half full.
     buckets: Vec<Bucket>,
     /// 64 minus log2 of the bucket count: `bucket_of`'s shift.
     shift: u32,
@@ -170,7 +179,7 @@ impl<V> Slab<V> {
                 Slot::Vacant(_) => unreachable!("an indexed slot holds a packet"),
             };
         }
-        if (self.len + 1) * 8 > self.buckets.len() * 7 {
+        if (self.len + 1) * 2 > self.buckets.len() {
             self.grow();
         }
         let slot = if self.free == NO_SLOT {
@@ -532,11 +541,11 @@ mod tests {
     /// windows, as a Scalar run's do. Sixteen sources of a 1,280-node image (nodes 0, 8, ..., 120,
     /// as on the dp1 corpus slice) keep 219 consecutive sequences each resident (3,504 packets);
     /// each round every source retires its oldest packet, sources its next and looks up four of
-    /// its resident ones. With the index grown only past 7/8 full, 3,504 packets sit at 0.86 of
-    /// 4,096 buckets and linear probing walks long runs: 12.1 probes per lookup (9.7 with a
-    /// splitmix64 hash instead of Fibonacci hashing), which made the dp1 slice's Scalar run +15%
-    /// instructions once F1 left fewer packets resident. The store must also drain in payload
-    /// order whatever its layout.
+    /// its resident ones. Had the index grown only past 7/8 full, 3,504 packets would sit at 0.86
+    /// of 4,096 buckets and linear probing would walk long runs: 12.1 probes per lookup (9.7 with
+    /// a splitmix64 hash instead of Fibonacci hashing), which made the dp1 slice's Scalar run +15%
+    /// instructions once F1 left fewer packets resident. Grown at half full, they sit in 8,192
+    /// buckets. The store must also drain in payload order whatever its layout.
     #[test]
     fn sliding_source_windows_keep_lookups_short() {
         const NODES: u64 = 1_280;
