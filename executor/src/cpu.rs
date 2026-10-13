@@ -2502,9 +2502,11 @@ fn merge_static_owner_batch(
         mut envelopes,
         ..
     } = batch;
+    // The merge leaves the batch empty; its buffer is sized by the batch it carried.
+    let carried = envelopes.len();
     let (frontier_updates, heap_pops, physical_lp_probes) =
         shard.merge_static_remote(&mut envelopes, remote_floor_ns, placement)?;
-    shard.return_buffer(source, envelopes);
+    shard.return_buffer(source, envelopes, carried);
     debug_assert_eq!(heap_pops, 0, "a merge pops no frontier entry");
     metrics.frontier_updates = metrics.frontier_updates.saturating_add(frontier_updates);
     metrics.physical_lp_probes = metrics
@@ -5289,14 +5291,14 @@ impl<'image> WorkerShard<'image> {
         })
     }
 
-    /// Keeps an emptied batch buffer for the next batch to `source`. A buffer much larger than
-    /// its last use is shrunk, so a burst cannot pin memory: each worker holds at most two
-    /// buffers per peer (its outbox and one returned buffer).
-    fn return_buffer(&mut self, source: usize, mut buffer: Vec<RemoteEnvelope>) {
+    /// Keeps an emptied batch buffer, which carried `carried` envelopes, for the next batch to
+    /// `source`. A buffer more than four times its batch (or 64 envelopes) is cut to twice that,
+    /// so a burst does not pin memory after it.
+    fn return_buffer(&mut self, source: usize, mut buffer: Vec<RemoteEnvelope>, carried: usize) {
         let Some(slot) = self.returned_buffers.get_mut(source) else {
             return;
         };
-        let used = buffer.len().max(64);
+        let used = carried.max(64);
         buffer.clear();
         if buffer.capacity() > 4 * used {
             buffer.shrink_to(2 * used);
