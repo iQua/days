@@ -6766,15 +6766,21 @@ impl<'image> TransitionState<'image> {
             position
         } else {
             // After the last packet from the tail whose key is not greater; a queued control
-            // packet ranks first, so the scan stops at it.
-            queue
-                .iter()
-                .rposition(|queued| {
-                    self.packets.get(queued).is_some_and(|resident| {
-                        resident.descriptor.kind.is_roce_control() || queued_key(resident) <= key
-                    })
+            // packet ranks first, so the scan stops at it. The tail itself is that packet unless
+            // packets were sourced at this instant with greater keys, so it is tested first.
+            let precedes = |queued: &PayloadId| {
+                self.packets.get(queued).is_some_and(|resident| {
+                    resident.descriptor.kind.is_roce_control() || queued_key(resident) <= key
                 })
-                .map_or(0, |position| position + 1)
+            };
+            if queue.back().is_none_or(precedes) {
+                queue.len()
+            } else {
+                queue
+                    .iter()
+                    .rposition(precedes)
+                    .map_or(0, |position| position + 1)
+            }
         };
         let state = self.host_state_mut(node)?;
         if position < state.queue.len() {
