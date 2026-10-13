@@ -1596,12 +1596,31 @@ inline bool queue_push(
     return true;
 }
 
+// P18 decision D16b (window-throttle design F1): a RoCE ACK, RoCE NACK or DCQCN CNP, the kinds
+// `pfc_class_of` sends on the feedback class (Scalar `PacketKind::is_roce_control`), from the kind
+// word with the ECN flag masked.
+inline bool roce_control_kind(ulong kind_word) {
+    ulong kind = kind_word & PK_KIND_MASK;
+    return kind == DCQCN_CNP_PACKET || kind == ROCE_ACK_PACKET || kind == ROCE_NACK_PACKET;
+}
+
+// Scalar `enqueue_source_packet`'s key `(rank, has_source_time, source_time_ns, flow, id)`: the
+// source time and its presence are `E_TIME` and `E_PHASE` (a restored packet holds phase 0). The
+// rank (decision D16b) puts control packets ahead of every other packet; only the mechanisms build
+// can hold one, so the plain build compiles it out. `right_control` is the inserted record's.
 inline bool source_queue_key_less_or_equal(
     const device ulong *records,
     ulong left_slot,
-    const thread ulong *right
+    const thread ulong *right,
+    bool right_control
 ) {
     ulong left = left_slot * EVENT_WORDS;
+    if (DAYS_MECHANISMS) {
+        bool left_control = roce_control_kind(records[left + PK_KIND]);
+        if (left_control != right_control) {
+            return left_control;
+        }
+    }
     if (records[left + E_PHASE] != right[E_PHASE]) {
         return records[left + E_PHASE] < right[E_PHASE];
     }
@@ -1631,11 +1650,12 @@ inline bool source_queue_insert(
         set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
         return false;
     }
+    bool control = DAYS_MECHANISMS && roce_control_kind(record[PK_KIND]);
     ulong insertion = count;
     while (insertion != 0) {
         ulong previous = insertion - 1;
         ulong previous_slot = offset + (head + previous) % max(capacity, 1ul);
-        if (source_queue_key_less_or_equal(records, previous_slot, record)) {
+        if (source_queue_key_less_or_equal(records, previous_slot, record, control)) {
             break;
         }
         ulong destination = offset + (head + insertion) % max(capacity, 1ul);
