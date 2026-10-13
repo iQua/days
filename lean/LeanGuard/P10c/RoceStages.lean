@@ -7,9 +7,9 @@ namespace LeanGuard.P10c.RoceStages
 Collective stages over RoCE queue pairs (schema Amendment 4): the joins between a run's collective
 progress log and its queue-pair logs, checked in trace mode with `--collective`.
 
-A stage queue pair's sender, receiver and DCQCN rows are a plain queue pair's rows whose
-`first_pacing_time_ns` is the release instant (ruling C2), so `RoceEventLog` checks them as it
-checks any pair. What only the joint logs show is that each pair starts when its stage is
+A stage queue pair's sender, receiver and DCQCN rows are a plain queue pair's rows whose grid
+anchor (`first_pacing_time_ns` on its first row; qp-schema Amendment 8 makes it state) is the
+release instant (ruling C2), so `RoceEventLog` checks them as it checks any pair. What only the joint logs show is that each pair starts when its stage is
 released and finishes where its successor sees it finish:
 
 * **Release.** A released RoCE stage's queue pair runs its first pacing tick at the release
@@ -97,7 +97,7 @@ def checkStages (horizonNs : Option Nat) (collective : List CollectiveEventLog.R
         | some first =>
             at_
               (first.kind = .tick && first.key.timeNs = row.key.timeNs &&
-                first.config.firstPacingTimeNs = row.key.timeNs)
+                first.before.gridAnchorNs = row.key.timeNs)
               s!"RoCE stage queue pair's first pacing tick is not at its release instant, on a grid anchored there (node_id={row.nodeId}, flow_id={row.flowId})"
             at_ (first.before.status = senderStatus row.afterStatus)
               s!"RoCE stage release status is not its queue pair's armed status at its first tick (node_id={row.nodeId}, flow_id={row.flowId})"

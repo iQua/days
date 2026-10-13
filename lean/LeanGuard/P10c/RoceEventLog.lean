@@ -277,7 +277,9 @@ structure SenderRow where
   srcLine : Nat
   deriving DecidableEq, Repr
 
-def parseSenderState (fieldPrefix : String) (idx : Std.HashMap String Nat)
+/-- One side of a sender row's state. `anchorColumn` holds its grid anchor (Amendment 8:
+`first_pacing_time_ns` before the transition, `after_grid_anchor_ns` after it). -/
+def parseSenderState (fieldPrefix anchorColumn : String) (idx : Std.HashMap String Nat)
     (fields : Array String) : Except String Roce.SenderState := do
   pure
     { nextPsn := ← parseU64 (← getField idx fields s!"{fieldPrefix}_next_psn")
@@ -288,7 +290,8 @@ def parseSenderState (fieldPrefix : String) (idx : Std.HashMap String Nat)
       rtoDeadlineNs := ← parseOptU64 (← getField idx fields s!"{fieldPrefix}_rto_deadline_ns")
       pacer := ← parsePacer (← getField idx fields s!"{fieldPrefix}_pacer")
       nextTickNs := ← parseOptU64 (← getField idx fields s!"{fieldPrefix}_next_tick_ns")
-      status := ← parseStatus (← getField idx fields s!"{fieldPrefix}_status") }
+      status := ← parseStatus (← getField idx fields s!"{fieldPrefix}_status")
+      gridAnchorNs := ← parseU64 (← getField idx fields anchorColumn) }
 
 def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array String) :
     Except String SenderRow := withLine lineNo do
@@ -327,7 +330,6 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
         { mtuBytes := ← parseU64 (← getField idx fields "mtu_bytes")
           totalBytes := ← parseU64 (← getField idx fields "total_bytes")
           pacingIntervalNs := ← parseU64 (← getField idx fields "pacing_interval_ns")
-          firstPacingTimeNs := ← parseU64 (← getField idx fields "first_pacing_time_ns")
           rtoNs := ← parseU64 (← getField idx fields "rto_ns")
           windowBytes := windowBytes
           variableWindow := variableWindow
@@ -340,13 +342,14 @@ def parseSenderRow (lineNo : Nat) (idx : Std.HashMap String Nat) (fields : Array
       emitted := emitted
       emission := emission
       emittedPayload := payload
-      before := ← parseSenderState "before" idx fields
-      after := ← parseSenderState "after" idx fields
+      before := ← parseSenderState "before" "first_pacing_time_ns" idx fields
+      after := ← parseSenderState "after" "after_grid_anchor_ns" idx fields
       srcLine := lineNo }
 
 /-- The sender schema (`roce_sender_transitions_csv`; `qp-schema-amendment-6.md`,
-`dcqcn-schema.md` Amendment 1, and P17's Amendment 7, the `congestion_control` column appended as
-column 46): every column the executor writes. -/
+`dcqcn-schema.md` Amendment 1, P17's Amendment 7, the `congestion_control` column appended as
+column 46, and P18's Amendment 8: `first_pacing_time_ns` is the grid anchor before the transition
+and `after_grid_anchor_ns`, column 47, the anchor after it): every column the executor writes. -/
 def senderSchema : List String := [
     "time_ns",
     "event_phase",
@@ -393,7 +396,8 @@ def senderSchema : List String := [
     "after_pacer",
     "after_next_tick_ns",
     "after_status",
-    "congestion_control"]
+    "congestion_control",
+    "after_grid_anchor_ns"]
 
 /-- The sender log must carry every column of `senderSchema`; the missing ones are named. P16 fix
 round 4 (the user's ruling) removed the pre-P16 sender layouts: no other format is read. -/
@@ -472,6 +476,10 @@ structure FlowTrack where
   pauseParked : Bool
   /-- Amendment 3: the pair's data class (constant per pair). -/
   dataClass : Nat
+  /-- Amendment 8 (P18 window-throttle F2): a window-blocked tick parked the pacer and no restart
+  attempt has run since (the executor's `window_parked`), so an ACK or NACK that moves `snd_una`
+  restarts it at its own instant, on a grid re-anchored there. -/
+  windowParked : Bool
 
 /--
 The events a pair has pending, as `(time, rank, name)`: the armed pacing tick and the armed
@@ -693,7 +701,8 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
     | none => do
         match row.rateBps with
         | some rate =>
-            at_ (row.kind = .tick && row.before = Roce.initialSender row.config rate)
+            at_ (row.kind = .tick &&
+                row.before = Roce.initialSender row.config row.before.gridAnchorNs rate)
               s!"RoCE sender first state is not initial (node_id={row.nodeId}, flow_id={row.flowId})"
             pure (some rate, 0, none)
         | none =>
@@ -701,7 +710,7 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
             -- rate. The initial state is checked in every field but its armed status, which
             -- bounds the rate until the rate is revealed.
             if row.kind = .tick && row.classPaused then
-              let initial := Roce.initialSender row.config 0
+              let initial := Roce.initialSender row.config row.before.gridAnchorNs 0
               at_ ({ initial with status := row.before.status } = row.before)
                 s!"RoCE sender first state is not initial (node_id={row.nodeId}, flow_id={row.flowId})"
               match Roce.statusThreshold row.config initial with
@@ -730,7 +739,7 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
       checkPending "sender" row.srcLine source
         { config := row.config, state := row.before, rateBps := knownRate, rateLow := rateLow,
           rateHigh := rateHigh, controller := none, pauseParked := false,
-          dataClass := row.dataClass }
+          dataClass := row.dataClass, windowParked := false }
         row.key.timeNs
   let pauseParked := prior.map (·.pauseParked) |>.getD false
   if row.kind = .resume then
@@ -766,6 +775,7 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
   else
     at_ (!row.windowBlocked) "RoCE window-blocked tick with nothing to send"
   let withinStop := row.after.pacer != .stopped
+  let windowParked := prior.any (·.windowParked)
   let expected :=
     match row.kind, row.inputAcknowledgment with
     | .tick, _ =>
@@ -773,9 +783,11 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
         else if row.windowBlocked then Roce.onWindowBlockedTick row.config rate row.before
         else Roce.onTick row.config rate rate row.key.timeNs withinStop row.before
     | .ack, some value =>
-        Roce.onFeedback row.config rate row.key.timeNs value false withinStop row.before
+        Roce.onFeedback row.config rate row.key.timeNs value false withinStop windowParked
+          row.before
     | .nack, some value =>
-        Roce.onFeedback row.config rate row.key.timeNs value true withinStop row.before
+        Roce.onFeedback row.config rate row.key.timeNs value true withinStop windowParked
+          row.before
     | .timeout, _ => Roce.onTimeout row.config rate row.key.timeNs withinStop row.before
     | .resume, _ => Roce.onResume row.config rate row.key.timeNs withinStop row.before
     | _, none => { state := row.before, emission := none, stopQuery := none }
@@ -813,6 +825,16 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
         | none => pure ()
         pure (track.lastPayload.insert row.nodeId payload)
   let nowPauseParked := row.classPaused || (pauseParked && row.after.pacer = .parked)
+  -- Amendment 8: a window-blocked tick sets the park; a restart attempt ends it (an ACK or NACK
+  -- that is not stale, or a timeout: the executor's `restart_roce_pacer`). Stale feedback keeps it.
+  let staleFeedback :=
+    match row.kind, row.inputAcknowledgment with
+    | .ack, some value => decide (value ≤ row.before.sndUna)
+    | .nack, some value => decide (value < row.before.sndUna)
+    | _, _ => false
+  let nowWindowParked :=
+    row.windowBlocked ||
+      (windowParked && (row.kind = .ack || row.kind = .nack) && staleFeedback)
   let pauseParkedIndex :=
     if nowPauseParked == pauseParked then track.pauseParkedIndex
     else
@@ -828,7 +850,8 @@ def checkSenderItem (stopTimeNs : Option Nat) (track : SenderTrack) (row : Sende
           rateHigh := rateHigh, controller := controller
           -- Set by a paused tick; cleared by any restart (the pacer leaves `parked`).
           pauseParked := nowPauseParked
-          dataClass := row.dataClass }
+          dataClass := row.dataClass
+          windowParked := nowWindowParked }
       lastPayload := lastPayload
       stop := stop }
 

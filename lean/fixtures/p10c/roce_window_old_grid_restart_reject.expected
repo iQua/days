@@ -1,0 +1,2 @@
+exit=1
+REJECT: sender: line 161: RoCE sender after-state mismatch
