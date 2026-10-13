@@ -5075,11 +5075,20 @@ inline void roce_settle(device ulong *row, ulong parked_status) {
 }
 
 // `restart_roce_pacer`: a parked pacer with packets to send restarts on the first point of its
-// pacing grid strictly after `now` (ruling D3). `tick` is the restarted tick's time, or NONE when
-// the pacer stays as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
-inline bool roce_restart(device ulong *row, ulong now, ulong stop, thread ulong &tick) {
+// pacing grid strictly after `now` (ruling D3), or, when `feedback` (an ACK or NACK that moved
+// `snd_una`) finds it parked by the window, at `now` on a grid re-anchored there (P18
+// window-throttle design F2). `tick` is the restarted tick's time, or NONE when the pacer stays
+// as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
+inline bool roce_restart(
+    device ulong *row,
+    ulong now,
+    ulong stop,
+    bool feedback,
+    thread ulong &tick
+) {
     tick = NONE;
     // Every restart attempt ends a window park (ruling D7).
+    bool window_parked = row[G_ROCE_WINDOW_PARKED] != 0;
     row[G_ROCE_WINDOW_PARKED] = 0;
     ulong total = row[G_RATE_TOTAL];
     if (row[G_ROCE_PACER_ARMED] != 0 || row[G_ROCE_NEXT_PSN] >= total ||
@@ -5089,7 +5098,11 @@ inline bool roce_restart(device ulong *row, ulong now, ulong stop, thread ulong 
     ulong first = row[G_RATE_FIRST];
     ulong interval = row[G_RATE_INTERVAL];
     ulong time = first;
-    if (now >= first) {
+    if (feedback && window_parked) {
+        // F2: the tick runs at the feedback's instant, on a grid anchored there.
+        row[G_RATE_FIRST] = now;
+        time = now;
+    } else if (now >= first) {
         // The 128-bit product, not a `> NONE / interval` test: LLVM folds that test into a 64-bit
         // multiply-with-overflow, which Apple's GPU backend cannot legalize.
         ulong ticks = (now - first) / interval;
@@ -5375,7 +5388,7 @@ inline bool roce_feedback_arrival(
                 row[G_ROCE_RTO_DEADLINE] = 0;
             }
         }
-        if (!roce_restart(row, now, params[P_STOP_TIME], tick)) {
+        if (!roce_restart(row, now, params[P_STOP_TIME], true, tick)) {
             set_semantic_error(error, 84, node);
             return false;
         }
@@ -5436,7 +5449,7 @@ inline bool roce_timeout(
     ulong timeout;
     ulong tick;
     if (!checked_add(now, row[G_ROCE_RTO], timeout) ||
-        !roce_restart(row, now, params[P_STOP_TIME], tick)) {
+        !roce_restart(row, now, params[P_STOP_TIME], false, tick)) {
         set_semantic_error(error, 85, node);
         return false;
     }
@@ -5678,7 +5691,7 @@ inline bool roce_resume_parked(
             // A phase-0 transition: the controller's due instants before the RESUME apply first.
             dcqcn_materialize_if_due(generator, false, event[E_TIME]);
             ulong tick;
-            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
+            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], false, tick)) {
                 set_semantic_error(error, 88, node);
                 return false;
             }

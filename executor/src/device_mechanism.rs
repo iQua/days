@@ -689,7 +689,9 @@ pub(crate) fn encode_roce_generator(roce: &crate::RoceGenerator, row: &mut [u64]
 /// `anchor_released` (P16 G1, design note G6) is true exactly when the pair is a collective stage
 /// that was unreleased in the input image and is released in the decoded stage state: its release
 /// moved the grid anchor `G_RATE_FIRST` from zero to the release time (rulings C2, C5), so the
-/// anchor is restored from the row. Every other pair keeps the anchor immutable.
+/// anchor is restored from the row. A pair with a window restores it from the row too: an ACK or
+/// NACK that restarts its window-parked pacer re-anchors the grid at its own instant (P18
+/// window-throttle design F2). Every other pair keeps the anchor immutable.
 pub(crate) fn decode_roce_generator(
     row: &[u64],
     roce: &mut crate::RoceGenerator,
@@ -697,7 +699,7 @@ pub(crate) fn decode_roce_generator(
 ) -> Result<(), &'static str> {
     let mut expected = [0_u64; 43];
     encode_roce_generator(roce, &mut expected);
-    if anchor_released {
+    if anchor_released || roce.window_bytes != 0 {
         expected[G_RATE_FIRST] = row[G_RATE_FIRST];
     }
     let immutable = [
@@ -2058,10 +2060,12 @@ mod tests {
 
     /// P16 G1 (design note G6): a gated stage's queue pair holds its grid anchor at zero until its
     /// release writes the release time. Its row decodes onto the input pair with the anchor
-    /// restored; the same change on an ordinary pair stays a corrupt row.
+    /// restored; the same change on an ordinary pair without a window stays a corrupt row.
     #[test]
     fn a_released_stage_row_restores_its_grid_anchor() {
         let mut gated = roce_generator();
+        gated.window_bytes = 0;
+        gated.variable_window = false;
         gated.pacer.first_pacing_time_ns = 0;
         gated.pacer_armed = false;
         gated.next_psn = 0;
@@ -2082,6 +2086,33 @@ mod tests {
         assert_eq!(decoded, released);
         let mut ordinary = gated;
         assert!(decode_roce_generator(&row, &mut ordinary, false).is_err());
+    }
+
+    /// P18 window-throttle F2: an ACK or NACK that restarts a window-parked pacer re-anchors its
+    /// grid at its own instant, so a windowed pair's row carries a moved anchor, which decodes.
+    #[test]
+    fn a_windowed_pair_row_restores_a_moved_grid_anchor() {
+        let parked = crate::RoceGenerator {
+            pacer_armed: false,
+            window_parked: true,
+            ..roce_generator()
+        };
+        assert_ne!(parked.window_bytes, 0);
+        let restarted = crate::RoceGenerator {
+            pacer: crate::RocePacer {
+                first_pacing_time_ns: parked.pacer.first_pacing_time_ns + 5,
+                ..parked.pacer
+            },
+            pacer_armed: true,
+            window_parked: false,
+            ..parked
+        };
+        let mut row = [0_u64; 43];
+        row[6] = restarted.pacing_timer_payload.0;
+        encode_roce_generator(&restarted, &mut row);
+        let mut decoded = parked;
+        decode_roce_generator(&row, &mut decoded, false).expect("a re-anchored row decodes");
+        assert_eq!(decoded, restarted);
     }
 
     /// P17 lane nocc: a pair without congestion control writes its mode in word 39, which a row
