@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use days::scenario::compile_config;
-use days_executor::{CpuConfig, run_cpu, run_scalar};
+use days_executor::{CpuConfig, CpuRoundRecords, run_cpu, run_scalar};
 
 fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -25,13 +25,14 @@ fn exact_executor_matches_key_on_legacy_st_terminal_observations() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 4,
             ..CpuConfig::default()
         },
     )
     .unwrap();
     assert_eq!(cpu.result, scalar);
-    assert_eq!(cpu.rounds.len(), 79_203);
+    assert_eq!(cpu.rounds().len(), 79_203);
 
     // Harvested from a release Nexosim ST key-on run of this exact fixture:
     // sources.csv sent 99,000 packets / 99,000,000 bytes, sinks.csv received the same,

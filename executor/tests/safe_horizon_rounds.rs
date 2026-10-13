@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use days_executor::{
     Backend, ChunkGranularity, ConstantGenerator, CpuConfig, CpuFaultInjection, CpuFaultKind,
-    Event, EventKey, EventKind, ExecutionError, FlowDescriptor, FlowGeneratorKind,
+    CpuRoundRecords, Event, EventKey, EventKind, ExecutionError, FlowDescriptor, FlowGeneratorKind,
     FlowGeneratorState, FlowId, GeneratorFeedbackState, GeneratorStatus, GeneratorTermination,
     HostState, LinkDescriptor, LinkId, NodeDescriptor, NodeId, NodeKind, ObservationMode,
     PacketDescriptor, PacketKind, PayloadId, RemoteChannel, ScheduledEmission, SchedulerKind,
@@ -525,6 +525,7 @@ fn cpu_handles_no_active_lps_and_more_workers_than_nodes() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 8,
             granularity: ChunkGranularity::Fixed(1),
             ..CpuConfig::default()
@@ -533,7 +534,7 @@ fn cpu_handles_no_active_lps_and_more_workers_than_nodes() {
     )
     .unwrap();
 
-    assert!(actual.rounds.is_empty());
+    assert!(actual.rounds().is_empty());
     assert_eq!(actual.result, expected);
 }
 
@@ -618,6 +619,7 @@ fn same_time_tx_ready_continuations_skip_round_queue_churn_without_changing_stat
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 4,
             granularity: ChunkGranularity::Static,
             ..CpuConfig::default()
@@ -638,7 +640,7 @@ fn same_time_tx_ready_continuations_skip_round_queue_churn_without_changing_stat
         7
     );
     assert_eq!(
-        cpu.rounds
+        cpu.rounds()
             .iter()
             .flat_map(|round| &round.semantic.lp_work)
             .map(|work| work.same_time_continuations)
@@ -691,6 +693,7 @@ fn cross_transport_round_semantics_match_for_remote_and_finish_merges() {
                     &image,
                     exclusive_horizon_ns,
                     CpuConfig {
+                        round_records: CpuRoundRecords::PerRound,
                         workers,
                         granularity,
                         ..CpuConfig::default()
@@ -699,7 +702,7 @@ fn cross_transport_round_semantics_match_for_remote_and_finish_merges() {
                 )
                 .unwrap();
                 let actual_semantics = actual
-                    .rounds
+                    .rounds()
                     .iter()
                     .map(|round| semantics(&round.semantic))
                     .collect::<Vec<_>>();
@@ -747,6 +750,7 @@ fn cpu_batches_remote_events_once_per_source_and_target_owner_per_round() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 1,
             granularity: ChunkGranularity::Fixed(1),
             ..CpuConfig::default()
@@ -756,13 +760,13 @@ fn cpu_batches_remote_events_once_per_source_and_target_owner_per_round() {
     .unwrap();
 
     assert_eq!(actual.result, expected);
-    assert_eq!(actual.rounds[0].semantic.active_lp_count, 8);
-    assert_eq!(actual.rounds[0].semantic.messages_exchanged, 8);
-    assert_eq!(actual.rounds[0].partition.bulk_chunks.len(), 8);
-    assert_eq!(actual.rounds[0].owner_batch_messages, 1);
+    assert_eq!(actual.rounds()[0].semantic.active_lp_count, 8);
+    assert_eq!(actual.rounds()[0].semantic.messages_exchanged, 8);
+    assert_eq!(actual.rounds()[0].partition.bulk_chunks.len(), 8);
+    assert_eq!(actual.rounds()[0].owner_batch_messages, 1);
     assert!(
         actual
-            .rounds
+            .rounds()
             .iter()
             .all(|round| round.owner_batch_messages <= 1)
     );
@@ -777,6 +781,7 @@ fn static_cpu_pool_publishes_one_horizon_and_delivers_owner_batches_directly() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers,
             granularity: ChunkGranularity::Static,
             straggler_threshold_events: None,
@@ -787,7 +792,7 @@ fn static_cpu_pool_publishes_one_horizon_and_delivers_owner_batches_directly() {
     .unwrap();
 
     assert_eq!(actual.result, expected);
-    for round in &actual.rounds {
+    for round in actual.rounds() {
         assert_eq!(round.worker_wake_messages, workers as u64);
         assert_eq!(round.worker_completion_messages, workers as u64);
         assert_eq!(round.chunk_request_messages, 0);
@@ -812,6 +817,7 @@ fn static_cpu_pool_publishes_one_horizon_and_delivers_owner_batches_directly() {
 fn summary_mode_samples_static_lp_wall_clock_buckets() {
     let image = direct_packets(1, 100);
     let config = CpuConfig {
+        round_records: CpuRoundRecords::PerRound,
         workers: 4,
         granularity: ChunkGranularity::Static,
         ..CpuConfig::default()
@@ -823,16 +829,16 @@ fn summary_mode_samples_static_lp_wall_clock_buckets() {
 
     assert_eq!(summary.result, expected);
     assert_eq!(summary.result.summary, full.result.summary);
-    assert!(summary.rounds.len() > 64);
+    assert!(summary.rounds().len() > 64);
     assert!(
         summary
-            .rounds
+            .rounds()
             .iter()
             .enumerate()
             .all(|(round, metrics)| { metrics.lp_timings.is_empty() == (round % 64 != 0) })
     );
     assert!(
-        full.rounds
+        full.rounds()
             .iter()
             .all(|round| { round.lp_timings.len() == round.semantic.active_lp_count })
     );
@@ -1331,6 +1337,7 @@ fn idle_lp_count_does_not_change_round_loop_operations() {
     assert_eq!(operations(&scalar_small), operations(&scalar_large));
 
     let config = CpuConfig {
+        round_records: CpuRoundRecords::PerRound,
         workers: 4,
         granularity: ChunkGranularity::Fixed(1),
         ..CpuConfig::default()
@@ -1338,7 +1345,7 @@ fn idle_lp_count_does_not_change_round_loop_operations() {
     let cpu_small = run_cpu_with_observations(&small, None, config, ObservationMode::Full).unwrap();
     let cpu_large = run_cpu_with_observations(&large, None, config, ObservationMode::Full).unwrap();
     let cpu_operations = |run: &days_executor::CpuRun| {
-        run.rounds
+        run.rounds()
             .iter()
             .map(|round| {
                 (
@@ -1362,7 +1369,7 @@ fn idle_lp_count_does_not_change_round_loop_operations() {
             .collect::<Vec<_>>()
     };
     let cpu_physical_probes = |run: &days_executor::CpuRun| {
-        run.rounds
+        run.rounds()
             .iter()
             .map(|round| round.semantic.physical_lp_probes)
             .collect::<Vec<_>>()
@@ -2599,6 +2606,7 @@ fn port_lps_take_independent_same_time_tx_ready_continuations() {
             &image,
             Some(11),
             CpuConfig {
+                round_records: CpuRoundRecords::PerRound,
                 workers: 4,
                 granularity,
                 ..CpuConfig::default()
@@ -2620,7 +2628,7 @@ fn port_lps_take_independent_same_time_tx_ready_continuations() {
         2
     );
     assert!(cpu.iter().all(|run| {
-        run.rounds
+        run.rounds()
             .iter()
             .flat_map(|round| &round.semantic.lp_work)
             .map(|work| work.same_time_continuations)
@@ -2826,6 +2834,7 @@ fn cpu_configuration_matrix_preserves_complete_state_at_full_and_partial_horizon
                         for straggler_threshold_events in [None, Some(0), Some(3)] {
                             for (horizon, expected) in horizons {
                                 let config = CpuConfig {
+                                    round_records: CpuRoundRecords::PerRound,
                                     workers,
                                     granularity,
                                     static_partition,
@@ -2848,7 +2857,7 @@ fn cpu_configuration_matrix_preserves_complete_state_at_full_and_partial_horizon
                                 });
                                 let maximum_owner_batches = u64::try_from(workers * workers)
                                     .expect("worker bound must fit u64");
-                                assert!(actual.rounds.iter().all(|round| {
+                                assert!(actual.rounds().iter().all(|round| {
                                     round.owner_batch_messages <= maximum_owner_batches
                                         && round.owner_batch_messages
                                             <= round.semantic.messages_exchanged
@@ -3319,6 +3328,7 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 4,
             granularity: ChunkGranularity::Fixed(1),
             straggler_threshold_events: Some(4),
@@ -3331,18 +3341,18 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
 
     assert_eq!(actual.result, expected);
     assert_eq!(
-        actual.rounds[0].partition.stragglers,
+        actual.rounds()[0].partition.stragglers,
         vec![days_executor::LpWorkEstimate {
             node: hot_port,
             estimated_events: 16,
         }]
     );
-    assert!(!actual.rounds[0].partition.bulk_chunks.is_empty());
+    assert!(!actual.rounds()[0].partition.bulk_chunks.is_empty());
     assert_eq!(
-        actual.rounds[0].partition.reserved_straggler_workers,
+        actual.rounds()[0].partition.reserved_straggler_workers,
         vec![0]
     );
-    let port = actual.rounds[0]
+    let port = actual.rounds()[0]
         .lp_timings
         .iter()
         .find(|timing| timing.node == hot_port)
@@ -3351,29 +3361,29 @@ fn incast_dominating_lp_is_classified_first_and_routed_to_a_dedicated_worker() {
     assert_eq!(port.worker, 0);
     assert_eq!(port.dispatch_order, 0);
     assert!(
-        actual.rounds[0]
+        actual.rounds()[0]
             .partition
             .reserved_straggler_workers
             .contains(&port.worker)
     );
     assert!(
-        actual.rounds[0]
+        actual.rounds()[0]
             .lp_timings
             .iter()
             .any(|timing| timing.class == WorkClass::Bulk)
     );
     assert!(
-        actual.rounds[0]
+        actual.rounds()[0]
             .lp_timings
             .iter()
             .filter(|timing| timing.class == WorkClass::Bulk)
-            .all(|timing| !actual.rounds[0]
+            .all(|timing| !actual.rounds()[0]
                 .partition
                 .reserved_straggler_workers
                 .contains(&timing.worker))
     );
     assert!(
-        actual.rounds[0]
+        actual.rounds()[0]
             .lp_timings
             .iter()
             .filter(|timing| timing.class == WorkClass::Bulk)
@@ -3392,6 +3402,7 @@ fn static_classification_uses_the_fused_two_message_worker_protocol() {
         &image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers,
             granularity: ChunkGranularity::Static,
             straggler_threshold_events: Some(4),
@@ -3403,7 +3414,7 @@ fn static_classification_uses_the_fused_two_message_worker_protocol() {
     .unwrap();
 
     assert_eq!(actual.result, expected);
-    let first = &actual.rounds[0];
+    let first = &actual.rounds()[0];
     assert_eq!(
         first.partition.stragglers,
         vec![days_executor::LpWorkEstimate {
@@ -3422,7 +3433,7 @@ fn static_classification_uses_the_fused_two_message_worker_protocol() {
             .filter(|timing| timing.class == WorkClass::Bulk)
             .all(|timing| timing.worker != 0)
     );
-    for round in &actual.rounds {
+    for round in actual.rounds() {
         assert_eq!(round.worker_wake_messages, workers as u64);
         assert_eq!(round.worker_completion_messages, workers as u64);
         assert_eq!(round.chunk_request_messages, 0);
@@ -3485,6 +3496,7 @@ fn assert_clean_port_execution(
         image,
         None,
         CpuConfig {
+            round_records: CpuRoundRecords::PerRound,
             workers: 2,
             granularity,
             ..CpuConfig::default()
@@ -3496,7 +3508,7 @@ fn assert_clean_port_execution(
         clean.result, *expected,
         "clean rerun granularity={granularity:?}"
     );
-    let port_timing = clean.rounds[0]
+    let port_timing = clean.rounds()[0]
         .lp_timings
         .iter()
         .find(|timing| timing.node == hot_port)

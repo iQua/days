@@ -880,12 +880,15 @@ fn retransmission_timeout_is_a_phase_one_fallback_classified_event() {
     let cpu = run_cpu_with_observations(
         &image,
         None,
-        days_executor::CpuConfig::default(),
+        days_executor::CpuConfig {
+            round_records: days_executor::CpuRoundRecords::PerRound,
+            ..days_executor::CpuConfig::default()
+        },
         ObservationMode::Full,
     )
     .expect("CPU should execute the stale timer");
     assert!(
-        cpu.rounds
+        cpu.rounds()
             .iter()
             .flat_map(|round| &round.semantic.lp_work)
             .any(|work| work.fallback_classified_pushes > 0),
