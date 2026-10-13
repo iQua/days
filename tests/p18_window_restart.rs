@@ -12,7 +12,8 @@ use days::scenario::compile_config;
 use days_executor::{
     Backend, CpuConfig, FlowGeneratorKind, FlowId, MechanismTransitionRecord, ObservationMode,
     RocePacerState, RoceSenderKind, RoceSenderRecord, RoceTransitionRecord, RunResult,
-    SimulationImage, run_cpu_with_observations, run_scalar_with_observations, validate,
+    SimulationImage, roce_sender_transitions_csv, run_cpu_with_observations,
+    run_scalar_with_observations, validate,
 };
 use tempfile::TempDir;
 
@@ -286,4 +287,57 @@ fn a_checkpoint_after_a_reanchored_restart_resumes_exactly() {
             );
         }
     }
+}
+
+/// qp-schema Amendment 8: the grid anchor is sender state. The sender CSV's
+/// `first_pacing_time_ns` (column 14) is the anchor before the transition and the appended
+/// `after_grid_anchor_ns` (column 47) the anchor after it; they differ exactly on the feedback
+/// rows that restart a window-parked pacer, whose new anchor is the row's own instant.
+#[test]
+fn the_sender_csv_carries_the_grid_anchor_before_and_after_each_transition() {
+    let result = run_full(&lower(WINDOW));
+    let csv = roce_sender_transitions_csv(
+        &result
+            .diagnostics
+            .as_ref()
+            .expect("full observation")
+            .mechanism_transitions,
+    )
+    .expect("sender CSV");
+    let mut lines = csv.lines();
+    let header = lines
+        .next()
+        .expect("a header")
+        .split(',')
+        .collect::<Vec<_>>();
+    assert_eq!(header.len(), 47);
+    assert_eq!(header[13], "first_pacing_time_ns");
+    assert_eq!(
+        header[45], "congestion_control",
+        "columns 1..46 keep their places"
+    );
+    assert_eq!(header[46], "after_grid_anchor_ns");
+    let column = |name: &str| header.iter().position(|column| *column == name).unwrap();
+    let (time, kind, before, after) = (
+        column("time_ns"),
+        column("kind"),
+        column("first_pacing_time_ns"),
+        column("after_grid_anchor_ns"),
+    );
+    let mut moved = 0;
+    let mut previous_after = BTreeMap::<String, String>::new();
+    let flow = column("flow_id");
+    for line in lines {
+        let fields = line.split(',').collect::<Vec<_>>();
+        if let Some(anchor) = previous_after.get(fields[flow]) {
+            assert_eq!(anchor, fields[before], "the anchor carries over: {line}");
+        }
+        if fields[before] != fields[after] {
+            assert!(matches!(fields[kind], "ack" | "nack"), "{line}");
+            assert_eq!(fields[after], fields[time], "{line}");
+            moved += 1;
+        }
+        previous_after.insert(fields[flow].to_owned(), fields[after].to_owned());
+    }
+    assert!(moved > 0, "feedback re-anchors window-parked pacers");
 }
