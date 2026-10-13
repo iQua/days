@@ -256,6 +256,10 @@ pub struct RoceSenderView {
     /// The pending tick's time while armed, or the beyond-stop tick while stopped.
     pub next_tick_ns: Option<u64>,
     pub status: GeneratorStatus,
+    /// The pacing grid's anchor, `RocePacer::first_pacing_time_ns` (qp-schema Amendment 8): state,
+    /// since an ACK or NACK that restarts a window-parked pacer re-anchors it at its own instant
+    /// (P18 window-throttle design F2). It sits in the view's tail padding.
+    pub grid_anchor_ns: u64,
 }
 
 impl RoceSenderView {
@@ -279,6 +283,7 @@ impl RoceSenderView {
             next_tick_ns: (pacer != RocePacerState::Parked)
                 .then_some(generator.next_emission.departure_time_ns),
             status: generator.next_emission.status,
+            grid_anchor_ns: roce.pacer.first_pacing_time_ns,
         }
     }
 }
@@ -332,7 +337,6 @@ pub struct RoceSenderRecord {
     pub mtu_bytes: u64,
     pub total_bytes: u64,
     pub pacing_interval_ns: u64,
-    pub first_pacing_time_ns: u64,
     pub rto_ns: u64,
     /// The window configuration (Amendment 6): `window_bytes` (0: none), `variable_window`, and
     /// the controller's maximum rate, which scales a variable window.

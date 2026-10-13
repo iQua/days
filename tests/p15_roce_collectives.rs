@@ -408,7 +408,7 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
             first.before.rto_deadline_ns, None,
             "{name}: no timer before a send"
         );
-        assert_eq!(first.first_pacing_time_ns, first.key.time_ns, "{name}");
+        assert_eq!(first.before.grid_anchor_ns, first.key.time_ns, "{name}");
         // A released stage's first tick is its release; a root's is the initial delay.
         if let Some(&released) = activations.get(flow) {
             assert_eq!(first.key.time_ns, released, "{name}");
@@ -693,7 +693,6 @@ pkt_size_dist = {{ type = "DiscreteUniform", low = 1000, high = 1000 }}
                             row.key.phase,
                             row.kind,
                             row.class_paused,
-                            row.first_pacing_time_ns,
                             row.rate_bps,
                             row.input_acknowledgment,
                             row.emitted.map(|emitted| {

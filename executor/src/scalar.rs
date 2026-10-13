@@ -7872,7 +7872,6 @@ fn roce_sender_record(
             mtu_bytes: roce.pacer.mtu_bytes,
             total_bytes: roce.pacer.total_bytes,
             pacing_interval_ns: roce.pacer.pacing_interval_ns,
-            first_pacing_time_ns: roce.pacer.first_pacing_time_ns,
             rto_ns: roce.rto_ns,
             window_bytes: roce.window_bytes,
             variable_window: roce.variable_window,

@@ -413,6 +413,8 @@ fn compiled_ramp_aqm_certificate_draws_for_data_and_admits_acks_unmarked() {
 #[test]
 fn the_wfq_record_does_not_grow_the_mechanism_record() {
     // The WFQ record is boxed: full observation retains one `MechanismTransitionRecord` per
-    // transition, and its size stays that of the largest variant before WFQ.
-    assert_eq!(std::mem::size_of::<MechanismTransitionRecord>(), 384);
+    // transition, and its size stays that of the largest variant before WFQ. P18 Amendment 8
+    // moved the RoCE sender's grid anchor into the before and after views' tail padding, so the
+    // RoCE sender record, the largest variant, shrank from 384 B to 368 B.
+    assert_eq!(std::mem::size_of::<MechanismTransitionRecord>(), 368);
 }
