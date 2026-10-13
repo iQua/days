@@ -6716,7 +6716,7 @@ impl<'image> TransitionState<'image> {
             .and_then(|resident| resident.source_time_ns)
             .ok_or(ExecutionError::UnknownPacket(payload))?;
         let slot = self.local_state_slot(node)?;
-        let position = self
+        let queue = &self
             .hosts
             .slices()
             .0
@@ -6726,19 +6726,38 @@ impl<'image> TransitionState<'image> {
                 kind: node.kind,
                 state_slot: node.state_slot,
             })?
-            .queue
-            .iter()
-            .rposition(|queued| {
+            .queue;
+        // The queue key is `(rank, has_source_time, source_time_ns, flow, id)`. P18 decision D16b
+        // (window-throttle design F1): the rank is 0 for a RoCE ACK, RoCE NACK or DCQCN CNP and 1
+        // for every other packet, so control packets are served ahead of every queued packet,
+        // non-preemptively (the packet in service has left the queue) and in the old order among
+        // themselves. The rank is derived from the kind, never stored: a checkpoint restore
+        // resets only the source time, so a restored packet keys as `(rank, 0, 0, ..)`.
+        let key = (1, source_time_ns, packet.flow, packet.id);
+        let queued_key = |resident: &ResidentPacket| {
+            (
+                u8::from(resident.source_time_ns.is_some()),
+                resident.source_time_ns.unwrap_or(0),
+                resident.descriptor.flow,
+                resident.descriptor.id,
+            )
+        };
+        let position = if packet.kind.is_roce_control() {
+            // After the last control packet whose key is not greater: past every non-control one.
+            queue.iter().rposition(|queued| {
                 self.packets.get(queued).is_some_and(|resident| {
-                    (
-                        u8::from(resident.source_time_ns.is_some()),
-                        resident.source_time_ns.unwrap_or(0),
-                        resident.descriptor.flow,
-                        resident.descriptor.id,
-                    ) <= (1, source_time_ns, packet.flow, packet.id)
+                    resident.descriptor.kind.is_roce_control() && queued_key(resident) <= key
                 })
             })
-            .map_or(0, |position| position + 1);
+        } else {
+            // A queued control packet ranks first, so the scan stops at it.
+            queue.iter().rposition(|queued| {
+                self.packets.get(queued).is_some_and(|resident| {
+                    resident.descriptor.kind.is_roce_control() || queued_key(resident) <= key
+                })
+            })
+        }
+        .map_or(0, |position| position + 1);
         let state = self.host_state_mut(node)?;
         if position < state.queue.len() {
             state.queue.insert(position, payload);

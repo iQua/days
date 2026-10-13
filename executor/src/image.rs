@@ -1083,6 +1083,18 @@ impl PacketKind {
         )
     }
 
+    /// A RoCE ACK, a RoCE NACK or a DCQCN CNP: the control packets a host NIC serves ahead of
+    /// every other queued packet (P18 decision D16b), and exactly the kinds
+    /// [`FlowDescriptor::packet_priority`] sends on `feedback_priority`. Not `is_feedback`, which
+    /// also holds TCP ACKs, PFC frames and constant-generator feedback.
+    #[inline(always)]
+    pub const fn is_roce_control(self) -> bool {
+        matches!(
+            self,
+            Self::RoceAck(_) | Self::RoceNack(_) | Self::DcqcnCnp(_)
+        )
+    }
+
     /// A zero-byte source-local timer token (a RoCE pacing tick): never enqueued, transmitted or
     /// delivered.
     pub const fn is_timer_token(self) -> bool {
