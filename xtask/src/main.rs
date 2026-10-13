@@ -184,8 +184,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "scalar.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 7,
-        purpose: "the stage-scan counting run, the stage-index equality hook, and the P16 PFC service probe (its counts field, the counts type, its two increments, and the counting run) exist only for standard tests",
+        count: 14,
+        purpose: "the stage-scan counting run, the stage-index equality hook, the P16 PFC service probe (its counts field, the counts type, its two increments, and the counting run), and the P18 control-insert scan counter (its per-thread counts, the counts type, its recording function and take, and in `enqueue_source_packet` the inspected count, its increment and its recording) exist only for standard tests",
     },
     AllowedFeatureGate {
         path: "stage_index.rs",
@@ -202,8 +202,8 @@ const BACKEND_FEATURE_GATES: &[AllowedFeatureGate] = &[
     AllowedFeatureGate {
         path: "lib.rs",
         predicate: r#"feature = "planner-test-hooks""#,
-        count: 2,
-        purpose: "validator flow-index equality hook and the P16 H1 per-host stage-width probe are exported only for standard tests",
+        count: 3,
+        purpose: "validator flow-index equality hook, the P16 H1 per-host stage-width probe and the P18 control-insert scan counter are exported only for standard tests",
     },
     AllowedFeatureGate {
         path: "phase_marks.rs",
