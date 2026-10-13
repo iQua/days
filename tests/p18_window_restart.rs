@@ -17,6 +17,10 @@ use days_executor::{
 };
 use tempfile::TempDir;
 
+#[path = "support/aicb.rs"]
+#[allow(dead_code)]
+mod aicb;
+
 const WINDOW: &str = "configs/p16/dcqcn_mlx_window.toml";
 const ACK_FIRST: &str = "configs/p18/roce_ack_first.toml";
 
@@ -340,4 +344,51 @@ fn the_sender_csv_carries_the_grid_anchor_before_and_after_each_transition() {
         previous_after.insert(fields[flow].to_owned(), fields[after].to_owned());
     }
     assert!(moved > 0, "feedback re-anchors window-parked pacers");
+}
+
+/// Review M1 (P18 ackfix fix 1): a deterministic guard on what F2 costs in events. After an
+/// ACK-clocked restart the grid is anchored at that ACK, so the pair's next tick falls one interval
+/// later, just before the next ACK: it finds the window closed and parks (ruling D7), and that ACK
+/// restarts it. On the b4 trace 1 ms past its first compute segment (Scalar, Summary) the slice
+/// sends the same data with and without F2, and F2 adds one window-blocked tick per ACK-clocked
+/// send (MEASURED, `days-gpu/evidence/P18/ackfix/raw/m1/`):
+///
+/// | tree | events | data packets | per data packet | window-blocked ticks |
+/// |---|---:|---:|---:|---:|
+/// | base `29ecee43` | 2,291,200 | 176,768 | 12.96 | 1,024 |
+/// | F1 alone | 2,291,968 | 176,896 | 12.96 | 896 |
+/// | F1 and F2 | 2,418,688 | 176,896 | 13.67 | 127,616 |
+///
+/// The pins hold the F1-and-F2 values, so no change grows the slice's events silently. Removing
+/// these ticks (parking at the send that closes the window) is a semantics decision outside this
+/// lane; a change that lowers the count should re-pin it with its reason.
+#[test]
+fn the_b4_slice_keeps_its_events_per_data_packet() {
+    let image = lower("tests/fixtures/aicb/b4-simai.toml");
+    let horizon = aicb::first_segment_end(&image) + 1_000_000;
+    let run = days_executor::run_scalar_rounds(&image, Some(horizon)).expect("the slice runs");
+    let events = run
+        .rounds
+        .iter()
+        .map(|round| round.events_processed)
+        .sum::<u64>();
+    let data_packets = run
+        .result
+        .host_states
+        .iter()
+        .flat_map(|state| &state.generators)
+        .filter(|generator| matches!(generator.kind, FlowGeneratorKind::Roce(_)))
+        .map(|generator| generator.packets_emitted)
+        .sum::<u64>();
+    println!(
+        "record=p18_b4_events horizon_ns={horizon} events={events} data_packets={data_packets} \
+         events_per_data_packet={:.4}",
+        events as f64 / data_packets as f64
+    );
+    assert_eq!(
+        (events, data_packets),
+        (2_418_688, 176_896),
+        "the b4 slice's events or data packets changed (pinned at F1 and F2: 13.67 events per \
+         data packet; F1 alone 12.96)"
+    );
 }
