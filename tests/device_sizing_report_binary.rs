@@ -68,6 +68,10 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
             "tcp_state",
         ]
     );
+    // P18 ring writes: the 2,907,067,776-byte staging plane is the one-word placeholder.
+    assert!(
+        stdout.contains("record=device_sizing_plane index=20 name=remote_staging words=1 bytes=8 ")
+    );
     // P16 G2: both planners allocate `tcp_state` for every image, so the projection reports it for
     // this open-loop image too: a 7-word receiver row, a 6-word ledger row and one 5-word ledger
     // record per flow, and no stage or RoCE region. The image has 5,530 flows (one generator stream
@@ -88,6 +92,11 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
     // P17 merge: the LP stream lists in `stream_state` no longer store the generator stream ids,
     // one word for each of the image's 5,530 generator streams (one per flow, above).
     let p17_generator_id_bytes = FLOWS * std::mem::size_of::<u64>();
+    // P18 ring writes: a streams plan stages nothing, so `stream_state` no longer holds one channel
+    // id per staging slot. The plan staged 30,281,956 records (363,383,472 words of 12-word
+    // records in the `remote_staging` plane at `5c7629ff`).
+    const STAGING_SLOTS: usize = 363_383_472 / 12;
+    let p18_staging_id_bytes = STAGING_SLOTS * std::mem::size_of::<u64>();
     assert!(stdout.contains(&format!(
         "record=device_sizing_arena \
          legacy_heap_event_slots=32775270 fallback_heap_event_slots=152986 \
@@ -95,8 +104,8 @@ fn k48_wide_sizing_dry_run_is_host_only_and_reproduces_load30_arenas() {
          generator_stream_event_slots=11060 heap_arena_bytes=21853024 \
          stream_arena_bytes={} total_event_arena_bytes={} \
          legacy_heap_arena_bytes=3675548832",
-        490_621_544_usize + round_scratch_bytes - p17_generator_id_bytes,
-        512_474_568_usize + round_scratch_bytes - p17_generator_id_bytes,
+        490_621_544_usize + round_scratch_bytes - p17_generator_id_bytes - p18_staging_id_bytes,
+        512_474_568_usize + round_scratch_bytes - p17_generator_id_bytes - p18_staging_id_bytes,
     )));
     assert!(stdout.contains("record=device_sizing_total plane_count=29 total_device_bytes="));
 }

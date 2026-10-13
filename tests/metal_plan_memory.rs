@@ -178,9 +178,19 @@ fn dominant_arena_high_water_is_test_only_and_fingerprint_neutral() {
         image.nodes.len()
     );
     assert_eq!(high_water.queue_records.high_water.len(), image.nodes.len());
+    // P18 ring writes: the streams path stages nothing, so every LP's staging capacity and
+    // occupancy is zero.
+    assert!(
+        high_water
+            .remote_staging
+            .capacities
+            .iter()
+            .chain(&high_water.remote_staging.high_water)
+            .all(|words| *words == 0),
+        "the streams path must plan and use no remote staging"
+    );
     for (arena, occupancy) in [
         ("stream_records", &high_water.stream_records),
-        ("remote_staging", &high_water.remote_staging),
         ("queue_records", &high_water.queue_records),
     ] {
         assert_eq!(

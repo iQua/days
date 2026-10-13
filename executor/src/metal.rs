@@ -28,9 +28,8 @@ use crate::device_compaction::{
     CompactionEntity, CompactionPlan, CompactionShape, metadata_region,
 };
 use crate::device_event_record::{
-    CHANNEL_EVENT_WORDS, EVENT_WORDS, GENERATOR_EVENT_WORDS, REMOTE_STAGING_EVENT_WORDS,
-    SERVICE_EVENT_WORDS, StoredEventClass, decode_event_record, stored_event_words,
-    stream_event_class,
+    CHANNEL_EVENT_WORDS, EVENT_WORDS, GENERATOR_EVENT_WORDS, SERVICE_EVENT_WORDS, StoredEventClass,
+    decode_event_record, stored_event_words, stream_event_class,
 };
 use crate::device_mechanism::RoundKernel;
 use crate::device_scheduler::{
@@ -48,7 +47,6 @@ use crate::{
 };
 
 const LANES: usize = 1_024;
-const SCATTER_COPY_LANES: usize = CHANNEL_EVENT_WORDS * 2;
 const NODE_WORDS: usize = 11;
 const GENERATOR_WORDS: usize = 43;
 const FLOW_WORDS: usize = 6;
@@ -194,8 +192,11 @@ fn reset_dominant_arena_high_water() {
 /// combines the sweep's per-threadgroup partials. **The dispatch boundary is the barrier** —
 /// `MTLDispatchType::Serial` ordering, the same guarantee `days_round` already relies on to see
 /// the `worklist` `days_round_prepare` wrote — so no kernel synchronizes across threadgroups.
-/// T24 omits only `FinalControlSweep` for a streams+Summary lowered plan; Full and legacy plans
-/// dispatch all thirteen entries.
+/// T24 omits only `FinalControlSweep` for a streams+Summary lowered plan. P18 ring writes omit the
+/// legacy staged exchange (`ExchangePrefix`, `ExchangeScatter`) from every streams plan: producers
+/// write the channel rings directly and `TargetMerge` publishes them. A streams plan encodes ten
+/// entries under Full observations and nine under Summary; a legacy plan encodes all twelve.
+/// [`AttemptKernel::encoded`] decides.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AttemptKernel {
     HorizonSweep,
@@ -205,7 +206,6 @@ enum AttemptKernel {
     DrainExecute,
     ContinuationControlSweep,
     ContinuationControl,
-    ExchangePrefixSweep,
     ExchangePrefix,
     ExchangeScatter,
     TargetMerge,
@@ -231,7 +231,7 @@ impl DispatchGeometry {
     }
 }
 
-const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 13] = [
+const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 12] = [
     (AttemptKernel::HorizonSweep, DispatchGeometry::ControlSweep),
     (AttemptKernel::Horizon, DispatchGeometry::FixedControl),
     (AttemptKernel::RoundReset, DispatchGeometry::Parallel),
@@ -247,10 +247,6 @@ const ATTEMPT_DISPATCHES: [(AttemptKernel, DispatchGeometry); 13] = [
     (
         AttemptKernel::ContinuationControl,
         DispatchGeometry::FixedControl,
-    ),
-    (
-        AttemptKernel::ExchangePrefixSweep,
-        DispatchGeometry::ControlSweep,
     ),
     (
         AttemptKernel::ExchangePrefix,
@@ -275,12 +271,22 @@ impl AttemptKernel {
             Self::DrainExecute => MetalKernel::Round,
             Self::ContinuationControlSweep => MetalKernel::ControlSweep,
             Self::ContinuationControl => MetalKernel::Control,
-            Self::ExchangePrefixSweep => MetalKernel::ExchangePrefixSweep,
             Self::ExchangePrefix => MetalKernel::ExchangePrefix,
             Self::ExchangeScatter => MetalKernel::ExchangeScatter,
             Self::TargetMerge => MetalKernel::ExchangeMerge,
             Self::FinalControlSweep => MetalKernel::FinalizeSweep,
             Self::FinalControl => MetalKernel::Finalize,
+        }
+    }
+
+    /// Whether a plan encodes this dispatch. Both inputs are lowered-plan policy
+    /// ([`crate::device_sizing::finalize_sweep_required`],
+    /// [`crate::device_sizing::staged_exchange_required`]), decided once per run.
+    const fn encoded(self, finalize_sweep_required: bool, staged_exchange_required: bool) -> bool {
+        match self {
+            Self::FinalControlSweep => finalize_sweep_required,
+            Self::ExchangePrefix | Self::ExchangeScatter => staged_exchange_required,
+            _ => true,
         }
     }
 
@@ -309,8 +315,6 @@ enum MetalKernel {
     /// T21 fix 1: the round-control scans, on the full grid.
     ControlSweep,
     Control,
-    /// T21 fix 1: the exchange-prefix streams scan, on the full grid.
-    ExchangePrefixSweep,
     ExchangePrefix,
     ExchangeScatter,
     ExchangeMerge,
@@ -327,7 +331,7 @@ enum MetalKernel {
 
 impl MetalKernel {
     /// In discriminant order, so `ALL[kernel as usize] == kernel`.
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 14] = [
         Self::HorizonSweep,
         Self::Horizon,
         Self::RoundReset,
@@ -335,7 +339,6 @@ impl MetalKernel {
         Self::Round,
         Self::ControlSweep,
         Self::Control,
-        Self::ExchangePrefixSweep,
         Self::ExchangePrefix,
         Self::ExchangeScatter,
         Self::ExchangeMerge,
@@ -354,7 +357,6 @@ impl MetalKernel {
             Self::Round | Self::RoundMechanisms => "days_round",
             Self::ControlSweep => "days_round_control_sweep",
             Self::Control => "days_round_control",
-            Self::ExchangePrefixSweep => "days_exchange_prefix_sweep",
             Self::ExchangePrefix => "days_exchange_prefix",
             Self::ExchangeScatter => "days_exchange_scatter",
             Self::ExchangeMerge => "days_exchange_merge",
@@ -398,7 +400,6 @@ impl MetalKernel {
             | Self::Horizon
             | Self::ControlSweep
             | Self::Control
-            | Self::ExchangePrefixSweep
             | Self::ExchangePrefix
             | Self::FinalizeSweep
             | Self::Finalize => ThreadgroupWidth::Lanes,
@@ -2377,10 +2378,9 @@ impl MetalPlan {
             },
             |capacity| capacity.max(config.capacity_floors.outbox_events_total),
         );
-        // `outbox_capacity` stays the uploaded `P_OUTBOX_CAPACITY` on both paths, so the round-wide
-        // remote-production check in `days_exchange_prefix`, its `ARENA_OUTBOX` fault, the retry
-        // growth law and every `CapacityWarmStart` entry are unchanged. Only the *storage* is
-        // conditional: the streams path never forms an outbox address.
+        // `outbox_capacity` is uploaded as `P_OUTBOX_CAPACITY` on both paths; only the legacy
+        // path's `days_exchange_prefix` reads it (a streams plan launches no staged exchange, P18),
+        // and only the legacy path allocates the arena it bounds.
         let outbox_records = if config.streams_enabled {
             crate::device_sizing::STREAMS_OUTBOX_RECORD_SLOTS
         } else {
@@ -2398,6 +2398,11 @@ impl MetalPlan {
                     0,
                 );
             }
+        }
+        // P18 ring writes: the streams path stages nothing (`append_remote` writes the channel
+        // rings), so only the legacy heap path gets staging capacity.
+        if config.streams_enabled {
+            remote_capacities.fill(0);
         }
         let mut remote_meta = vec![0_u64; node_count * ARENA_META_WORDS];
         let remote_staging_slots = assign_arena_offsets(&mut remote_meta, &remote_capacities)?;
@@ -2567,14 +2572,7 @@ impl MetalPlan {
             arrivals: zero_words(observation_slots, ARRIVAL_WORDS)?,
             lp_state: vec![0_u64; node_count.max(1) * LP_STATE_WORDS],
             remote_meta,
-            remote_staging: zero_words(
-                remote_staging_slots,
-                if config.streams_enabled {
-                    REMOTE_STAGING_EVENT_WORDS
-                } else {
-                    EVENT_WORDS
-                },
-            )?,
+            remote_staging: zero_words(remote_staging_slots, EVENT_WORDS)?,
             observation_meta,
             inbound_meta,
             merge_cursors: vec![0_u64; inbound_producers.len().max(1)],
@@ -4221,8 +4219,13 @@ impl MetalBuffers {
             plan.params.push(resume_scan_offset as u64);
             // P17 merge: the merge counter rows and the flow-source table (params word 39).
             let merge_audit_offset = plan.stream_state.len();
-            let region =
-                crate::merge_audit::hook_region(plan.params[0] as usize, &plan.flows, FLOW_WORDS);
+            let region = crate::merge_audit::hook_region(
+                plan.params[0] as usize,
+                plan.params[1] as usize,
+                &plan.flows,
+                FLOW_WORDS,
+                plan.stream_layout.channel_count,
+            );
             plan.stream_state.extend(region);
             assert_eq!(
                 plan.params.len(),
@@ -5621,13 +5624,6 @@ impl DirectMetal {
         let Ok(pipelines) = <[MetalPipeline; MetalKernel::ALL.len()]>::try_from(pipelines) else {
             unreachable!("one pipeline is created per kernel");
         };
-        let exchange_scatter_pipeline = &pipelines[MetalKernel::ExchangeScatter as usize];
-        if exchange_scatter_pipeline.threadExecutionWidth() < SCATTER_COPY_LANES {
-            return Err(MetalError::Unavailable(format!(
-                "exchange-scatter pipeline has SIMD width {}, but paired record copies require {SCATTER_COPY_LANES} lanes",
-                exchange_scatter_pipeline.threadExecutionWidth()
-            )));
-        }
         let pipeline_creation_ns = duration_ns(pipeline_started.elapsed());
         let initialization_ns = duration_ns(initialization_started.elapsed());
         let direct = Self {
@@ -5772,15 +5768,6 @@ impl DirectMetal {
                  {execution_width}"
             )));
         }
-        let scatter_execution_width = self
-            .pipeline(MetalKernel::ExchangeScatter)
-            .threadExecutionWidth();
-        if !round_threads.is_multiple_of(scatter_execution_width) {
-            return Err(MetalError::Validation(format!(
-                "round_threads_per_threadgroup must be a multiple of the exchange-scatter \
-                 execution width {scatter_execution_width}"
-            )));
-        }
         self.check_limits(Some(round_threads), Some(round_kernel))?;
         let wall_started = Instant::now();
         let mut host_encode_submit_ns = 0_u64;
@@ -5917,8 +5904,10 @@ impl DirectMetal {
         parallel_grid: MTLSize,
         parallel_group: MTLSize,
     ) {
+        let staged_exchange_required =
+            crate::device_sizing::staged_exchange_required(buffers.memory_layout.streams_enabled);
         for (kernel, geometry) in ATTEMPT_DISPATCHES {
-            if !buffers.finalize_sweep_required && kernel == AttemptKernel::FinalControlSweep {
+            if !kernel.encoded(buffers.finalize_sweep_required, staged_exchange_required) {
                 continue;
             }
             encoder.setComputePipelineState(self.pipeline(kernel.metal_kernel_for(round_kernel)));
@@ -6195,7 +6184,9 @@ mod tests {
     fn semantic_fault_decodes_the_word_the_kernels_write() {
         let source = include_str!("metal_kernels.metal");
         assert!(source.contains("constant ulong ERROR_SEMANTIC = 3;"));
-        assert!(source.contains("control[C_ERROR] = ERROR_SEMANTIC + 42;"));
+        // P18 ring writes: the producer raises 42 as an LP error naming the channel, which the
+        // continuation control copies into the control plane.
+        assert!(source.contains("set_semantic_error(error, 42, channel);"));
 
         let mut control = vec![0_u64; 20];
         // An LP semantic fault (here semantic 25, raw 28) keeps the LP it names.
@@ -6261,7 +6252,7 @@ mod tests {
 
     #[test]
     fn production_attempt_assigns_every_geometry_class() {
-        assert_eq!(ATTEMPT_DISPATCHES.len(), 13);
+        assert_eq!(ATTEMPT_DISPATCHES.len(), 12);
         for kernel in [
             AttemptKernel::Horizon,
             AttemptKernel::ContinuationControl,
@@ -6284,7 +6275,6 @@ mod tests {
         for kernel in [
             AttemptKernel::HorizonSweep,
             AttemptKernel::ContinuationControlSweep,
-            AttemptKernel::ExchangePrefixSweep,
             AttemptKernel::FinalControlSweep,
         ] {
             let (_, geometry) = ATTEMPT_DISPATCHES
@@ -6309,6 +6299,34 @@ mod tests {
             .find(|(candidate, _)| *candidate == AttemptKernel::DrainExecute)
             .expect("the drain dispatch is present");
         assert_eq!(drain_geometry, DispatchGeometry::ActiveWorklist);
+    }
+
+    /// P18 ring writes: a streams plan encodes no staged exchange (ten dispatches under Full
+    /// observations, nine under Summary); the legacy heap path encodes all twelve.
+    #[test]
+    fn streams_attempts_encode_no_staged_exchange() {
+        for (streams_enabled, full_observations, encoded) in [
+            (true, true, 10),
+            (true, false, 9),
+            (false, true, 12),
+            (false, false, 12),
+        ] {
+            let finalize =
+                crate::device_sizing::finalize_sweep_required(full_observations, streams_enabled);
+            let staged = crate::device_sizing::staged_exchange_required(streams_enabled);
+            let kernels = ATTEMPT_DISPATCHES
+                .into_iter()
+                .map(|(kernel, _)| kernel)
+                .filter(|kernel| kernel.encoded(finalize, staged))
+                .collect::<Vec<_>>();
+            assert_eq!(kernels.len(), encoded, "{kernels:?}");
+            for kernel in [
+                AttemptKernel::ExchangePrefix,
+                AttemptKernel::ExchangeScatter,
+            ] {
+                assert_eq!(kernels.contains(&kernel), !streams_enabled, "{kernels:?}");
+            }
+        }
     }
 
     #[test]
@@ -6482,8 +6500,9 @@ mod tests {
             (MetalKernel::Round, 384, 0),
             (MetalKernel::ControlSweep, 1_024, 12_288),
             (MetalKernel::Control, 1_024, 12_288),
-            (MetalKernel::ExchangePrefixSweep, 1_024, 20_480),
-            (MetalKernel::ExchangePrefix, 1_024, 20_480),
+            // P18: the streams branch and its `failures` array left `days_exchange_prefix`
+            // (20,480 B measured before), leaving `sums` and `exceeded`.
+            (MetalKernel::ExchangePrefix, 1_024, 12_288),
             (MetalKernel::ExchangeScatter, 1_024, 0),
             (MetalKernel::ExchangeMerge, 832, 0),
             (MetalKernel::FinalizeSweep, 1_024, 12_288),
@@ -6523,12 +6542,14 @@ mod tests {
             matches!(&error, MetalError::Validation(message) if message.contains("days_round pipeline")),
             "{error}",
         );
-        // 16 KiB covers the 12 KiB control scans but not the 20 KiB exchange-prefix scans.
-        let error = check_all(16_384, None).expect_err("the exchange prefix needs 20 KiB");
+        // Since P18 retired the 20 KiB streams prefix scan, 16 KiB covers every pipeline; 8 KiB
+        // covers the reset but not the 12 KiB control scans.
+        assert_eq!(check_all(16_384, None), Ok(()));
+        let error = check_all(8_192, None).expect_err("the control scans need 12 KiB");
         assert!(
             matches!(
                 &error,
-                MetalError::Unavailable(message) if message.contains("days_exchange_prefix_sweep")
+                MetalError::Unavailable(message) if message.contains("days_horizon_sweep")
             ),
             "{error}",
         );

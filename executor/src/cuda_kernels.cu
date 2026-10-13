@@ -43,10 +43,6 @@ constexpr uint EVENT_WORDS = 14;
 constexpr uint CHANNEL_EVENT_WORDS = 11;
 constexpr uint SERVICE_EVENT_WORDS = 5;
 constexpr uint GENERATOR_EVENT_WORDS = 10;
-constexpr uint REMOTE_STAGING_EVENT_WORDS = 12;
-constexpr uint SCATTER_GROUP_WIDTH = 32;
-constexpr uint SCATTER_GROUP_MASK = 0xffffffffu;
-constexpr uint SCATTER_COOPERATIVE_MIN_RECORDS = 3;
 constexpr uint NODE_WORDS = 11;
 constexpr uint GENERATOR_WORDS = 43;
 constexpr uint FLOW_WORDS = 6;
@@ -169,18 +165,39 @@ constexpr uint RESUME_SCAN_COUNT_WORDS = 3;
 // nothing and carry no audit.
 #ifdef DAYS_MERGE_AUDIT
 constexpr uint P_MERGE_AUDIT_OFFSET = 35;
-constexpr uint MERGE_AUDIT_WORDS = 6;
+constexpr uint MERGE_AUDIT_WORDS = 8;
 constexpr uint MA_INVOCATIONS = 0;
 constexpr uint MA_STREAMS_READ = 1;
 constexpr uint MA_APPENDED = 2;
 constexpr uint MA_MISMATCHES = 3;
 constexpr uint MA_NONEMPTY_STREAMS = 4;
 constexpr uint MA_STREAM_ENTRIES = 5;
+// P18 ring writes: the visibility audit (`days_exchange_merge`).
+constexpr uint MA_VISIBILITY_CHECKS = 6;
+constexpr uint MA_VISIBILITY_MISMATCHES = 7;
 #define RECORD_MERGE(params, state, node, counter, amount) \
     ((state)[(params)[P_MERGE_AUDIT_OFFSET] + (node) * MERGE_AUDIT_WORDS + (counter)] += \
         (ulong)(amount))
+// P18 ring writes: after the LP rows and the flow-source table, one row of VISIBILITY_WORDS words
+// per channel, `{FNV-1a over the words its producer wrote this round, its consumer's pops this
+// round}`. `days_round_reset` restarts both, the producer folds each record it writes, the
+// consumer counts its pops, and `days_exchange_merge` checks them before it publishes. Each word
+// has one writer in each kernel, so no atomics.
+constexpr uint VISIBILITY_WORDS = 2;
+constexpr ulong VISIBILITY_FNV_BASIS = 0xcbf29ce484222325ul;
+constexpr ulong VISIBILITY_FNV_PRIME = 0x100000001b3ul;
+#define VISIBILITY_ROW(params, channel) \
+    ((params)[P_MERGE_AUDIT_OFFSET] + (params)[P_NODE_COUNT] * MERGE_AUDIT_WORDS + \
+        (params)[P_FLOW_COUNT] + (channel) * VISIBILITY_WORDS)
+#define RECORD_CHANNEL_POP(params, state, stream) \
+    do { \
+        if ((stream) < (params)[P_SERVICE_STREAM_BASE]) { \
+            (state)[VISIBILITY_ROW(params, stream) + 1] += 1; \
+        } \
+    } while (0)
 #else
 #define RECORD_MERGE(params, state, node, counter, amount) ((void)0)
+#define RECORD_CHANNEL_POP(params, state, stream) ((void)0)
 #endif
 // P16 G1: one stage row per flow, then the successor array (`executor/src/device_stage.rs`).
 constexpr uint STAGE_ROW_WORDS = 5;
@@ -681,36 +698,22 @@ __device__ __forceinline__ void decode_stream_record(
     }
 }
 
-__device__ __forceinline__ void encode_remote_staging_record(
-    const ulong *record,
-    ulong *encoded
-) {
+// The 11-word channel record, `[time, phase, origin, sequence, payload, flow, size, kind, meta0,
+// meta1, meta2]`: target and event kind are implicit in the channel. This is the record a producer
+// writes into its consumer's ring (P18 ring writes) and the unit of a future cross-partition frame
+// (`days-gpu/evidence/P17/partition/design.md` §2.3.2); `encode_stream_record`'s channel branch
+// and `decode_stream_record` agree with it word for word.
+__device__ __forceinline__ void encode_channel_record(const ulong *record, ulong *encoded) {
     for (uint word = 0; word < 4; ++word) {
         encoded[word] = record[word];
     }
-    encoded[4] = record[E_TARGET];
-    encoded[5] = record[E_PAYLOAD];
-    encoded[6] = record[PK_FLOW];
-    encoded[7] = record[PK_SIZE];
-    encoded[8] = record[PK_KIND];
-    encoded[9] = record[PK_META_0];
-    encoded[10] = record[PK_META_1];
-    encoded[11] = record[PK_META_2];
-}
-
-__device__ __forceinline__ void copy_staging_to_channel(
-    const ulong *remote_staging,
-    ulong source_slot,
-    ulong *stream_records,
-    ulong target_word
-) {
-    ulong source_word = source_slot * REMOTE_STAGING_EVENT_WORDS;
-    for (uint word = 0; word < 4; ++word) {
-        stream_records[target_word + word] = remote_staging[source_word + word];
-    }
-    for (uint word = 4; word < CHANNEL_EVENT_WORDS; ++word) {
-        stream_records[target_word + word] = remote_staging[source_word + word + 1];
-    }
+    encoded[4] = record[E_PAYLOAD];
+    encoded[5] = record[PK_FLOW];
+    encoded[6] = record[PK_SIZE];
+    encoded[7] = record[PK_KIND];
+    encoded[8] = record[PK_META_0];
+    encoded[9] = record[PK_META_1];
+    encoded[10] = record[PK_META_2];
 }
 
 __device__ __forceinline__ void swap_records(ulong *records, ulong left_slot, ulong right_slot) {
@@ -1470,6 +1473,7 @@ __device__ __forceinline__ bool fel_pop_selected(
     ulong count = stream_state[base + 3] - 1;
     stream_state[base + 2] = (head + 1) % max(capacity, 1ul);
     stream_state[base + 3] = count;
+    RECORD_CHANNEL_POP(params, stream_state, selected_stream);
     if (count == 0) {
         active_remove(node, selected_active, params, stream_state);
     } else {
@@ -1866,6 +1870,23 @@ __device__ __forceinline__ bool record_arrival(
     return true;
 }
 
+// P18 ring writes (`days-gpu/evidence/P17/partition/design.md` §1.2). On the streams path the
+// producer writes the child's final channel record straight into its consumer's ring. The slot is
+// fixed by the round-start snapshot `days_round_reset` took of the ring, so it is the slot the
+// retired scatter chose: during processing only the consumer's pops change the ring's head and
+// count, and a pop leaves `head + count` unchanged, so the tail `tail0` is the tail after
+// processing too. The consumer reads only slots in `[head, head + count)`, inside the snapshot's
+// `[head0, head0 + count0)`, and the producer writes only `tail0 + b` for `b < capacity - count0`,
+// outside it. `days_exchange_merge` publishes `count += b` after every processing attempt of the
+// round, so nothing written here is visible inside the round that wrote it.
+//
+// The capacity check uses the snapshot, not the live count: a live read would make the outcome,
+// and so the retry count, depend on thread timing. It is stricter than the scatter's
+// after-consumption check, and a capacity retry never changes a result.
+//
+// The channel's batch quadruple (`days_round_reset` writes it, this LP alone advances word 0):
+//   +0 records written this round, `b`   +1 `tail0`   +2 `count0`
+//   +3 with order checks, the round's horizon minus one (`days_round_reset`)
 __device__ __forceinline__ bool append_remote(
     ulong node,
     const ulong *record,
@@ -1873,25 +1894,9 @@ __device__ __forceinline__ bool append_remote(
     const ulong *params,
     ulong *remote_meta,
     ulong *remote_staging,
-    ulong *stream_state
+    ulong *stream_state,
+    ulong *stream_records
 ) {
-    ulong base = node * META_WORDS;
-    ulong offset = remote_meta[base];
-    ulong capacity = remote_meta[base + 1];
-    ulong index = remote_meta[base + 3];
-    if (index >= capacity) {
-        set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity, index + 1);
-        return false;
-    }
-    if (params[P_STREAMS_ENABLED] != 0) {
-        encode_remote_staging_record(
-            record,
-            remote_staging + (offset + index) * REMOTE_STAGING_EVENT_WORDS
-        );
-    } else {
-        copy_thread_to_device(record, remote_staging, offset + index);
-    }
-    remote_meta[base + 3] = index + 1;
     if (params[P_STREAMS_ENABLED] != 0) {
         ulong outbound_meta =
             params[P_OUTBOUND_META_OFFSET] + node * OUTBOUND_META_WORDS;
@@ -1931,25 +1936,77 @@ __device__ __forceinline__ bool append_remote(
         }
         ulong batch =
             params[P_CHANNEL_BATCH_OFFSET] + channel * CHANNEL_BATCH_WORDS;
-        ulong batch_count = stream_state[batch];
-        if (params[P_STREAM_ORDER_CHECKS] != 0 && batch_count != 0) {
-            ulong previous_slot = stream_state[batch + 2];
-            if (!key_less(
-                remote_staging + previous_slot * REMOTE_STAGING_EVENT_WORDS,
-                remote_staging + (offset + index) * REMOTE_STAGING_EVENT_WORDS
-            )) {
-                set_semantic_error(error, 41, node);
+        ulong written = stream_state[batch];
+        ulong tail = stream_state[batch + 1];
+        ulong pending = stream_state[batch + 2];
+        ulong stream_base = channel * META_WORDS;
+        ulong capacity = stream_state[stream_base + 1];
+        // `pending <= capacity` is a ring invariant, so the subtraction cannot wrap.
+        if (written >= capacity - pending) {
+            set_capacity_error(
+                error,
+                ARENA_CHANNEL_INBOX,
+                channel,
+                capacity,
+                pending + written + 1
+            );
+            return false;
+        }
+        // `tail < capacity` and `written < capacity`: one conditional subtraction is the modulo.
+        ulong slot = tail + written;
+        if (slot >= capacity) {
+            slot -= capacity;
+        }
+        ulong offset = stream_state[stream_base];
+        if (params[P_STREAM_ORDER_CHECKS] != 0) {
+            // Error 41: keys strictly increase within a round's records. Error 42: the round's
+            // first record follows the ring's last record (immutable during the round: a pop does
+            // not touch record words) and is not before the horizon.
+            ulong previous = written != 0 ? slot : tail;
+            if (written != 0 || pending != 0) {
+                previous = previous == 0 ? capacity - 1 : previous - 1;
+                if (!key_less(
+                    stream_records + offset + previous * CHANNEL_EVENT_WORDS,
+                    record
+                )) {
+                    if (written != 0) {
+                        set_semantic_error(error, 41, node);
+                    } else {
+                        set_semantic_error(error, 42, channel);
+                    }
+                    return false;
+                }
+            }
+            if (written == 0 && record[E_TIME] <= stream_state[batch + 3]) {
+                set_semantic_error(error, 42, channel);
                 return false;
             }
-        } else {
-            stream_state[batch + 1] = offset + index;
         }
-        stream_state[batch] = batch_count + 1;
-        stream_state[batch + 2] = offset + index;
-        stream_state[params[P_STAGING_CHANNEL_OFFSET] + offset + index] =
-            channel;
+        ulong word = offset + slot * CHANNEL_EVENT_WORDS;
+        encode_channel_record(record, stream_records + word);
+        stream_state[batch] = written + 1;
+#ifdef DAYS_MERGE_AUDIT
+        {
+            ulong row = VISIBILITY_ROW(params, channel);
+            ulong hash = stream_state[row];
+            for (uint index = 0; index < CHANNEL_EVENT_WORDS; ++index) {
+                hash = (hash ^ stream_records[word + index]) * VISIBILITY_FNV_PRIME;
+            }
+            stream_state[row] = hash;
+        }
+#endif
         return true;
     }
+    ulong base = node * META_WORDS;
+    ulong offset = remote_meta[base];
+    ulong capacity = remote_meta[base + 1];
+    ulong index = remote_meta[base + 3];
+    if (index >= capacity) {
+        set_capacity_error(error, ARENA_REMOTE_STAGING, node, capacity, index + 1);
+        return false;
+    }
+    copy_thread_to_device(record, remote_staging, offset + index);
+    remote_meta[base + 3] = index + 1;
     ulong insertion = index;
     while (
         insertion != 0 &&
@@ -2127,7 +2184,8 @@ __device__ __forceinline__ bool emit_child(
         params,
         remote_meta,
         remote_staging,
-        stream_state
+        stream_state,
+        stream_records
     );
 }
 
@@ -7223,9 +7281,10 @@ __device__ __forceinline__ bool hydrate_tx_complete_event(
 // the selected stream's header, `fel_meta`, `fel_records` and `stream_records`. Between
 // `days_horizon_sweep`'s evaluation and the reset/count + prepare/write reads, the only device
 // writes are horizon control/cache output, reset's `lp_state` error words,
-// `remote_meta[node * META_WORDS + 3]`, and the channel BATCH quadruple at
-// `P_CHANNEL_BATCH_OFFSET + channel * CHANNEL_BATCH_WORDS`. None of those is in the read set — the
-// batch quadruple is a different region of `stream_state` from the per-channel stream headers
+// `remote_meta[node * META_WORDS + 3]` (legacy path), and the channel BATCH quadruple at
+// `P_CHANNEL_BATCH_OFFSET + channel * CHANNEL_BATCH_WORDS` (the P18 round-start snapshot, which
+// reads the channel stream headers but does not write them). None of those is in the read set —
+// the batch quadruple is a different region of `stream_state` from the per-channel stream headers
 // `fel_peek` reads — so the cached answer is the answer a recomputed query would return.
 static __device__ inline ulong round_scratch_cache(const ulong *params) {
     return params[P_ROUND_SCRATCH_OFFSET];
@@ -7499,6 +7558,17 @@ extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
     ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(lane);
     ulong stride = ulong(gridDim.x) * ulong(blockDim.x);
     if (params[P_STREAMS_ENABLED] != 0) {
+        // P18 ring writes: each channel's round-start snapshot, read by its producer
+        // (`append_remote`) and its publish (`days_exchange_merge`). See `append_remote` for the
+        // quadruple's layout. With order checks, word 3 is the round's exclusive horizon minus
+        // one, so `time <= word 3` is `before_horizon(time)`: the horizon is at most 2^64 (the
+        // run end), and a round with horizon 0 processes nothing.
+        ulong horizon_last = 0;
+        if (params[P_STREAM_ORDER_CHECKS] != 0) {
+            horizon_last = control[C_HORIZON_HI] != 0
+                ? NONE
+                : control[C_HORIZON_LO] - min(control[C_HORIZON_LO], 1ul);
+        }
         for (
             ulong channel = first;
             channel < params[P_CHANNEL_COUNT];
@@ -7507,10 +7577,17 @@ extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
             ulong batch =
                 params[P_CHANNEL_BATCH_OFFSET] +
                 channel * CHANNEL_BATCH_WORDS;
+            ulong stream_base = channel * META_WORDS;
+            ulong count = stream_state[stream_base + 3];
             stream_state[batch] = 0;
-            stream_state[batch + 1] = NONE;
-            stream_state[batch + 2] = NONE;
-            stream_state[batch + 3] = 0;
+            stream_state[batch + 1] = (stream_state[stream_base + 2] + count) %
+                max(stream_state[stream_base + 1], 1ul);
+            stream_state[batch + 2] = count;
+            stream_state[batch + 3] = horizon_last;
+#ifdef DAYS_MERGE_AUDIT
+            stream_state[VISIBILITY_ROW(params, channel)] = VISIBILITY_FNV_BASIS;
+            stream_state[VISIBILITY_ROW(params, channel) + 1] = 0;
+#endif
         }
     }
     ulong local_count = 0;
@@ -7521,7 +7598,9 @@ extern "C" __global__ void days_round_reset(DAYS_BUFFERS) {
         lp_state[state + L_ERROR_NODE] = NONE;
         lp_state[state + L_ERROR_CAPACITY] = 0;
         lp_state[state + L_ERROR_DEMAND] = 0;
-        remote_meta[node * META_WORDS + 3] = 0;
+        if (params[P_STREAMS_ENABLED] == 0) {
+            remote_meta[node * META_WORDS + 3] = 0;
+        }
         ulong time;
         local_count = ulong(
             load_fel_root(stream_state, params, node, time) &&
@@ -7765,212 +7844,21 @@ extern "C" __global__ void days_round_control(DAYS_BUFFERS) {
     }
 }
 
-// T21 fix 1 — the exchange-prefix STREAMS scan, on the whole grid.
+// The legacy (streams-disabled) exchange's node-ordered prefix scan: each producer's compaction
+// base in the outbox, against the plane-wide outbox capacity. Its output depends on the partition,
+// so it stays in one width-1 block over 1,024-lane contiguous chunks.
 //
-// This is the kernel the FIRST attempt died in (`evidence/P12/aterm-fixes.md` §3.1-3.3): its
-// in-dispatch combine produced `demand: 18446744073709551615`, i.e. this clamped sum saturating on
-// garbage, at k=32 width only. Here the combine is a SEPARATE DISPATCH, so there are no partials
-// in flight and nothing to order.
-//
-// Three partition-free reductions: the clamped sum of the per-channel batch counts (associative on
-// non-negative values, so `min(true total, 2^64-1)` for every grouping), the `OR` of the capacity
-// flags (every tree node's value is its subtree's clamped sum, hence at most the total, and the
-// root re-checks the total, so the flag is exactly `total > capacity`), and the `min` over the
-// channel indices that failed validation.
-//
-// The per-channel `stream_state[batch + 3] = 0` reset comes along: it is one write per channel by
-// the one thread that owns that channel, and it touches the channel BATCH quadruple, not the
-// stream header at `channel * META_WORDS` that the combine re-reads for the failure detail.
-//
-// The LEGACY (streams-disabled) path is NOT here. It is a node-ordered prefix scan whose output —
-// each producer's staging base — depends on the partition, so it stays in the width-1 combine over
-// the retained 1,024-lane contiguous chunks.
-extern "C" __global__ void days_exchange_prefix_sweep(DAYS_BUFFERS) {
-    uint lane = threadIdx.x;
-    __shared__ ulong sums[1024];
-    __shared__ uint exceeded[1024];
-    __shared__ ulong failures[1024];
-    if (
-        control[C_ERROR] != 0 ||
-        control[C_DONE] != 0 ||
-        control[C_CONTINUATION] != 2 ||
-        params[P_STREAMS_ENABLED] == 0
-    ) {
-        return;
-    }
-
-    // Braced so the per-channel body below stays a line-for-line copy of the pre-T21 kernel's,
-    // including the `capacity` the stream header shadows inside the loop.
-    {
-        ulong capacity = params[P_OUTBOX_CAPACITY];
-        ulong local_sum = 0;
-        uint local_exceeded = 0;
-        ulong local_failure = NONE;
-        ulong first = ulong(blockIdx.x) * ulong(blockDim.x) + ulong(threadIdx.x);
-        ulong grid_stride = ulong(gridDim.x) * ulong(blockDim.x);
-        for (
-            ulong channel = first;
-            channel < params[P_CHANNEL_COUNT];
-            channel += grid_stride
-        ) {
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            ulong batch_count = stream_state[batch];
-            local_sum = saturating_add_ulong(local_sum, batch_count);
-            local_exceeded |= uint(local_sum > capacity);
-            stream_state[batch + 3] = 0;
-            ulong stream_base = channel * META_WORDS;
-            ulong capacity = stream_state[stream_base + 1];
-            ulong count = stream_state[stream_base + 3];
-            bool invalid_capacity =
-                count > capacity || batch_count > capacity - min(count, capacity);
-            bool invalid_order = false;
-            if (
-                params[P_STREAM_ORDER_CHECKS] != 0 &&
-                !invalid_capacity &&
-                batch_count != 0
-            ) {
-                ulong first_slot = stream_state[batch + 1];
-                invalid_order = before_horizon(
-                    remote_staging[
-                        first_slot * REMOTE_STAGING_EVENT_WORDS + E_TIME
-                    ],
-                    control
-                );
-                if (!invalid_order && count != 0) {
-                    ulong head = stream_state[stream_base + 2];
-                    ulong tail = (head + count - 1) % max(capacity, 1ul);
-                    invalid_order = !key_less(
-                        stream_records + stream_record_offset(
-                            channel,
-                            tail,
-                            params,
-                            stream_state
-                        ),
-                        remote_staging +
-                            first_slot * REMOTE_STAGING_EVENT_WORDS
-                    );
-                }
-            }
-            if ((invalid_capacity || invalid_order) && channel < local_failure) {
-                local_failure = channel;
-            }
-        }
-        sums[lane] = local_sum;
-        exceeded[lane] = local_exceeded;
-        failures[lane] = local_failure;
-        __syncthreads();
-        for (uint stride = 512; stride != 0; stride >>= 1) {
-            if (lane < stride) {
-                ulong right_sum = sums[lane + stride];
-                uint combined_exceeded =
-                    exceeded[lane] | exceeded[lane + stride];
-                ulong combined_sum = saturating_add_ulong(sums[lane], right_sum);
-                combined_exceeded |= uint(combined_sum > capacity);
-                sums[lane] = combined_sum;
-                exceeded[lane] = combined_exceeded;
-                failures[lane] = min(failures[lane], failures[lane + stride]);
-            }
-            __syncthreads();
-        }
-        if (lane == 0) {
-            store_round_partial(stream_state, params, blockIdx.x, 0, sums[0]);
-            store_round_partial(stream_state, params, blockIdx.x, 1, ulong(exceeded[0]));
-            store_round_partial(stream_state, params, blockIdx.x, 2, failures[0]);
-        }
-    }
-}
-
-// T21 fix 1 — the exchange-prefix combine, plus the legacy node-ordered prefix scan.
-//
-// The guard is `days_exchange_prefix_sweep`'s, word for word; nothing between the two dispatches
-// writes a word it reads.
+// The streams path never launches it (P18 ring writes): producers write the channel rings
+// directly and `days_exchange_merge` publishes them.
 extern "C" __global__ void days_exchange_prefix(DAYS_BUFFERS) {
     uint lane = threadIdx.x;
     __shared__ ulong sums[1024];
     __shared__ uint exceeded[1024];
-    __shared__ ulong failures[1024];
     if (
         control[C_ERROR] != 0 ||
         control[C_DONE] != 0 ||
         control[C_CONTINUATION] != 2
     ) {
-        return;
-    }
-
-    if (params[P_STREAMS_ENABLED] != 0) {
-        ulong capacity = params[P_OUTBOX_CAPACITY];
-        ulong local_sum = 0;
-        uint local_exceeded = 0;
-        ulong local_failure = NONE;
-        for (
-            ulong block = lane;
-            block < CONTROL_SWEEP_BLOCKS;
-            block += 1024
-        ) {
-            local_sum = saturating_add_ulong(
-                local_sum,
-                load_round_partial(stream_state, params, block, 0)
-            );
-            local_exceeded |= uint(
-                load_round_partial(stream_state, params, block, 1) != 0
-            );
-            local_exceeded |= uint(local_sum > capacity);
-            local_failure = min(
-                local_failure,
-                load_round_partial(stream_state, params, block, 2)
-            );
-        }
-        sums[lane] = local_sum;
-        exceeded[lane] = local_exceeded;
-        failures[lane] = local_failure;
-        __syncthreads();
-        for (uint stride = 512; stride != 0; stride >>= 1) {
-            if (lane < stride) {
-                ulong right_sum = sums[lane + stride];
-                uint combined_exceeded =
-                    exceeded[lane] | exceeded[lane + stride];
-                ulong combined_sum = saturating_add_ulong(sums[lane], right_sum);
-                combined_exceeded |= uint(combined_sum > capacity);
-                sums[lane] = combined_sum;
-                exceeded[lane] = combined_exceeded;
-                failures[lane] = min(failures[lane], failures[lane + stride]);
-            }
-            __syncthreads();
-        }
-        if (lane == 0) {
-            control[C_OUTBOX] = sums[0];
-            ulong failure = failures[0];
-            if (exceeded[0] != 0) {
-                control[C_ERROR] = ERROR_CAPACITY;
-                control[C_ERROR_ARENA] = ARENA_OUTBOX;
-                control[C_ERROR_NODE] = NONE;
-                control[C_ERROR_CAPACITY] = capacity;
-                control[C_ERROR_DEMAND] = sums[0];
-            } else if (failure != NONE) {
-                ulong batch =
-                    params[P_CHANNEL_BATCH_OFFSET] +
-                    failure * CHANNEL_BATCH_WORDS;
-                ulong stream_base = failure * META_WORDS;
-                ulong capacity = stream_state[stream_base + 1];
-                ulong count = stream_state[stream_base + 3];
-                ulong batch_count = stream_state[batch];
-                control[C_ERROR_NODE] =
-                    stream_state[params[P_CHANNEL_TARGET_OFFSET] + failure];
-                if (
-                    count > capacity ||
-                    batch_count > capacity - min(count, capacity)
-                ) {
-                    control[C_ERROR] = ERROR_CAPACITY;
-                    control[C_ERROR_ARENA] = ARENA_CHANNEL_INBOX;
-                    control[C_ERROR_CAPACITY] = capacity;
-                    control[C_ERROR_DEMAND] = saturating_add_ulong(count, batch_count);
-                } else {
-                    control[C_ERROR] = ERROR_SEMANTIC + 42;
-                }
-            }
-        }
         return;
     }
 
@@ -8032,120 +7920,8 @@ extern "C" __global__ void days_exchange_prefix(DAYS_BUFFERS) {
     }
 }
 
-__device__ __forceinline__ ulong scatter_stream_target(
-    ulong staging_slot,
-    const ulong *params,
-    ulong *stream_state
-) {
-    ulong channel =
-        stream_state[params[P_STAGING_CHANNEL_OFFSET] + staging_slot];
-    ulong batch =
-        params[P_CHANNEL_BATCH_OFFSET] +
-        channel * CHANNEL_BATCH_WORDS;
-    ulong cursor = stream_state[batch + 3];
-    ulong stream_base = channel * META_WORDS;
-    ulong capacity = stream_state[stream_base + 1];
-    ulong physical = (
-        stream_state[stream_base + 2] +
-        stream_state[stream_base + 3] +
-        cursor
-    ) % max(capacity, 1ul);
-    stream_state[batch + 3] = cursor + 1;
-    return stream_state[stream_base] + physical * CHANNEL_EVENT_WORDS;
-}
-
-__device__ __forceinline__ void scatter_stream_commit(
-    ulong producer,
-    const ulong *params,
-    ulong *stream_state
-) {
-    ulong outbound_meta =
-        params[P_OUTBOUND_META_OFFSET] + producer * OUTBOUND_META_WORDS;
-    ulong entry = stream_state[outbound_meta];
-    ulong entry_count = stream_state[outbound_meta + 1];
-    for (ulong index = 0; index < entry_count; ++index) {
-        ulong channel =
-            stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
-        ulong batch =
-            params[P_CHANNEL_BATCH_OFFSET] + channel * CHANNEL_BATCH_WORDS;
-        stream_state[channel * META_WORDS + 3] += stream_state[batch];
-    }
-}
-
-__device__ __forceinline__ void scatter_stream_producer_lane(
-    ulong producer,
-    ulong count,
-    const ulong *params,
-    const ulong *remote_meta,
-    const ulong *remote_staging,
-    ulong *stream_state,
-    ulong *stream_records
-) {
-    ulong base = producer * META_WORDS;
-    ulong staging = remote_meta[base];
-    for (ulong index = 0; index < count; ++index) {
-        ulong target =
-            scatter_stream_target(staging + index, params, stream_state);
-        copy_staging_to_channel(
-            remote_staging,
-            staging + index,
-            stream_records,
-            target
-        );
-    }
-    scatter_stream_commit(producer, params, stream_state);
-}
-
-__device__ __forceinline__ void scatter_stream_producer(
-    ulong producer,
-    ulong count,
-    uint lane,
-    const ulong *params,
-    const ulong *remote_meta,
-    const ulong *remote_staging,
-    ulong *stream_state,
-    ulong *stream_records
-) {
-    // The leader preserves the scalar channel-cursor recurrence. The other
-    // lanes only copy words into the disjoint slots that recurrence selects.
-    ulong staging = 0;
-    if (lane == 0) {
-        ulong base = producer * META_WORDS;
-        staging = remote_meta[base];
-    }
-    staging = __shfl_sync(SCATTER_GROUP_MASK, staging, 0);
-
-    for (ulong index = 0; index < count; index += 2) {
-        ulong first_target = 0;
-        ulong second_target = 0;
-        if (lane == 0) {
-            first_target = scatter_stream_target(staging + index, params, stream_state);
-            if (index + 1 < count) {
-                second_target =
-                    scatter_stream_target(staging + index + 1, params, stream_state);
-            }
-        }
-        first_target = __shfl_sync(SCATTER_GROUP_MASK, first_target, 0);
-        second_target = __shfl_sync(SCATTER_GROUP_MASK, second_target, 0);
-
-        if (lane < 2 * CHANNEL_EVENT_WORDS) {
-            ulong record = lane / CHANNEL_EVENT_WORDS;
-            uint word = lane % CHANNEL_EVENT_WORDS;
-            if (index + record < count) {
-                ulong source_slot = staging + index + record;
-                ulong target_word = record == 0 ? first_target : second_target;
-                ulong source_word = source_slot * REMOTE_STAGING_EVENT_WORDS +
-                    (word < 4 ? word : word + 1);
-                stream_records[target_word + word] = remote_staging[source_word];
-            }
-        }
-    }
-
-    if (lane == 0) {
-        scatter_stream_commit(producer, params, stream_state);
-    }
-}
-
+// The legacy (streams-disabled) exchange's copy of each producer's staged events into its
+// compacted outbox range. The streams path never launches it (P18 ring writes).
 extern "C" __global__ void days_exchange_scatter(DAYS_BUFFERS) {
     uint global_thread = blockIdx.x * blockDim.x + threadIdx.x;
     if (
@@ -8153,65 +7929,6 @@ extern "C" __global__ void days_exchange_scatter(DAYS_BUFFERS) {
         control[C_DONE] != 0 ||
         control[C_CONTINUATION] != 2
     ) {
-        return;
-    }
-    if (
-        params[P_STREAMS_ENABLED] != 0 &&
-        blockDim.x >= SCATTER_GROUP_WIDTH &&
-        blockDim.x % SCATTER_GROUP_WIDTH == 0
-    ) {
-        // Counts below three fit in at most one two-record copy cluster. Keep
-        // those producers on the original lane mapping so one warp can advance
-        // up to 32 of them concurrently.
-        if (global_thread < params[P_NODE_COUNT]) {
-            ulong producer = global_thread;
-            ulong count = remote_meta[producer * META_WORDS + 3];
-            if (count < SCATTER_COOPERATIVE_MIN_RECORDS) {
-                scatter_stream_producer_lane(
-                    producer,
-                    count,
-                    params,
-                    remote_meta,
-                    remote_staging,
-                    stream_state,
-                    stream_records
-                );
-            }
-        }
-
-        // Long producers retain one cooperative warp each. The worklist is
-        // deterministic and unique; the count predicate makes the lane and
-        // cooperative traversals disjoint.
-        uint lane = threadIdx.x % SCATTER_GROUP_WIDTH;
-        ulong groups_per_block = blockDim.x / SCATTER_GROUP_WIDTH;
-        ulong group =
-            ulong(blockIdx.x) * groups_per_block +
-            threadIdx.x / SCATTER_GROUP_WIDTH;
-        ulong group_stride = ulong(gridDim.x) * groups_per_block;
-        for (
-            ulong active_index = group;
-            active_index < control[C_ACTIVE];
-            active_index += group_stride
-        ) {
-            ulong producer = worklist[active_index];
-            ulong count = 0;
-            if (lane == 0) {
-                count = remote_meta[producer * META_WORDS + 3];
-            }
-            count = __shfl_sync(SCATTER_GROUP_MASK, count, 0);
-            if (count >= SCATTER_COOPERATIVE_MIN_RECORDS) {
-                scatter_stream_producer(
-                    producer,
-                    count,
-                    lane,
-                    params,
-                    remote_meta,
-                    remote_staging,
-                    stream_state,
-                    stream_records
-                );
-            }
-        }
         return;
     }
     if (global_thread >= params[P_NODE_COUNT]) {
@@ -8222,45 +7939,6 @@ extern "C" __global__ void days_exchange_scatter(DAYS_BUFFERS) {
     ulong staging = remote_meta[base];
     ulong compact = remote_meta[base + 2];
     ulong count = remote_meta[base + 3];
-    if (params[P_STREAMS_ENABLED] != 0) {
-        for (ulong index = 0; index < count; ++index) {
-            ulong staging_slot = staging + index;
-            ulong channel =
-                stream_state[params[P_STAGING_CHANNEL_OFFSET] + staging_slot];
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            ulong cursor = stream_state[batch + 3];
-            ulong stream_base = channel * META_WORDS;
-            ulong capacity = stream_state[stream_base + 1];
-            ulong physical = (
-                stream_state[stream_base + 2] +
-                stream_state[stream_base + 3] +
-                cursor
-            ) % max(capacity, 1ul);
-            copy_staging_to_channel(
-                remote_staging,
-                staging_slot,
-                stream_records,
-                stream_state[stream_base] + physical * CHANNEL_EVENT_WORDS
-            );
-            stream_state[batch + 3] = cursor + 1;
-        }
-        ulong outbound_meta =
-            params[P_OUTBOUND_META_OFFSET] +
-            ulong(producer) * OUTBOUND_META_WORDS;
-        ulong entry = stream_state[outbound_meta];
-        ulong entry_count = stream_state[outbound_meta + 1];
-        for (ulong index = 0; index < entry_count; ++index) {
-            ulong channel =
-                stream_state[entry + index * OUTBOUND_ENTRY_WORDS + 1];
-            ulong batch =
-                params[P_CHANNEL_BATCH_OFFSET] +
-                channel * CHANNEL_BATCH_WORDS;
-            stream_state[channel * META_WORDS + 3] += stream_state[batch];
-        }
-        return;
-    }
     for (ulong index = 0; index < count; ++index) {
         copy_device_record(
             remote_staging,
@@ -8368,17 +8046,75 @@ __device__ void merge_audit(
     if (heap && stream_state[active] != NONE) {
         mismatches += 1;
     }
+    // P18 ring writes: other merge threads publish their channels (`count += b`) while this one
+    // sweeps, so a channel's live count is racy here. Its count after the round's publish is
+    // `count0 - pops + b`, from words no merge thread writes (`visibility_audit` checks that the
+    // count before the publish is `count0 - pops`).
     ulong nonempty = 0;
     for (
         ulong stream = node;
         stream < params[P_STREAM_COUNT];
         stream += params[P_NODE_COUNT]
     ) {
-        nonempty += ulong(stream_state[stream * META_WORDS + 3] != 0);
+        ulong count = stream_state[stream * META_WORDS + 3];
+        if (stream < params[P_SERVICE_STREAM_BASE]) {
+            ulong batch = params[P_CHANNEL_BATCH_OFFSET] + stream * CHANNEL_BATCH_WORDS;
+            count = stream_state[batch + 2] - stream_state[VISIBILITY_ROW(params, stream) + 1] +
+                stream_state[batch];
+        }
+        nonempty += ulong(count != 0);
     }
     RECORD_MERGE(params, stream_state, node, MA_MISMATCHES, mismatches);
     RECORD_MERGE(params, stream_state, node, MA_NONEMPTY_STREAMS, nonempty);
     RECORD_MERGE(params, stream_state, node, MA_STREAM_ENTRIES, stream_entries);
+}
+
+// P18 ring writes (test hooks only): the visibility rule for inbound channel `channel` of LP
+// `node`, checked at the publish step, before `count += b`. Since the snapshot (`days_round_reset`)
+// the count changed by exactly the consumer's pops and never grew, so nothing was published early;
+// the ring's tail is still `tail0`; the round's `b` records fit beside the snapshot's `count0`;
+// and the `b` slots from `tail0` hash to what the producer wrote there, in emission order, so
+// nothing else wrote them. Each failed clause adds one mismatch.
+__device__ void visibility_audit(
+    ulong node,
+    ulong channel,
+    const ulong *params,
+    ulong *stream_state,
+    const ulong *stream_records
+) {
+    ulong batch = params[P_CHANNEL_BATCH_OFFSET] + channel * CHANNEL_BATCH_WORDS;
+    ulong written = stream_state[batch];
+    ulong tail = stream_state[batch + 1];
+    ulong pending = stream_state[batch + 2];
+    ulong stream_base = channel * META_WORDS;
+    ulong offset = stream_state[stream_base];
+    ulong capacity = stream_state[stream_base + 1];
+    ulong head = stream_state[stream_base + 2];
+    ulong count = stream_state[stream_base + 3];
+    ulong row = VISIBILITY_ROW(params, channel);
+    ulong mismatches = 0;
+    if (count > pending || count + stream_state[row + 1] != pending) {
+        mismatches += 1;
+    }
+    if ((head + count) % max(capacity, 1ul) != tail) {
+        mismatches += 1;
+    }
+    if (pending > capacity || written > capacity - pending) {
+        mismatches += 1;
+    } else {
+        ulong hash = VISIBILITY_FNV_BASIS;
+        for (ulong index = 0; index < written; ++index) {
+            ulong word = offset + ((tail + index) % max(capacity, 1ul)) * CHANNEL_EVENT_WORDS;
+            for (uint part = 0; part < CHANNEL_EVENT_WORDS; ++part) {
+                hash = (hash ^ stream_records[word + part]) * VISIBILITY_FNV_PRIME;
+            }
+        }
+        if (hash != stream_state[row]) {
+            mismatches += 1;
+        }
+    }
+    RECORD_MERGE(params, stream_state, node, MA_VISIBILITY_CHECKS, 1);
+    RECORD_MERGE(params, stream_state, node, MA_VISIBILITY_MISMATCHES, mismatches);
 }
 #endif
 
@@ -8394,16 +8130,17 @@ extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
     }
     if (params[P_STREAMS_ENABLED] != 0) {
         // P17 merge (`days-gpu/evidence/P17/merge/design.md`): processing keeps the LP's active
-        // list exact for every local push, pop and timer removal; only the scatter's remote
-        // delivery leaves a channel that went from empty to non-empty without an entry. So the
-        // merge keeps the maintained list and appends exactly those channels.
+        // list exact for every local push, pop and timer removal; only remote delivery leaves a
+        // channel that went from empty to non-empty without an entry. So the merge keeps the
+        // maintained list and appends exactly those channels.
         //
-        // A channel's batch word counts the records its unique producer appended this round
-        // (zeroed by the reset), and the scatter added it to the channel's count. `count == batch`
-        // with `batch != 0` therefore means the channel was empty after processing and is
-        // non-empty now, which by the list invariant is exactly a channel without an entry.
-        // The LP's stream list holds its inbound channels, ascending, then its service stream;
-        // `stream_state[meta + 1]` counts every stream the LP owns, generators included.
+        // P18 ring writes: this is also where remote delivery happens. Each inbound channel's
+        // producer wrote its `b` records at the ring's tail during processing (`append_remote`)
+        // and counted them in the channel's batch word; the publish is `count += b`, the step that
+        // makes them visible. A channel with `b != 0` that was empty before it is exactly a
+        // channel without an entry. The LP's stream list holds its inbound channels, ascending,
+        // then its service stream; `stream_state[meta + 1]` counts every stream the LP owns,
+        // generators included.
         //
         // The list's order is not canonical: every reader is order-independent (event keys are
         // unique; `fel_peek` takes a strict minimum, the continuation predicate is universal),
@@ -8443,11 +8180,19 @@ extern "C" __global__ void days_exchange_merge(DAYS_BUFFERS) {
             if (stream >= params[P_SERVICE_STREAM_BASE]) {
                 break;
             }
-            ulong batch = stream_state[
+#ifdef DAYS_MERGE_AUDIT
+            visibility_audit(target, stream, params, stream_state, stream_records);
+#endif
+            ulong written = stream_state[
                 params[P_CHANNEL_BATCH_OFFSET] + stream * CHANNEL_BATCH_WORDS
             ];
+            if (written == 0) {
+                continue;
+            }
             ulong stream_base = stream * META_WORDS;
-            if (batch != 0 && stream_state[stream_base + 3] == batch) {
+            ulong count = stream_state[stream_base + 3];
+            stream_state[stream_base + 3] = count + written;
+            if (count == 0) {
                 ulong entry = active + active_count * ACTIVE_STREAM_ENTRY_WORDS;
                 active_count += 1;
                 RECORD_MERGE(params, stream_state, target, MA_APPENDED, 1);

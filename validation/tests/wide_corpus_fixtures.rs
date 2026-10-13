@@ -301,6 +301,20 @@ fn k48_wide_load60_sizing_reproduces_retained_arenas_and_plane_total() {
         .collect::<BTreeSet<_>>()
         .len()
         * std::mem::size_of::<u64>();
+    // P18 ring writes: a streams plan stages nothing, so `stream_state` no longer holds one channel
+    // id per staging slot. The plan staged 60,293,602 records (723,523,224 words of 12-word records
+    // in the `remote_staging` plane at `5c7629ff`, measured).
+    const STAGING_SLOTS: usize = 723_523_224 / 12;
+    let p18_staging_id_bytes = STAGING_SLOTS * std::mem::size_of::<u64>();
+    assert_eq!(
+        report
+            .planes
+            .iter()
+            .find(|plane| plane.name == "remote_staging")
+            .map(|plane| plane.words),
+        Some(1),
+        "a streams plan stages nothing"
+    );
     assert_eq!(
         report.event_arenas,
         DeviceEventArenaSizing {
@@ -310,7 +324,9 @@ fn k48_wide_load60_sizing_reproduces_retained_arenas_and_plane_total() {
             service_stream_event_slots: 294_912,
             generator_stream_event_slots: 22_118,
             heap_arena_bytes: 22_472_272,
-            stream_arena_bytes: 896_615_984 + t21_round_scratch_bytes - p17_generator_id_bytes,
+            stream_arena_bytes: 896_615_984 + t21_round_scratch_bytes
+                - p17_generator_id_bytes
+                - p18_staging_id_bytes,
             legacy_heap_arena_bytes: 7_217_131_632,
         }
     );
