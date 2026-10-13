@@ -4948,6 +4948,39 @@ fn a_warm_merge_allocates_nothing() {
     assert_eq!(allocations, 0, "a warm merge of 1,000 envelopes allocated");
 }
 
+/// P18 W2: an owner keeps a merged batch's buffer for reuse, sized by the batch it carried: a
+/// buffer at most four times the batch (or 64 envelopes) keeps its capacity; a larger one is cut
+/// to twice the batch.
+#[cfg(test)]
+#[test]
+fn a_returned_batch_buffer_keeps_its_capacity_unless_far_larger_than_its_batch() {
+    let image = target_interleaved_outbox_image();
+    // (batch length, buffer capacity, least and most capacity kept)
+    for (length, capacity, least, most) in [
+        (300, 400, 400, 400),
+        (300, 10_000, 300, 1_200),
+        (10, 200, 200, 200),
+        (10, 1_000, 10, 256),
+    ] {
+        let (mut shard, placement, templates) = merge_test_shard(&image);
+        shard.returned_buffers.resize_with(1, Vec::new);
+        let mut envelopes = Vec::with_capacity(capacity);
+        envelopes.extend(merge_test_batch(templates, length, 100, false));
+        let batch = StaticOwnerBatch {
+            round: 0,
+            source: 0,
+            envelopes,
+        };
+        let mut metrics = InboundMergeMetrics::default();
+        merge_static_owner_batch(&mut shard, batch, 0, &placement, true, &mut metrics).unwrap();
+        let kept = shard.returned_buffers[0].capacity();
+        assert!(
+            (least..=most).contains(&kept),
+            "a {length}-envelope batch in a {capacity}-envelope buffer kept {kept}"
+        );
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn one_lp_outbox_is_event_key_ordered_not_target_major() {
