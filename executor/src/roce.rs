@@ -98,7 +98,9 @@ pub(crate) fn settled_status(
 
 /// The grid point at which a parked pacer restarts after a rewind at `now_ns`: the first point of
 /// its pacing grid strictly after `now_ns` (design note D3), so a restart never shares the rewind's
-/// instant and no credit accrues while parked. `None` on overflow.
+/// instant and no credit accrues while parked. `None` on overflow. A pacer the window parked and
+/// an ACK or NACK restarts is the exception: it restarts at the feedback's instant, on a grid
+/// re-anchored there (P18 window-throttle design F2, `scalar::restart_roce_pacer`).
 pub(crate) fn restart_time_ns(roce: &RoceGenerator, now_ns: u64) -> Option<u64> {
     let first = roce.pacer.first_pacing_time_ns;
     let interval = roce.pacer.pacing_interval_ns;

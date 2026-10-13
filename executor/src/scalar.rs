@@ -3345,7 +3345,7 @@ impl<'image> TransitionState<'image> {
                         roce.controller,
                     )));
                 }
-                let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+                let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns, false)?;
                 settle_roce_sender(generator, &roce, generator.next_emission.status);
                 generator.kind = FlowGeneratorKind::Roce(roce);
                 records.push(roce_sender_record(
@@ -4897,7 +4897,7 @@ impl<'image> TransitionState<'image> {
                         roce.rto_deadline_ns = 0;
                     }
                 }
-                tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+                tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns, true)?;
             }
             // A pair without congestion control (P17) has no controller to freeze or feed: its
             // inert controller is never armed, and its sender ignores the ECN echo, so neither
@@ -5099,7 +5099,7 @@ impl<'image> TransitionState<'image> {
                 .checked_add(roce.rto_ns)
                 .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
             roce.rto_deadline_ns = deadline;
-            let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+            let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns, false)?;
             settle_roce_sender(generator, &roce, generator.next_emission.status);
             generator.kind = FlowGeneratorKind::Roce(roce);
             leave_parked_list(state.pfc, data_class, position, generator, &roce);
@@ -7745,25 +7745,37 @@ fn settle_roce_sender(
 }
 
 /// Restarts a parked pacer that has packets to send again, on its next grid point after `now_ns`
-/// (ruling D3). Returns the tick to emit, or `None` when the pacer stays as it is; a restart
-/// beyond the stop time leaves it `Stopped` there.
+/// (ruling D3), or, when `feedback` (an ACK or NACK that moved `snd_una`) finds it parked by the
+/// window, at `now_ns` on a grid re-anchored there (P18 window-throttle design F2: ACK-clocked).
+/// Returns the tick to emit, or `None` when the pacer stays as it is; a restart beyond the stop
+/// time leaves it `Stopped` there.
 fn restart_roce_pacer(
     generator: &mut crate::FlowGeneratorState,
     roce: &mut crate::RoceGenerator,
     now_ns: u64,
     stop_time_ns: u64,
+    feedback: bool,
 ) -> Result<Option<u64>, ExecutionError> {
     // Every restart attempt ends a window park (ruling D7): it runs only for an ACK or NACK that
     // moves `snd_una` and for a timeout, whatever it then finds.
-    roce.window_parked = false;
+    let window_parked = std::mem::replace(&mut roce.window_parked, false);
     if roce.pacer_armed
         || roce.next_psn >= roce.pacer.total_bytes
         || roce.snd_una >= roce.pacer.total_bytes
     {
         return Ok(None);
     }
-    let time_ns = crate::roce::restart_time_ns(roce, now_ns)
-        .ok_or(ExecutionError::GeneratorTimeOverflow(generator.flow))?;
+    let time_ns = if feedback && window_parked {
+        // F2: the tick runs at the feedback's instant, after it (a pacing timer is phase 1), and
+        // credits one interval as every tick does. The window-blocked tick that parked the pacer
+        // credited nothing and lay at least one interval after the last crediting tick, so
+        // crediting ticks stay at least one interval apart.
+        roce.pacer.first_pacing_time_ns = now_ns;
+        now_ns
+    } else {
+        crate::roce::restart_time_ns(roce, now_ns)
+            .ok_or(ExecutionError::GeneratorTimeOverflow(generator.flow))?
+    };
     generator.next_emission.departure_time_ns = time_ns;
     if time_ns <= stop_time_ns {
         roce.pacer_armed = true;

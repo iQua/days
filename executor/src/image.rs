@@ -751,7 +751,9 @@ pub struct RoceGenerator {
     pub variable_window: bool,
     /// The pacer is parked because a tick found the window closed, and no restart has run since.
     /// Only an ACK or NACK that moves `snd_una`, or a timeout, restarts such a pacer; a host
-    /// RESUME does not (it restarts pause-parked pacers), so the bit keeps the two apart.
+    /// RESUME does not (it restarts pause-parked pacers), so the bit keeps the two apart. The
+    /// ACK or NACK restarts it at its own instant and re-anchors the pacing grid there (P18
+    /// window-throttle design F2); a timeout restarts it on the old grid (ruling D3).
     pub window_parked: bool,
     /// P17: DCQCN, or no congestion control.
     pub congestion_control: RoceCongestionControl,

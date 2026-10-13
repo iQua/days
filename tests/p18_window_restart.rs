@@ -131,14 +131,14 @@ fn a_window_parked_pacer_restarts_at_the_feedback_that_reopens_its_window() {
     );
 }
 
-/// `configs/p15/roce_gbn_lossy.toml` with an 8,000 B window on each pair: tail losses leave some
-/// window-parked pair without feedback until its retransmission timeout fires.
+/// `configs/p15/roce_gbn_lossy.toml` with an 8,000 B window on each pair and a 100 us timeout:
+/// tail losses leave some window-parked pair without feedback until its timeout fires.
 fn lossy_window_image() -> SimulationImage {
     let directory = TempDir::new().unwrap();
     let text = fs::read_to_string(repo_path("configs/p15/roce_gbn_lossy.toml")).unwrap();
     let windowed = text.replace(
         "retransmit_timeout_ns = 1000000\n",
-        "retransmit_timeout_ns = 1000000\nwindow_bytes = 8000\n",
+        "retransmit_timeout_ns = 100000\nwindow_bytes = 8000\n",
     );
     assert_ne!(windowed, text);
     let path = directory.path().join("roce_gbn_lossy_window.toml");
