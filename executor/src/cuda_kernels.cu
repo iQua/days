@@ -1627,11 +1627,43 @@ __device__ __forceinline__ bool source_queue_insert(
         return false;
     }
     bool control = MECHANISMS && roce_control_kind(record[PK_KIND]);
+    if (MECHANISMS && control) {
+        // Decision D16b: a control packet goes after the leading run of control packets whose
+        // key is not greater, counted from the head, as Scalar's `enqueue_source_packet` counts
+        // it. The run moves one slot toward the head, so a control packet costs the queued
+        // control packets (usually none or one), never the data behind them.
+        ulong run = 0;
+        while (run < count) {
+            ulong slot = offset + (head + run) % capacity;
+            if (!roce_control_kind(records[slot * EVENT_WORDS + PK_KIND]) ||
+                !source_queue_key_less_or_equal<MECHANISMS>(records, slot, record, true)) {
+                break;
+            }
+            run += 1;
+        }
+        ulong position = (head + run) % capacity;
+        if (run < count) {
+            ulong first = (head + capacity - 1) % capacity;
+            for (ulong index = 0; index < run; ++index) {
+                copy_device_record(
+                    records,
+                    offset + (head + index) % capacity,
+                    records,
+                    offset + (first + index) % capacity
+                );
+            }
+            position = (first + run) % capacity;
+            meta[base + 2] = first;
+        }
+        copy_thread_to_device(record, records, offset + position);
+        meta[base + 3] = count + 1;
+        return true;
+    }
     ulong insertion = count;
     while (insertion != 0) {
         ulong previous = insertion - 1;
         ulong previous_slot = offset + (head + previous) % max(capacity, 1ul);
-        if (source_queue_key_less_or_equal<MECHANISMS>(records, previous_slot, record, control)) {
+        if (source_queue_key_less_or_equal<MECHANISMS>(records, previous_slot, record, false)) {
             break;
         }
         ulong destination = offset + (head + insertion) % max(capacity, 1ul);
