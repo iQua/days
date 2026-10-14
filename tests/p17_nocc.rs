@@ -376,7 +376,8 @@ fn the_sender_csv_names_each_pairs_congestion_control() {
         .expect("a header")
         .split(',')
         .collect::<Vec<_>>();
-    assert_eq!(header.len(), 46);
+    // Column 46 (Amendment 7); P18's Amendment 8 appends column 47, the grid anchor after.
+    assert_eq!(header.len(), 47);
     assert_eq!(header[45], "congestion_control");
     let flow = header
         .iter()
@@ -385,7 +386,7 @@ fn the_sender_csv_names_each_pairs_congestion_control() {
     let mut seen = [0_usize; 2];
     for line in lines {
         let fields = line.split(',').collect::<Vec<_>>();
-        assert_eq!(fields.len(), 46, "{line}");
+        assert_eq!(fields.len(), 47, "{line}");
         let none = nocc.contains(&fields[flow].parse::<u64>().unwrap());
         assert_eq!(fields[45], if none { "none" } else { "dcqcn" }, "{line}");
         seen[usize::from(none)] += 1;

@@ -41,29 +41,30 @@ const ROCE_FIXTURES: &[&str] = &[
 ];
 
 /// Frozen Scalar summary-mode anchors (`tests/p15_roce_collectives.rs`, re-frozen at P16 D1 and
-/// ecnramp): the devices must reproduce the same pretty-`Debug` bytes and FNV-1a64.
+/// ecnramp, and at P18 ackfix for decision D16b with `roce_ring_release_paused` re-tuned): the
+/// devices must reproduce the same pretty-`Debug` bytes and FNV-1a64.
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        190_023,
-        0x7991_1130_0edc_753d,
+        190_022,
+        0x4a9f_b9b2_59df_36bf,
     ),
     (
         "roce_allgather_lossless.toml",
         122_162,
-        0xa7d6_51e8_b84f_7b01,
+        0x8ad2_3f0d_d194_e2c6,
     ),
-    ("roce_ring_lossy.toml", 179_008, 0x62fd_2636_40b6_c9c1),
-    ("roce_compute_dag.toml", 208_285, 0xb946_2a2b_3cbe_0b26),
+    ("roce_ring_lossy.toml", 178_209, 0x76e1_0dbe_9c01_eec7),
+    ("roce_compute_dag.toml", 208_284, 0x1eb2_9ae4_dadc_5fa1),
     (
         "roce_tcp_mixed_collectives.toml",
         136_572,
-        0xbd42_30ab_406e_c194,
+        0x4a52_12d7_577b_8450,
     ),
     (
         "roce_ring_release_paused.toml",
-        193_977,
-        0xcee3_a626_84e9_2076,
+        193_970,
+        0xed99_648e_b41c_6a49,
     ),
 ];
 

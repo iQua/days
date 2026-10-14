@@ -37,6 +37,9 @@
 #   41 after_credit_quanta  42 after_rto_deadline_ns  43 after_pacer  44 after_next_tick_ns
 #   45 after_status
 #   46 congestion_control (P17 Amendment 7: `dcqcn` or `none`; appended, so 1..45 keep their places)
+#   47 after_grid_anchor_ns (P18 Amendment 8: the pacing grid's anchor is sender state; column 14,
+#      first_pacing_time_ns, is the anchor before the transition and column 47 the anchor after it.
+#      An ACK or NACK that restarts a window-parked pacer re-anchors it at its own instant.)
 # Every sender log carries data_class, so every sender case passes its PFC log (--pfc); the hand
 # fixtures without host PFC have a header-only one.
 #
@@ -660,28 +663,32 @@ mutate_nocc() {
 }
 mutate_nocc "pairs-relabelled-dcqcn" nocc_echo sender \
   'NR > 1 { $46 = "dcqcn" } { print }' \
-  'REJECT: sender: line 164: RoCE ACK or NACK echoes CE on an incomplete queue pair but has no DCQCN feedback row (node_id=1, flow_id=1)'
+  'REJECT: sender: line 156: RoCE ACK or NACK echoes CE on an incomplete queue pair but has no DCQCN feedback row (node_id=1, flow_id=1)'
 mutate_nocc "lossy-pairs-relabelled-dcqcn" nocc_lossy sender \
   'NR > 1 { $46 = "dcqcn" } { print }' \
-  'REJECT: sender: line 127: RoCE ACK or NACK echoes CE on an incomplete queue pair but has no DCQCN feedback row (node_id=1, flow_id=1)'
+  'REJECT: sender: line 122: RoCE ACK or NACK echoes CE on an incomplete queue pair but has no DCQCN feedback row (node_id=1, flow_id=1)'
 mutate_nocc "dcqcn-pair-relabelled-none" nocc_mixed sender \
   'NR > 1 && $6 == 1 { $46 = "none" } { print }' \
   'REJECT: dcqcn: line 2: DCQCN row of a queue pair without congestion control (node_id=1, flow_id=1)'
-# A feedback row for pair 0 (no congestion control) at its first echoing ACK (350168, 0, 4, 137),
-# consistent on its own terms (a first feedback: next alpha tick at +1,000 ns, next decrease check
-# at +4,001 ns), joined at a sender row that may not have one.
+# A feedback row for pair 0 (no congestion control) at its first echoing ACK (located by named
+# columns: (334168, 0, 4, 131) since P18's F1), consistent on its own terms (a first feedback:
+# next alpha tick at +1,000 ns, next decrease check at +4,001 ns), joined at a sender row that may
+# not have one.
 nocc_mixed_base="$fixture_dir/roce_trace_nocc_mixed_executor_accept"
+read -r fed_t fed_p fed_o fed_s <<<"$(awk -F, 'NR == 1 { for (i = 1; i <= NF; i++) c[$i] = i; next } $c["flow_id"] == 0 && $c["kind"] == "ack" && $c["input_ce_echo"] == 1 { print $1, $2, $3, $4; exit }' "$nocc_mixed_base.sender.csv")"
 {
   head -1 "$nocc_mixed_base.dcqcn.csv"
   {
     tail -n +2 "$nocc_mixed_base.dcqcn.csv"
-    awk -F, -v OFS=, 'NR == 2 { $1 = 350168; $2 = 0; $3 = 4; $4 = 137; $5 = 0; $6 = 0; $8 = 350168; $38 = 351168; $39 = 354169; print }' \
+    awk -F, -v OFS=, -v t="$fed_t" -v p="$fed_p" -v o="$fed_o" -v q="$fed_s" \
+      'NR == 2 { $1 = t; $2 = p; $3 = o; $4 = q; $5 = 0; $6 = 0; $8 = t; $38 = t + 1000; $39 = t + 4001; print }' \
       "$nocc_mixed_base.dcqcn.csv"
   } | sort -t, -k1,1n -k2,2n -k3,3n -k4,4n
 } > "$campaign_tmp/nocc-fed.dcqcn.csv"
+fed_line="$(awk -F, -v t="$fed_t" -v q="$fed_s" '$1 == t && $4 == q && $6 == 0 { print NR; exit }' "$campaign_tmp/nocc-fed.dcqcn.csv")"
 mutations=$((mutations + 1))
 if check_case "nocc/dcqcn-row-of-a-pair-without-congestion-control" 1 \
-    'REJECT: dcqcn: line 6: DCQCN row of a queue pair without congestion control (node_id=0, flow_id=0)' \
+    "REJECT: dcqcn: line $fed_line: DCQCN row of a queue pair without congestion control (node_id=0, flow_id=0)" \
     trace "$nocc_mixed_base.sender.csv" "$nocc_mixed_base.receiver.csv" \
     "$campaign_tmp/nocc-fed.dcqcn.csv" --pfc "$nocc_mixed_base.pfc.csv" \
     "$(cat "$nocc_mixed_base.stop_time_ns")"; then
@@ -703,7 +710,7 @@ mutate_nocc "unknown-mode" nocc_echo sender \
   'NR == 2 { $46 = "hpcc" } { print }' \
   "REJECT: sender: line 2: invalid RoCE congestion_control: 'hpcc'"
 mutate_nocc "mode-column-missing" nocc_echo sender \
-  '{ NF = 45; print }' \
+  '{ for (i = 46; i < NF; i++) $i = $(i + 1); NF = NF - 1; print }' \
   'REJECT: sender: line 1: sender log lacks P16 sender schema column(s): congestion_control'
 
 # --- Pending events must fire (review H1) -----------------------------------------------------
@@ -982,7 +989,7 @@ check_case "roce_sender_resume_accept.csv (stop inferred)" 0 "ACCEPT" \
 # restarts flow 7 at 8500, beyond stop 8000: stopped.
 resume_order='REJECT: sender: line 9: RoCE resume rows sharing an event key must be of one node in strictly increasing flow_id order'
 mutate_amended "resume-of-unpaused-pair" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
-  'NR == 14 { print "7600,0,9,1,1,3,resume,0,0,3,1000,2000,1000,1000,0,0,0,8000000000,8000000000,,,,0,,,,,2000,0,2000,2,0,,parked,,blocked,2000,0,2000,2,0,,parked,,blocked,dcqcn" } { print }' \
+  'NR == 14 { print "7600,0,9,1,1,3,resume,0,0,3,1000,2000,1000,1000,0,0,0,8000000000,8000000000,,,,0,,,,,2000,0,2000,2,0,,parked,,blocked,2000,0,2000,2,0,,parked,,blocked,dcqcn,1000" } { print }' \
   'REJECT: sender: line 14: RoCE resume of a queue pair not parked by a pause (node_id=1, flow_id=3)'
 mutate_amended "two-resume-rows-for-one-flow" "$resume" "$resume_dcqcn" "$resume_pfc" "$resume_stop" \
   'NR == 8 { print } { print }' \
@@ -1368,6 +1375,77 @@ m_line="$(awk -F, -v flow="$m_flow" 'NR == 1 { for (i = 1; i <= NF; i++) d[$i] =
 window_reject "maximum-rate-not-the-controllers" \
   '$c["flow_id"] == '"$m_flow"' { $c["maximum_rate_bps"] += 1 }' \
   "REJECT: dcqcn: line $m_line: DCQCN maximum rate differs from the queue pair's maximum_rate_bps (node_id=$m_node, flow_id=$m_flow)"
+
+# --- Amendment 8 (P18 window-throttle F2): the pacing grid's anchor is sender state -------------
+# An ACK or NACK that moves `snd_una` and finds the pacer parked by the window restarts it at its own
+# instant, on a grid re-anchored there; timeouts and host RESUMEs restart on the old grid (D3).
+# Column 14, first_pacing_time_ns, is the anchor before a transition and column 47,
+# after_grid_anchor_ns, the anchor after it. The window prefix above re-anchors 24 times;
+# roce_trace_window_timeout_prefix_executor_accept is configs/p15/roce_gbn_lossy.toml with an
+# 8,000 B window and a 100 us timeout on each pair, before 900,000 ns (days-gpu
+# evidence/P18/ackfix/tooling/lg-configs/roce_gbn_lossy_window_lg.toml, regen_traces.sh): 35
+# feedback re-anchors and a timeout that restarts a window-parked pacer on its old grid. These
+# mutations locate their rows by named columns.
+wt="$fixture_dir/roce_trace_window_timeout_prefix_executor_accept"
+# anchor_reject <label> <fixture base> <awk program over the sender log> <expected REJECT line>
+anchor_reject() {
+  awk -F, -v OFS=, "$named $3"' { print }' "$2.sender.csv" > "$campaign_tmp/anchor.sender.csv"
+  mutations=$((mutations + 1))
+  if check_case "anchor/$1" 1 "$4" \
+      trace "$campaign_tmp/anchor.sender.csv" "$2.receiver.csv" "$2.dcqcn.csv" --pfc "$2.pfc.csv" \
+      --horizon-ns "$(cat "$2.horizon_ns")" "$(cat "$2.stop_time_ns")"; then
+    mutations_caught=$((mutations_caught + 1))
+  fi
+}
+# The first feedback row that re-anchors a window-parked pacer, and its D3 restart on the old grid.
+read -r r_line r_old r_d3 <<<"$(awk -F, "$columns"' $c["first_pacing_time_ns"] != $c["after_grid_anchor_ns"] { a = $c["first_pacing_time_ns"]; i = $c["pacing_interval_ns"]; print NR, a, a + (int(($c["time_ns"] - a) / i) + 1) * i; exit }' "$wn.sender.csv")"
+# The design's RED fixture, committed: that ACK restarts the window-parked pacer on its old grid,
+# as ruling D3 did before F2.
+check_case "roce_window_old_grid_restart_reject" 1 "$(sed -n '2p' "$fixture_dir/roce_window_old_grid_restart_reject.expected")" \
+  trace "$fixture_dir/roce_window_old_grid_restart_reject.sender.csv" "$wn.receiver.csv" \
+  "$wn.dcqcn.csv" --pfc "$wn.pfc.csv" --horizon-ns "$(cat "$wn.horizon_ns")" \
+  "$(cat "$wn.stop_time_ns")" || true
+anchor_reject "feedback-restart-on-the-old-grid" "$wn" \
+  "NR == $r_line"' { $c["after_next_tick_ns"] = '"$r_d3"'; $c["after_grid_anchor_ns"] = '"$r_old"' }' \
+  "REJECT: sender: line $r_line: RoCE sender after-state mismatch"
+anchor_reject "feedback-restart-at-its-instant-without-re-anchoring" "$wn" \
+  "NR == $r_line"' { $c["after_grid_anchor_ns"] = '"$r_old"' }' \
+  "REJECT: sender: line $r_line: invalid RoCE sender after-state"
+anchor_reject "feedback-restart-re-anchored-on-the-old-grid-point" "$wn" \
+  "NR == $r_line"' { $c["after_next_tick_ns"] = '"$r_d3"'; $c["after_grid_anchor_ns"] = '"$r_d3"' }' \
+  "REJECT: sender: line $r_line: RoCE sender after-state mismatch"
+# A crediting tick that moves the anchor (still on the grid it claims).
+read -r k_line k_time <<<"$(awk -F, "$columns"' seen[$c["flow_id"]]++ && $c["kind"] == "tick" && $c["rate_bps"] != "" && $c["after_pacer"] == "armed" { print NR, $c["time_ns"]; exit }' "$wn.sender.csv")"
+anchor_reject "tick-moves-the-anchor" "$wn" \
+  "NR == $k_line"' { $c["after_grid_anchor_ns"] = '"$k_time"' }' \
+  "REJECT: sender: line $k_line: RoCE sender after-state mismatch"
+# The anchor a row starts from is the one its pair's previous row left.
+read -r d_line d_flow d_node <<<"$(awk -F, "$columns"' seen[$c["flow_id"]]++ > 2 && $c["kind"] == "ack" { print NR, $c["flow_id"], $c["node_id"]; exit }' "$wn.sender.csv")"
+anchor_reject "anchor-discontinuity" "$wn" \
+  "NR == $d_line"' { $c["first_pacing_time_ns"] += $c["pacing_interval_ns"] }' \
+  "REJECT: sender: line $d_line: RoCE sender state discontinuity (node_id=$d_node, flow_id=$d_flow)"
+# A timeout restarts a window-parked pacer on its old grid; re-anchoring it there (as the
+# window-throttle scratch patch did) is rejected.
+read -r t_line t_time <<<"$(awk -F, "$columns"' { k = $c["kind"]; f = $c["flow_id"] } $c["window_blocked"] == 1 { wp[f] = 1; next } { if (wp[f] && k == "timeout" && $c["after_pacer"] == "armed") { print NR, $c["time_ns"]; exit } if (k == "timeout" || k == "ack" || k == "nack") wp[f] = 0 }' "$wt.sender.csv")"
+anchor_reject "timeout-restart-re-anchored" "$wt" \
+  "NR == $t_line"' { $c["after_next_tick_ns"] = '"$t_time"'; $c["after_grid_anchor_ns"] = '"$t_time"' }' \
+  "REJECT: sender: line $t_line: RoCE sender after-state mismatch"
+# A feedback re-anchor of the timeout fixture, restarted on the old grid instead.
+read -r q_line q_old q_d3 <<<"$(awk -F, "$columns"' $c["first_pacing_time_ns"] != $c["after_grid_anchor_ns"] { a = $c["first_pacing_time_ns"]; i = $c["pacing_interval_ns"]; print NR, a, a + (int(($c["time_ns"] - a) / i) + 1) * i; exit }' "$wt.sender.csv")"
+anchor_reject "lossy-feedback-restart-on-the-old-grid" "$wt" \
+  "NR == $q_line"' { $c["after_next_tick_ns"] = '"$q_d3"'; $c["after_grid_anchor_ns"] = '"$q_old"' }' \
+  "REJECT: sender: line $q_line: RoCE sender after-state mismatch"
+# A host RESUME restarts a pause-parked pacer on its old grid (D3), never at its instant.
+read -r h_line h_time <<<"$(awk -F, "$columns"' $c["kind"] == "resume" && $c["after_pacer"] == "armed" { print NR, $c["time_ns"]; exit }' "$hp.sender.csv")"
+awk -F, -v OFS=, "$named"' NR == '"$h_line"' { $c["after_next_tick_ns"] = '"$h_time"'; $c["after_grid_anchor_ns"] = '"$h_time"' } { print }' \
+  "$hp.sender.csv" > "$campaign_tmp/anchor-resume.sender.csv"
+expect_hp_reject "resume-restart-re-anchored" \
+  "REJECT: sender: line $h_line: RoCE sender after-state mismatch" \
+  "$campaign_tmp/anchor-resume.sender.csv" "$hp.receiver.csv" "$hp.dcqcn.csv" "$hp.pfc.csv"
+# The anchor after is a required column.
+mutate_nocc "anchor-column-missing" nocc_echo sender \
+  '{ NF = 46; print }' \
+  'REJECT: sender: line 1: sender log lacks P16 sender schema column(s): after_grid_anchor_ns'
 
 # --- Collective stages over RoCE (P15 LeanGuard part 3): the --collective joins -----------------
 # The DAG prefix: rows 2-5 release the four compute-gated roots at 5,000 ns; row 11 releases flow 7

@@ -618,15 +618,20 @@ fn widened_release_paused(ranks: usize, variant: Variant) -> SimulationImage {
 /// R2-F1): a windowed pair with a retransmission timeout rewinds behind a backlog, so its window
 /// does not bound its queues either; the rings whose stage pairs have a window and a 1 ms or a
 /// 100 us timeout keep their base 0 and 2 (the window grouping had taken 1 and 5).
+///
+/// P18 ackfix (decision D16b and the ACK-clocked restart, F2): the TCP ring and the windowed ring
+/// with a 100 us timeout take no retry (1 and 2 before). MEASURED on CUDA: the same without the
+/// re-tune of `roce_ring_release_paused` and without the F2 restart term of the event bounds, so
+/// the new queue dynamics alone keep their queues within the default plan.
 #[allow(dead_code)]
 const PINNED_RETRIES: &[(&str, usize)] = &[
     ("hostpfc_multi_qp_window_50000", 1),
     ("hostpfc_multi_qp_tcp", 8),
     ("release_paused_ring16", 0),
     ("release_paused_ring16_no_host_pfc", 2),
-    ("release_paused_ring16_tcp", 1),
+    ("release_paused_ring16_tcp", 0),
     ("release_paused_ring16_stage_window", 0),
-    ("release_paused_ring16_stage_window_rto100us", 2),
+    ("release_paused_ring16_stage_window_rto100us", 0),
 ];
 
 #[allow(dead_code)]

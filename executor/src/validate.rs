@@ -6421,6 +6421,30 @@ pub(crate) fn roce_grid_ticks(
     (image.stop_time_ns - start) / roce.pacer.pacing_interval_ns + 1
 }
 
+/// Pacing ticks beyond [`roce_grid_ticks`] that a RoCE queue pair can still run until the stop
+/// time: P18 window-throttle design F2 restarts a window-parked pacer at the instant of the ACK or
+/// NACK that reopens its window, off the old grid, and re-anchors the grid there.
+///
+/// Every tick but such a restart lies at least one interval after the tick before it, so at most
+/// [`roce_grid_ticks`] of them remain. Each restart follows the window-blocked tick that parked
+/// the pacer: a future grid tick, the park the pair is in now, or a restarted tick that found the
+/// window still closed. Such a tick was restarted by an ACK that moved `snd_una` by at least a
+/// packet (a NACK's restart rewinds `next_psn` to `snd_una`, which opens the window), so there are
+/// at most as many as unacknowledged packets. None without a window, or with no tick left.
+pub(crate) fn roce_restart_ticks(roce: crate::RoceGenerator, grid_ticks: u64) -> u64 {
+    if roce.window_bytes == 0 || grid_ticks == 0 {
+        return 0;
+    }
+    let unacknowledged = roce
+        .pacer
+        .total_bytes
+        .saturating_sub(roce.snd_una)
+        .div_ceil(roce.pacer.mtu_bytes.max(1));
+    grid_ticks
+        .saturating_add(unacknowledged)
+        .saturating_add(u64::from(roce.window_parked))
+}
+
 /// Retransmission-timeout installations a RoCE queue pair can still make until the stop time.
 ///
 /// A timeout is installed when a send makes data outstanding (at most one per pacing tick), when
@@ -7817,17 +7841,22 @@ fn validate_origin_sequences(
                     pacing_successors
                 }
                 FlowGeneratorKind::Roce(roce) => {
-                    // Every pacing tick, restarts included, and every timeout installation is one
-                    // emitted event (a conservative count: the pending tick already exists).
+                    // Every pacing tick, restarts included (F2's off the grid too), and every
+                    // timeout installation is one emitted event (a conservative count: the pending
+                    // tick already exists).
                     let pacing_ticks = roce_grid_ticks(image, &generator, roce);
                     let data_packets = executable_generator_packets(image, generator)?;
                     let timers = roce_timer_installations(image, roce, pacing_ticks, data_packets)?;
-                    pacing_ticks.checked_add(timers).ok_or_else(|| {
-                        ValidationError::new(format!(
-                            "flow {:?} RoCE timer event count exceeds u64",
-                            generator.flow
-                        ))
-                    })?
+                    let restarts = roce_restart_ticks(roce, pacing_ticks);
+                    pacing_ticks
+                        .checked_add(timers)
+                        .and_then(|events| events.checked_add(restarts))
+                        .ok_or_else(|| {
+                            ValidationError::new(format!(
+                                "flow {:?} RoCE timer event count exceeds u64",
+                                generator.flow
+                            ))
+                        })?
                 }
             };
             emissions_by_node[owner.id.0 as usize] += u128::from(emissions);

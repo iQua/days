@@ -689,7 +689,9 @@ pub(crate) fn encode_roce_generator(roce: &crate::RoceGenerator, row: &mut [u64]
 /// `anchor_released` (P16 G1, design note G6) is true exactly when the pair is a collective stage
 /// that was unreleased in the input image and is released in the decoded stage state: its release
 /// moved the grid anchor `G_RATE_FIRST` from zero to the release time (rulings C2, C5), so the
-/// anchor is restored from the row. Every other pair keeps the anchor immutable.
+/// anchor is restored from the row. A pair with a window restores it from the row too: an ACK or
+/// NACK that restarts its window-parked pacer re-anchors the grid at its own instant (P18
+/// window-throttle design F2). Every other pair keeps the anchor immutable.
 pub(crate) fn decode_roce_generator(
     row: &[u64],
     roce: &mut crate::RoceGenerator,
@@ -697,7 +699,7 @@ pub(crate) fn decode_roce_generator(
 ) -> Result<(), &'static str> {
     let mut expected = [0_u64; 43];
     encode_roce_generator(roce, &mut expected);
-    if anchor_released {
+    if anchor_released || roce.window_bytes != 0 {
         expected[G_RATE_FIRST] = row[G_RATE_FIRST];
     }
     let immutable = [
@@ -932,7 +934,8 @@ pub(crate) fn recompute_pause_parked(image: &SimulationImage, state: &mut crate:
 
 /// An upper bound on the device transitions one RoCE queue pair can still cause, beyond what its
 /// estimated packets contribute (P15). Its timers: pacing ticks (at most one per remaining grid
-/// point, restarts included: a restart lands on a grid point and at most one tick is pending)
+/// point, D3 restarts included: such a restart lands on a grid point and at most one tick is
+/// pending; plus the off-grid restarts of a windowed pair, P18 F2, `roce_restart_ticks`)
 /// and timeout firings (the Mellanox-form controller has no timer event, P16) (each re-arms `rto_ns`
 /// later, so at most one per `rto_ns` until the stop time; none with the timeout off). Its
 /// packets: at most one data packet per grid tick, each answered by at most an ACK or NACK (P16:
@@ -946,6 +949,8 @@ pub(crate) fn roce_transition_bound(
 ) -> usize {
     let stop = image.stop_time_ns;
     let pacing = crate::validate::roce_grid_ticks(image, generator, roce);
+    // P18 window-throttle F2: a window-parked pacer that feedback restarts ticks off the grid.
+    let restarts = crate::validate::roce_restart_ticks(roce, pacing);
     let timeouts = stop.checked_div(roce.rto_ns).map_or(0, |fires| fires + 1);
     let hops = image
         .flows
@@ -958,6 +963,7 @@ pub(crate) fn roce_transition_bound(
         .saturating_mul(1_u64.saturating_add(hops.saturating_mul(3)));
     usize::try_from(
         pacing
+            .saturating_add(restarts)
             .saturating_add(timeouts)
             .saturating_add(packet_transitions),
     )
@@ -2054,10 +2060,12 @@ mod tests {
 
     /// P16 G1 (design note G6): a gated stage's queue pair holds its grid anchor at zero until its
     /// release writes the release time. Its row decodes onto the input pair with the anchor
-    /// restored; the same change on an ordinary pair stays a corrupt row.
+    /// restored; the same change on an ordinary pair without a window stays a corrupt row.
     #[test]
     fn a_released_stage_row_restores_its_grid_anchor() {
         let mut gated = roce_generator();
+        gated.window_bytes = 0;
+        gated.variable_window = false;
         gated.pacer.first_pacing_time_ns = 0;
         gated.pacer_armed = false;
         gated.next_psn = 0;
@@ -2078,6 +2086,33 @@ mod tests {
         assert_eq!(decoded, released);
         let mut ordinary = gated;
         assert!(decode_roce_generator(&row, &mut ordinary, false).is_err());
+    }
+
+    /// P18 window-throttle F2: an ACK or NACK that restarts a window-parked pacer re-anchors its
+    /// grid at its own instant, so a windowed pair's row carries a moved anchor, which decodes.
+    #[test]
+    fn a_windowed_pair_row_restores_a_moved_grid_anchor() {
+        let parked = crate::RoceGenerator {
+            pacer_armed: false,
+            window_parked: true,
+            ..roce_generator()
+        };
+        assert_ne!(parked.window_bytes, 0);
+        let restarted = crate::RoceGenerator {
+            pacer: crate::RocePacer {
+                first_pacing_time_ns: parked.pacer.first_pacing_time_ns + 5,
+                ..parked.pacer
+            },
+            pacer_armed: true,
+            window_parked: false,
+            ..parked
+        };
+        let mut row = [0_u64; 43];
+        row[6] = restarted.pacing_timer_payload.0;
+        encode_roce_generator(&restarted, &mut row);
+        let mut decoded = parked;
+        decode_roce_generator(&row, &mut decoded, false).expect("a re-anchored row decodes");
+        assert_eq!(decoded, restarted);
     }
 
     /// P17 lane nocc: a pair without congestion control writes its mode in word 39, which a row
@@ -2418,6 +2453,9 @@ mod tests {
             reverse_route: vec![crate::LinkId(2), crate::LinkId(3)],
         });
         let mut roce = roce_generator();
+        // Without a window first: every tick lies on the grid.
+        roce.window_bytes = 0;
+        roce.variable_window = false;
         let mut generator = generator_state(FlowGeneratorKind::Roce(roce));
         generator.next_emission.departure_time_ns = 0;
         // 11 grid ticks (0, 16, ..., 160), 4 timeout firings
@@ -2430,6 +2468,23 @@ mod tests {
         assert_eq!(
             roce_transition_bound(&image, &generator, roce),
             11 + 11 * 2 * 7
+        );
+        // P18 F2: with a window, feedback restarts a window-parked pacer off the grid, after a
+        // blocked grid tick (11), a blocked restarted tick (one per unacknowledged packet) or the
+        // park the pair is in now.
+        roce.window_bytes = 2 * roce.pacer.mtu_bytes;
+        // (180 - 17) / 17, rounded up: 10.
+        let unacknowledged =
+            usize::try_from((roce.pacer.total_bytes - roce.snd_una).div_ceil(roce.pacer.mtu_bytes))
+                .unwrap();
+        assert_eq!(
+            roce_transition_bound(&image, &generator, roce),
+            11 + (11 + unacknowledged) + 11 * 2 * 7
+        );
+        roce.window_parked = true;
+        assert_eq!(
+            roce_transition_bound(&image, &generator, roce),
+            11 + (11 + unacknowledged + 1) + 11 * 2 * 7
         );
     }
 }

@@ -1596,12 +1596,31 @@ inline bool queue_push(
     return true;
 }
 
+// P18 decision D16b (window-throttle design F1): a RoCE ACK, RoCE NACK or DCQCN CNP, the kinds
+// `pfc_class_of` sends on the feedback class (Scalar `PacketKind::is_roce_control`), from the kind
+// word with the ECN flag masked.
+inline bool roce_control_kind(ulong kind_word) {
+    ulong kind = kind_word & PK_KIND_MASK;
+    return kind == DCQCN_CNP_PACKET || kind == ROCE_ACK_PACKET || kind == ROCE_NACK_PACKET;
+}
+
+// Scalar `enqueue_source_packet`'s key `(rank, has_source_time, source_time_ns, flow, id)`: the
+// source time and its presence are `E_TIME` and `E_PHASE` (a restored packet holds phase 0). The
+// rank (decision D16b) puts control packets ahead of every other packet; only the mechanisms build
+// can hold one, so the plain build compiles it out. `right_control` is the inserted record's.
 inline bool source_queue_key_less_or_equal(
     const device ulong *records,
     ulong left_slot,
-    const thread ulong *right
+    const thread ulong *right,
+    bool right_control
 ) {
     ulong left = left_slot * EVENT_WORDS;
+    if (DAYS_MECHANISMS) {
+        bool left_control = roce_control_kind(records[left + PK_KIND]);
+        if (left_control != right_control) {
+            return left_control;
+        }
+    }
     if (records[left + E_PHASE] != right[E_PHASE]) {
         return records[left + E_PHASE] < right[E_PHASE];
     }
@@ -1631,11 +1650,45 @@ inline bool source_queue_insert(
         set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
         return false;
     }
+    bool control = DAYS_MECHANISMS && roce_control_kind(record[PK_KIND]);
+    if (DAYS_MECHANISMS && control) {
+        // Decision D16b: a control packet goes after the leading run of control packets whose
+        // key is not greater, counted from the head, as Scalar's `enqueue_source_packet` counts
+        // it. The run moves one slot toward the head, so a control packet costs the queued
+        // control packets (usually none or one), never the data behind them.
+        ulong run = 0;
+        while (run < count) {
+            ulong slot = offset + (head + run) % capacity;
+            if (!roce_control_kind(records[slot * EVENT_WORDS + PK_KIND]) ||
+                !source_queue_key_less_or_equal(records, slot, record, true)) {
+                break;
+            }
+            run += 1;
+        }
+        ulong position = (head + run) % capacity;
+        if (run < count) {
+            ulong first = (head + capacity - 1) % capacity;
+            for (ulong index = 0; index < run; ++index) {
+                copy_device_record(
+                    records,
+                    offset + (head + index) % capacity,
+                    records,
+                    offset + (first + index) % capacity
+                );
+            }
+            position = (first + run) % capacity;
+            meta[base + 2] = first;
+        }
+        copy_thread_to_device(record, records, offset + position);
+        meta[base + 3] = count + 1;
+        RECORD_QUEUE_HIGH_WATER(params, meta, node, count + 1);
+        return true;
+    }
     ulong insertion = count;
     while (insertion != 0) {
         ulong previous = insertion - 1;
         ulong previous_slot = offset + (head + previous) % max(capacity, 1ul);
-        if (source_queue_key_less_or_equal(records, previous_slot, record)) {
+        if (source_queue_key_less_or_equal(records, previous_slot, record, false)) {
             break;
         }
         ulong destination = offset + (head + insertion) % max(capacity, 1ul);
@@ -5055,11 +5108,20 @@ inline void roce_settle(device ulong *row, ulong parked_status) {
 }
 
 // `restart_roce_pacer`: a parked pacer with packets to send restarts on the first point of its
-// pacing grid strictly after `now` (ruling D3). `tick` is the restarted tick's time, or NONE when
-// the pacer stays as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
-inline bool roce_restart(device ulong *row, ulong now, ulong stop, thread ulong &tick) {
+// pacing grid strictly after `now` (ruling D3), or, when `feedback` (an ACK or NACK that moved
+// `snd_una`) finds it parked by the window, at `now` on a grid re-anchored there (P18
+// window-throttle design F2). `tick` is the restarted tick's time, or NONE when the pacer stays
+// as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
+inline bool roce_restart(
+    device ulong *row,
+    ulong now,
+    ulong stop,
+    bool feedback,
+    thread ulong &tick
+) {
     tick = NONE;
     // Every restart attempt ends a window park (ruling D7).
+    bool window_parked = row[G_ROCE_WINDOW_PARKED] != 0;
     row[G_ROCE_WINDOW_PARKED] = 0;
     ulong total = row[G_RATE_TOTAL];
     if (row[G_ROCE_PACER_ARMED] != 0 || row[G_ROCE_NEXT_PSN] >= total ||
@@ -5069,7 +5131,11 @@ inline bool roce_restart(device ulong *row, ulong now, ulong stop, thread ulong 
     ulong first = row[G_RATE_FIRST];
     ulong interval = row[G_RATE_INTERVAL];
     ulong time = first;
-    if (now >= first) {
+    if (feedback && window_parked) {
+        // F2: the tick runs at the feedback's instant, on a grid anchored there.
+        row[G_RATE_FIRST] = now;
+        time = now;
+    } else if (now >= first) {
         // The 128-bit product, not a `> NONE / interval` test: LLVM folds that test into a 64-bit
         // multiply-with-overflow, which Apple's GPU backend cannot legalize.
         ulong ticks = (now - first) / interval;
@@ -5355,7 +5421,7 @@ inline bool roce_feedback_arrival(
                 row[G_ROCE_RTO_DEADLINE] = 0;
             }
         }
-        if (!roce_restart(row, now, params[P_STOP_TIME], tick)) {
+        if (!roce_restart(row, now, params[P_STOP_TIME], true, tick)) {
             set_semantic_error(error, 84, node);
             return false;
         }
@@ -5416,7 +5482,7 @@ inline bool roce_timeout(
     ulong timeout;
     ulong tick;
     if (!checked_add(now, row[G_ROCE_RTO], timeout) ||
-        !roce_restart(row, now, params[P_STOP_TIME], tick)) {
+        !roce_restart(row, now, params[P_STOP_TIME], false, tick)) {
         set_semantic_error(error, 85, node);
         return false;
     }
@@ -5658,7 +5724,7 @@ inline bool roce_resume_parked(
             // A phase-0 transition: the controller's due instants before the RESUME apply first.
             dcqcn_materialize_if_due(generator, false, event[E_TIME]);
             ulong tick;
-            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
+            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], false, tick)) {
                 set_semantic_error(error, 88, node);
                 return false;
             }

@@ -1,0 +1,53 @@
+# P18 ackfix (window-throttle design F1 and F2, user-approved Oct 13; days-gpu
+# evidence/P18/window-throttle/design.md section 3): two hosts that each send a RoCE queue pair to
+# the other through one switch, so each host's NIC queue holds its own paced data while it
+# acknowledges the other pair. Both pairs pace at the 1 Gbps line rate (no congestion control),
+# 1,000 B packets, one ACK per packet; the pacer pushes data into the host FIFO, and every ACK the
+# host sends delays that data, so data waits in the FIFO when the next ACK is queued. A 16,000 B
+# window binds once the round trip grows, so window parks and their ACK-clocked restarts occur.
+# Contract (tests/p18_ack_first.rs): a RoCE ACK queued while data waits departs before that data
+# (F1, non-preemptive); a window-parked pacer restarts at the instant of the ACK that reopens it
+# (F2); both pairs complete; CPU and the devices match Scalar; a checkpoint whose host queue holds
+# an ACK ahead of data resumes exactly.
+seed = 42
+edges = [[0, 1], [1, 2]]
+hosts = [0, 2]
+duration = 0.01
+
+[switch]
+port_rate = 1000000000
+capacity = 1000
+discipline = "FIFO"
+drop = "TailDrop"
+
+[[flow]]
+flow_type = "RoCE"
+priority = 3
+graph = [[0, 2]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 400000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.roce]
+congestion_control = "none"
+retransmit_timeout_ns = 0
+window_bytes = 16000
+
+[[flow]]
+flow_type = "RoCE"
+priority = 3
+graph = [[2, 0]]
+
+[flow.traffic]
+initial_delay = 0.0
+size = 400000
+arr_dist = { type = "Uniform", low = 1, high = 1 }
+pkt_size_dist = { type = "DiscreteUniform", low = 1000, high = 1000 }
+
+[flow.traffic.roce]
+congestion_control = "none"
+retransmit_timeout_ns = 0
+window_bytes = 16000

@@ -541,14 +541,16 @@ fn scalar_anchor(name: &str) -> (u64, u64) {
 /// anchor re-frozen at P16 ecnramp (2026-10-08, Mac) for the byte ECN step; with `drop_mark`
 /// normalized, `roce_cnp_under_pfc` and `roce_feedback_priority` mark fewer data packets (ACKs now
 /// count their 60 B toward the 50,000 B step) and the rest are unchanged
-/// (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`).
+/// (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`). P18 ackfix (2026-10-13, Mac) re-froze
+/// `roce_cnp_under_pfc` and `roce_feedback_priority` for decision D16b: their hosts both send and
+/// acknowledge, and their ACKs now lead the host queue (`days-gpu/evidence/P18/ackfix/`).
 const ANCHORS: [(&str, u64, u64); 7] = [
     ("roce_lossless_pfc.toml", 46_261, 0xaa03_bbd8_1cd7_b0c5),
     ("roce_gbn_lossy.toml", 46_488, 0x9159_37dc_3c0c_15fb),
     ("roce_timeout.toml", 35_202, 0xf44b_63d3_0ee8_dda7),
     ("roce_nack_only.toml", 35_181, 0xdd48_bebf_f7f0_7cb1),
-    ("roce_cnp_under_pfc.toml", 57_734, 0x3c48_4c47_67f1_0add),
-    ("roce_feedback_priority.toml", 57_735, 0xd800_ffac_5e0b_8d64),
+    ("roce_cnp_under_pfc.toml", 57_734, 0x53db_c9e5_6ced_42d3),
+    ("roce_feedback_priority.toml", 57_735, 0xcfc7_1a67_970b_d572),
     ("roce_mixed_tcp.toml", 52_647, 0x435d_d558_548d_35aa),
 ];
 

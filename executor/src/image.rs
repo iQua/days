@@ -751,7 +751,9 @@ pub struct RoceGenerator {
     pub variable_window: bool,
     /// The pacer is parked because a tick found the window closed, and no restart has run since.
     /// Only an ACK or NACK that moves `snd_una`, or a timeout, restarts such a pacer; a host
-    /// RESUME does not (it restarts pause-parked pacers), so the bit keeps the two apart.
+    /// RESUME does not (it restarts pause-parked pacers), so the bit keeps the two apart. The
+    /// ACK or NACK restarts it at its own instant and re-anchors the pacing grid there (P18
+    /// window-throttle design F2); a timeout restarts it on the old grid (ruling D3).
     pub window_parked: bool,
     /// P17: DCQCN, or no congestion control.
     pub congestion_control: RoceCongestionControl,
@@ -1080,6 +1082,18 @@ impl PacketKind {
                 | Self::DcqcnCnp(_)
                 | Self::RoceAck(_)
                 | Self::RoceNack(_)
+        )
+    }
+
+    /// A RoCE ACK, a RoCE NACK or a DCQCN CNP: the control packets a host NIC serves ahead of
+    /// every other queued packet (P18 decision D16b), and exactly the kinds
+    /// [`FlowDescriptor::packet_priority`] sends on `feedback_priority`. Not `is_feedback`, which
+    /// also holds TCP ACKs, PFC frames and constant-generator feedback.
+    #[inline(always)]
+    pub const fn is_roce_control(self) -> bool {
+        matches!(
+            self,
+            Self::RoceAck(_) | Self::RoceNack(_) | Self::DcqcnCnp(_)
         )
     }
 

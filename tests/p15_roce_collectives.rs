@@ -408,7 +408,7 @@ fn check_stage_rules(name: &str, image: &SimulationImage, result: &RunResult) {
             first.before.rto_deadline_ns, None,
             "{name}: no timer before a send"
         );
-        assert_eq!(first.first_pacing_time_ns, first.key.time_ns, "{name}");
+        assert_eq!(first.before.grid_anchor_ns, first.key.time_ns, "{name}");
         // A released stage's first tick is its release; a root's is the initial delay.
         if let Some(&released) = activations.get(flow) {
             assert_eq!(first.key.time_ns, released, "{name}");
@@ -693,7 +693,6 @@ pkt_size_dist = {{ type = "DiscreteUniform", low = 1000, high = 1000 }}
                             row.key.phase,
                             row.kind,
                             row.class_paused,
-                            row.first_pacing_time_ns,
                             row.rate_bps,
                             row.input_acknowledgment,
                             row.emitted.map(|emitted| {
@@ -818,29 +817,32 @@ fn fingerprint(value: &impl std::fmt::Debug) -> (u64, u64) {
 /// counted stage dependencies, which change only the stage records' rendering
 /// (`days-gpu/evidence/P16/collops-impl/semantic-identity-r1.txt`); re-frozen at P16 ecnramp
 /// (2026-10-08, Mac) for the byte ECN step, which changes only the queues' `drop_mark` rendering
-/// here (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`).
+/// here (`days-gpu/evidence/P16/ecnramp/refreeze-compare-c6.txt`); re-frozen at P18 ackfix
+/// (2026-10-13, Mac) for decision D16b (every ring host sends and acknowledges, and its ACKs now lead
+/// its NIC queue), with `roce_ring_release_paused` re-tuned (its background pair starts at 100 us)
+/// (`days-gpu/evidence/P18/ackfix/`).
 const ANCHORS: [(&str, u64, u64); 6] = [
     (
         "roce_ring_allreduce_lossless.toml",
-        190_023,
-        0x7991_1130_0edc_753d,
+        190_022,
+        0x4a9f_b9b2_59df_36bf,
     ),
     (
         "roce_allgather_lossless.toml",
         122_162,
-        0xa7d6_51e8_b84f_7b01,
+        0x8ad2_3f0d_d194_e2c6,
     ),
-    ("roce_ring_lossy.toml", 179_008, 0x62fd_2636_40b6_c9c1),
-    ("roce_compute_dag.toml", 208_285, 0xb946_2a2b_3cbe_0b26),
+    ("roce_ring_lossy.toml", 178_209, 0x76e1_0dbe_9c01_eec7),
+    ("roce_compute_dag.toml", 208_284, 0x1eb2_9ae4_dadc_5fa1),
     (
         "roce_tcp_mixed_collectives.toml",
         136_572,
-        0xbd42_30ab_406e_c194,
+        0x4a52_12d7_577b_8450,
     ),
     (
         "roce_ring_release_paused.toml",
-        193_977,
-        0xcee3_a626_84e9_2076,
+        193_970,
+        0xed99_648e_b41c_6a49,
     ),
 ];
 

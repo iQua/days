@@ -1570,12 +1570,33 @@ __device__ __forceinline__ bool queue_push(
     return true;
 }
 
+// P18 decision D16b (window-throttle design F1): a RoCE ACK, RoCE NACK or DCQCN CNP, the kinds
+// `pfc_class_of` sends on the feedback class (Scalar `PacketKind::is_roce_control`), from the kind
+// word with the ECN flag masked.
+__device__ __forceinline__ bool roce_control_kind(ulong kind_word) {
+    ulong kind = kind_word & PK_KIND_MASK;
+    return kind == DCQCN_CNP_PACKET || kind == ROCE_ACK_PACKET || kind == ROCE_NACK_PACKET;
+}
+
+// Scalar `enqueue_source_packet`'s key `(rank, has_source_time, source_time_ns, flow, id)`: the
+// source time and its presence are `E_TIME` and `E_PHASE` (a restored packet holds phase 0). The
+// rank (decision D16b) puts control packets ahead of every other packet; only the mechanisms
+// kernel can hold one, so the plain kernel compiles it out. `right_control` is the inserted
+// record's.
+template <bool MECHANISMS>
 __device__ __forceinline__ bool source_queue_key_less_or_equal(
     const ulong *records,
     ulong left_slot,
-    const ulong *right
+    const ulong *right,
+    bool right_control
 ) {
     ulong left = left_slot * EVENT_WORDS;
+    if (MECHANISMS) {
+        bool left_control = roce_control_kind(records[left + PK_KIND]);
+        if (left_control != right_control) {
+            return left_control;
+        }
+    }
     if (records[left + E_PHASE] != right[E_PHASE]) {
         return records[left + E_PHASE] < right[E_PHASE];
     }
@@ -1588,6 +1609,7 @@ __device__ __forceinline__ bool source_queue_key_less_or_equal(
     return records[left + PK_ID] <= right[PK_ID];
 }
 
+template <bool MECHANISMS>
 __device__ __forceinline__ bool source_queue_insert(
     ulong node,
     const ulong *record,
@@ -1604,11 +1626,44 @@ __device__ __forceinline__ bool source_queue_insert(
         set_capacity_error(error, ARENA_QUEUE, node, capacity, count + 1);
         return false;
     }
+    bool control = MECHANISMS && roce_control_kind(record[PK_KIND]);
+    if (MECHANISMS && control) {
+        // Decision D16b: a control packet goes after the leading run of control packets whose
+        // key is not greater, counted from the head, as Scalar's `enqueue_source_packet` counts
+        // it. The run moves one slot toward the head, so a control packet costs the queued
+        // control packets (usually none or one), never the data behind them.
+        ulong run = 0;
+        while (run < count) {
+            ulong slot = offset + (head + run) % capacity;
+            if (!roce_control_kind(records[slot * EVENT_WORDS + PK_KIND]) ||
+                !source_queue_key_less_or_equal<MECHANISMS>(records, slot, record, true)) {
+                break;
+            }
+            run += 1;
+        }
+        ulong position = (head + run) % capacity;
+        if (run < count) {
+            ulong first = (head + capacity - 1) % capacity;
+            for (ulong index = 0; index < run; ++index) {
+                copy_device_record(
+                    records,
+                    offset + (head + index) % capacity,
+                    records,
+                    offset + (first + index) % capacity
+                );
+            }
+            position = (first + run) % capacity;
+            meta[base + 2] = first;
+        }
+        copy_thread_to_device(record, records, offset + position);
+        meta[base + 3] = count + 1;
+        return true;
+    }
     ulong insertion = count;
     while (insertion != 0) {
         ulong previous = insertion - 1;
         ulong previous_slot = offset + (head + previous) % max(capacity, 1ul);
-        if (source_queue_key_less_or_equal(records, previous_slot, record)) {
+        if (source_queue_key_less_or_equal<MECHANISMS>(records, previous_slot, record, false)) {
             break;
         }
         ulong destination = offset + (head + insertion) % max(capacity, 1ul);
@@ -4133,6 +4188,7 @@ __device__ __forceinline__ bool tcp_receive_range(
     return true;
 }
 
+template <bool MECHANISMS>
 __device__ __forceinline__ bool tcp_enqueue_attempt(
     ulong node,
     ulong flow,
@@ -4169,7 +4225,7 @@ __device__ __forceinline__ bool tcp_enqueue_attempt(
     packet[PK_META_1] = now_ns;
     packet[PK_META_2] = ulong(retransmission);
     if (!tcp_ledger_insert(flow, packet, error, params, tcp_state) ||
-        !source_queue_insert(node, packet, error, queue_meta, queue_records) ||
+        !source_queue_insert<MECHANISMS>(node, packet, error, queue_meta, queue_records) ||
         !record_sourced(node, packet, error, params, summary, observation_meta, observed)) {
         return false;
     }
@@ -4193,6 +4249,7 @@ __device__ __forceinline__ bool tcp_enqueue_attempt(
     return true;
 }
 
+template <bool MECHANISMS>
 __device__ __forceinline__ bool prepare_tcp_attempts(
     ulong node,
     ulong flow,
@@ -4226,7 +4283,7 @@ __device__ __forceinline__ bool prepare_tcp_attempts(
             return false;
         }
         ulong size = tcp_state[record + 1];
-        if (!tcp_enqueue_attempt(
+        if (!tcp_enqueue_attempt<MECHANISMS>(
             node, flow, retransmit_sequence, size, parent[E_TIME], true, parent, error,
             params, node_state, generators, queue_meta, queue_records, summary,
             observation_meta, observed, tcp_state
@@ -4252,7 +4309,7 @@ __device__ __forceinline__ bool prepare_tcp_attempts(
             }
             generators[generator + G_TCP_NEXT] = sequence + size;
             generators[generator + G_TCP_FLIGHT] = flight + size;
-            if (!tcp_enqueue_attempt(
+            if (!tcp_enqueue_attempt<MECHANISMS>(
                 node, flow, sequence, size, parent[E_TIME], false, parent, error, params,
                 node_state, generators, queue_meta, queue_records, summary, observation_meta,
                 observed, tcp_state
@@ -4617,7 +4674,7 @@ __device__ __forceinline__ bool dcqcn_pacing_timer(
         sourced_packet[word] = event[word];
     }
     sourced_packet[E_PHASE] = 1;
-    if (!source_queue_insert(node, sourced_packet, error, queue_meta, queue_records) ||
+    if (!source_queue_insert<true>(node, sourced_packet, error, queue_meta, queue_records) ||
         !record_sourced(node, event, error, params, summary, observation_meta, observed)) {
         return false;
     }
@@ -4731,7 +4788,7 @@ __device__ __forceinline__ bool dcqcn_data_arrival(
     cnp[PK_SIZE] = receiver[DR_CNP_SIZE];
     cnp[PK_KIND] = DCQCN_CNP_PACKET;
     cnp[PK_META_0] = event[PK_ID];
-    if (!source_queue_insert(node, cnp, error, queue_meta, queue_records) ||
+    if (!source_queue_insert<true>(node, cnp, error, queue_meta, queue_records) ||
         !record_sourced(node, cnp, error, params, summary, observation_meta, observed)) {
         return false;
     }
@@ -4987,11 +5044,20 @@ __device__ __noinline__ void roce_settle(ulong *row, ulong parked_status) {
 }
 
 // `restart_roce_pacer`: a parked pacer with packets to send restarts on the first point of its
-// pacing grid strictly after `now` (ruling D3). `tick` is the restarted tick's time, or NONE when
-// the pacer stays as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
-__device__ __forceinline__ bool roce_restart(ulong *row, ulong now, ulong stop, ulong &tick) {
+// pacing grid strictly after `now` (ruling D3), or, when `feedback` (an ACK or NACK that moved
+// `snd_una`) finds it parked by the window, at `now` on a grid re-anchored there (P18
+// window-throttle design F2). `tick` is the restarted tick's time, or NONE when the pacer stays
+// as it is; a restart beyond the stop time leaves it Stopped. False on overflow.
+__device__ __forceinline__ bool roce_restart(
+    ulong *row,
+    ulong now,
+    ulong stop,
+    bool feedback,
+    ulong &tick
+) {
     tick = NONE;
     // Every restart attempt ends a window park (ruling D7).
+    bool window_parked = row[G_ROCE_WINDOW_PARKED] != 0;
     row[G_ROCE_WINDOW_PARKED] = 0;
     ulong total = row[G_RATE_TOTAL];
     if (row[G_ROCE_PACER_ARMED] != 0 || row[G_ROCE_NEXT_PSN] >= total ||
@@ -5001,7 +5067,11 @@ __device__ __forceinline__ bool roce_restart(ulong *row, ulong now, ulong stop, 
     ulong first = row[G_RATE_FIRST];
     ulong interval = row[G_RATE_INTERVAL];
     ulong time = first;
-    if (now >= first) {
+    if (feedback && window_parked) {
+        // F2: the tick runs at the feedback's instant, on a grid anchored there.
+        row[G_RATE_FIRST] = now;
+        time = now;
+    } else if (now >= first) {
         // The 128-bit product, not a `> NONE / interval` test: LLVM folds that test into a 64-bit
         // multiply-with-overflow, which Apple's GPU backend cannot legalize.
         ulong ticks = (now - first) / interval;
@@ -5199,7 +5269,7 @@ __device__ __forceinline__ bool roce_pacing_tick(
     data[PK_META_0] = psn;
     data[PK_META_1] = now;
     data[PK_META_2] = retransmission ? 1 : 0;
-    if (!source_queue_insert(node, data, error, queue_meta, queue_records) ||
+    if (!source_queue_insert<true>(node, data, error, queue_meta, queue_records) ||
         !record_sourced(node, data, error, params, summary, observation_meta, observed)) {
         return false;
     }
@@ -5287,7 +5357,7 @@ __device__ __forceinline__ bool roce_feedback_arrival(
                 row[G_ROCE_RTO_DEADLINE] = 0;
             }
         }
-        if (!roce_restart(row, now, params[P_STOP_TIME], tick)) {
+        if (!roce_restart(row, now, params[P_STOP_TIME], true, tick)) {
             set_semantic_error(error, 84, node);
             return false;
         }
@@ -5348,7 +5418,7 @@ __device__ __forceinline__ bool roce_timeout(
     ulong timeout;
     ulong tick;
     if (!checked_add(now, row[G_ROCE_RTO], timeout) ||
-        !roce_restart(row, now, params[P_STOP_TIME], tick)) {
+        !roce_restart(row, now, params[P_STOP_TIME], false, tick)) {
         set_semantic_error(error, 85, node);
         return false;
     }
@@ -5497,7 +5567,7 @@ __device__ __forceinline__ bool roce_data_arrival(
         packet, now, feedback_payload, flow, record[RR_ACK_SIZE],
         action == ROCE_ACTION_NACK ? ROCE_NACK_PACKET : ROCE_ACK_PACKET,
         record[RR_EXPECTED], event[PK_META_1], event[PK_SIZE] | echo);
-    if (!source_queue_insert(node, packet, error, queue_meta, queue_records) ||
+    if (!source_queue_insert<true>(node, packet, error, queue_meta, queue_records) ||
         !record_sourced(node, packet, error, params, summary, observation_meta, observed)) {
         return false;
     }
@@ -5591,7 +5661,7 @@ __device__ __forceinline__ bool roce_resume_parked(
             // A phase-0 transition: the controller's due instants before the RESUME apply first.
             dcqcn_materialize_if_due(generator, false, event[E_TIME]);
             ulong tick;
-            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], tick)) {
+            if (!roce_restart(generator, event[E_TIME], params[P_STOP_TIME], false, tick)) {
                 set_semantic_error(error, 88, node);
                 return false;
             }
@@ -5770,7 +5840,7 @@ __device__ __forceinline__ bool stage_release(
     ulong now = event[E_TIME];
     ulong kind = row[G_KIND];
     if (kind == 1) {
-        return prepare_tcp_attempts(
+        return prepare_tcp_attempts<true>(
             node, flow, event, false, 0, true, false, error, params, node_state, generators,
             fel_meta, fel_records, queue_meta, queue_records, remote_meta, remote_staging,
             stream_state, stream_records, summary, observation_meta, observed, tcp_state);
@@ -6216,7 +6286,8 @@ __device__ __forceinline__ bool dispatch_event(
             sourced_packet[word] = event[word];
         }
         sourced_packet[E_PHASE] = 1;
-        if (!source_queue_insert(node, sourced_packet, error, queue_meta, queue_records) ||
+        if (!source_queue_insert<MECHANISMS>(
+                node, sourced_packet, error, queue_meta, queue_records) ||
             !record_sourced(
                 node, event, error, params, summary, observation_meta, observed)) {
             return false;
@@ -6278,11 +6349,12 @@ __device__ __forceinline__ bool dispatch_event(
             }
             sourced_packet[E_PHASE] = 1;
             if (!tcp_ledger_insert(event[PK_FLOW], event, error, params, tcp_state) ||
-                !source_queue_insert(node, sourced_packet, error, queue_meta, queue_records) ||
+                !source_queue_insert<MECHANISMS>(
+                    node, sourced_packet, error, queue_meta, queue_records) ||
                 !record_sourced(node, event, error, params, summary, observation_meta, observed)) {
                 return false;
             }
-            return prepare_tcp_attempts(
+            return prepare_tcp_attempts<MECHANISMS>(
                 node, event[PK_FLOW], event, false, 0, true, false, error, params, node_state,
                 generators, fel_meta, fel_records, queue_meta, queue_records, remote_meta,
                 remote_staging, stream_state, stream_records, summary, observation_meta,
@@ -6399,7 +6471,7 @@ __device__ __forceinline__ bool dispatch_event(
             sourced_packet[word] = event[word];
         }
         sourced_packet[E_PHASE] = 1;
-        if (!source_queue_insert(
+        if (!source_queue_insert<MECHANISMS>(
             node,
             sourced_packet,
             error,
@@ -6974,7 +7046,7 @@ __device__ __forceinline__ bool dispatch_event(
         ack[PK_META_0] = tcp_state[receiver + 3];
         ack[PK_META_1] = event[PK_SIZE];
         ack[PK_META_2] = event[PK_META_1];
-        if (!source_queue_insert(node, ack, error, queue_meta, queue_records) ||
+        if (!source_queue_insert<MECHANISMS>(node, ack, error, queue_meta, queue_records) ||
             !record_sourced(node, ack, error, params, summary, observation_meta, observed)) {
             return false;
         }
@@ -7107,7 +7179,7 @@ __device__ __forceinline__ bool dispatch_event(
         if (scheduled && !retransmit) {
             return true;
         }
-        return prepare_tcp_attempts(
+        return prepare_tcp_attempts<MECHANISMS>(
             node, flow, event, retransmit, retransmit_sequence, fill && !scheduled, scheduled,
             error, params, node_state, generators, fel_meta, fel_records, queue_meta,
             queue_records, remote_meta, remote_staging, stream_state, stream_records, summary,
@@ -7152,7 +7224,7 @@ __device__ __forceinline__ bool dispatch_event(
         generators[generator + G_TCP_RTO] = min(
             saturating_mul_u64(generators[generator + G_TCP_TIMER_RTO], 2), TCP_MAX_RTO
         );
-        return prepare_tcp_attempts(
+        return prepare_tcp_attempts<MECHANISMS>(
             node, flow, event, true, generators[generator + G_TCP_HIGHEST_ACK], false, false,
             error, params, node_state, generators, fel_meta, fel_records, queue_meta,
             queue_records, remote_meta, remote_staging, stream_state, stream_records, summary,

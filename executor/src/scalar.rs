@@ -3345,7 +3345,7 @@ impl<'image> TransitionState<'image> {
                         roce.controller,
                     )));
                 }
-                let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+                let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns, false)?;
                 settle_roce_sender(generator, &roce, generator.next_emission.status);
                 generator.kind = FlowGeneratorKind::Roce(roce);
                 records.push(roce_sender_record(
@@ -4897,7 +4897,7 @@ impl<'image> TransitionState<'image> {
                         roce.rto_deadline_ns = 0;
                     }
                 }
-                tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+                tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns, true)?;
             }
             // A pair without congestion control (P17) has no controller to freeze or feed: its
             // inert controller is never armed, and its sender ignores the ECN echo, so neither
@@ -5099,7 +5099,7 @@ impl<'image> TransitionState<'image> {
                 .checked_add(roce.rto_ns)
                 .ok_or(ExecutionError::GeneratorTimeOverflow(flow))?;
             roce.rto_deadline_ns = deadline;
-            let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns)?;
+            let tick_ns = restart_roce_pacer(generator, &mut roce, now, stop_time_ns, false)?;
             settle_roce_sender(generator, &roce, generator.next_emission.status);
             generator.kind = FlowGeneratorKind::Roce(roce);
             leave_parked_list(state.pfc, data_class, position, generator, &roce);
@@ -6716,7 +6716,7 @@ impl<'image> TransitionState<'image> {
             .and_then(|resident| resident.source_time_ns)
             .ok_or(ExecutionError::UnknownPacket(payload))?;
         let slot = self.local_state_slot(node)?;
-        let position = self
+        let queue = &self
             .hosts
             .slices()
             .0
@@ -6726,19 +6726,62 @@ impl<'image> TransitionState<'image> {
                 kind: node.kind,
                 state_slot: node.state_slot,
             })?
-            .queue
-            .iter()
-            .rposition(|queued| {
-                self.packets.get(queued).is_some_and(|resident| {
-                    (
-                        u8::from(resident.source_time_ns.is_some()),
-                        resident.source_time_ns.unwrap_or(0),
-                        resident.descriptor.flow,
-                        resident.descriptor.id,
-                    ) <= (1, source_time_ns, packet.flow, packet.id)
+            .queue;
+        // The queue key is `(rank, has_source_time, source_time_ns, flow, id)`. P18 decision D16b
+        // (window-throttle design F1): the rank is 0 for a RoCE ACK, RoCE NACK or DCQCN CNP and 1
+        // for every other packet, so control packets are served ahead of every queued packet,
+        // non-preemptively (the packet in service has left the queue) and in the old order among
+        // themselves. The rank is derived from the kind, never stored: a checkpoint restore
+        // resets only the source time, so a restored packet keys as `(rank, 0, 0, ..)`.
+        let key = (1, source_time_ns, packet.flow, packet.id);
+        let queued_key = |resident: &ResidentPacket| {
+            (
+                u8::from(resident.source_time_ns.is_some()),
+                resident.source_time_ns.unwrap_or(0),
+                resident.descriptor.flow,
+                resident.descriptor.id,
+            )
+        };
+        let position = if packet.kind.is_roce_control() {
+            // After the leading run of control packets whose key is not greater, counted from the
+            // head: the control packets lead the queue, so this costs the queued control packets
+            // (usually none or one), never the data behind them (window-throttle design §3.5).
+            // Every backend counts the same run (the device kernels' `source_queue_insert`).
+            #[cfg(feature = "planner-test-hooks")]
+            let mut inspected = 0_u64;
+            let position = queue
+                .iter()
+                .position(|queued| {
+                    #[cfg(feature = "planner-test-hooks")]
+                    {
+                        inspected += 1;
+                    }
+                    !self.packets.get(queued).is_some_and(|resident| {
+                        resident.descriptor.kind.is_roce_control() && queued_key(resident) <= key
+                    })
                 })
-            })
-            .map_or(0, |position| position + 1);
+                .unwrap_or(queue.len());
+            #[cfg(feature = "planner-test-hooks")]
+            note_control_insert(inspected, queue.len());
+            position
+        } else {
+            // After the last packet from the tail whose key is not greater; a queued control
+            // packet ranks first, so the scan stops at it. The tail itself is that packet unless
+            // packets were sourced at this instant with greater keys, so it is tested first.
+            let precedes = |queued: &PayloadId| {
+                self.packets.get(queued).is_some_and(|resident| {
+                    resident.descriptor.kind.is_roce_control() || queued_key(resident) <= key
+                })
+            };
+            if queue.back().is_none_or(precedes) {
+                queue.len()
+            } else {
+                queue
+                    .iter()
+                    .rposition(precedes)
+                    .map_or(0, |position| position + 1)
+            }
+        };
         let state = self.host_state_mut(node)?;
         if position < state.queue.len() {
             state.queue.insert(position, payload);
@@ -7725,26 +7768,79 @@ fn settle_roce_sender(
     generator.feedback.unacknowledged_bytes = outstanding;
 }
 
+#[cfg(feature = "planner-test-hooks")]
+std::thread_local! {
+    /// Test-only (P18 ackfix): the control-packet insertions into host queues on this thread
+    /// (a Scalar run's), the queued packets each inspected, and the deepest queue one met.
+    static CONTROL_INSERTS: std::cell::Cell<ControlInsertScans> =
+        const { std::cell::Cell::new(ControlInsertScans { inserts: 0, inspected: 0, deepest_queue: 0 }) };
+}
+
+/// Test-only (P18 ackfix, window-throttle design §3.5): what placing control packets (RoCE ACKs
+/// and NACKs, DCQCN CNPs) in host queues cost on this thread.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ControlInsertScans {
+    /// Control packets placed in a host queue.
+    pub inserts: u64,
+    /// Queued packets inspected to place them.
+    pub inspected: u64,
+    /// The longest queue one was placed in.
+    pub deepest_queue: u64,
+}
+
+#[cfg(feature = "planner-test-hooks")]
+fn note_control_insert(inspected: u64, queue_len: usize) {
+    CONTROL_INSERTS.with(|cell| {
+        let mut scans = cell.get();
+        scans.inserts += 1;
+        scans.inspected += inspected;
+        scans.deepest_queue = scans.deepest_queue.max(queue_len as u64);
+        cell.set(scans);
+    });
+}
+
+/// Test-only (P18 ackfix): this thread's control-packet insertions since the last call; resets
+/// them.
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub fn take_control_insert_scans_for_testing() -> ControlInsertScans {
+    CONTROL_INSERTS.take()
+}
+
 /// Restarts a parked pacer that has packets to send again, on its next grid point after `now_ns`
-/// (ruling D3). Returns the tick to emit, or `None` when the pacer stays as it is; a restart
-/// beyond the stop time leaves it `Stopped` there.
+/// (ruling D3), or, when `feedback` (an ACK or NACK that moved `snd_una`) finds it parked by the
+/// window, at `now_ns` on a grid re-anchored there (P18 window-throttle design F2: ACK-clocked).
+/// Returns the tick to emit, or `None` when the pacer stays as it is; a restart beyond the stop
+/// time leaves it `Stopped` there.
 fn restart_roce_pacer(
     generator: &mut crate::FlowGeneratorState,
     roce: &mut crate::RoceGenerator,
     now_ns: u64,
     stop_time_ns: u64,
+    feedback: bool,
 ) -> Result<Option<u64>, ExecutionError> {
     // Every restart attempt ends a window park (ruling D7): it runs only for an ACK or NACK that
     // moves `snd_una` and for a timeout, whatever it then finds.
-    roce.window_parked = false;
+    let window_parked = std::mem::replace(&mut roce.window_parked, false);
     if roce.pacer_armed
         || roce.next_psn >= roce.pacer.total_bytes
         || roce.snd_una >= roce.pacer.total_bytes
     {
         return Ok(None);
     }
-    let time_ns = crate::roce::restart_time_ns(roce, now_ns)
-        .ok_or(ExecutionError::GeneratorTimeOverflow(generator.flow))?;
+    let time_ns = if feedback && window_parked {
+        // F2: the tick runs at the feedback's instant, after it (a pacing timer is phase 1), and
+        // credits one interval as every tick does. The window-blocked tick that parked the pacer
+        // credited nothing and lay at least one interval after the last crediting tick, so
+        // crediting ticks stay at least one interval apart.
+        roce.pacer.first_pacing_time_ns = now_ns;
+        now_ns
+    } else {
+        crate::roce::restart_time_ns(roce, now_ns)
+            .ok_or(ExecutionError::GeneratorTimeOverflow(generator.flow))?
+    };
     generator.next_emission.departure_time_ns = time_ns;
     if time_ns <= stop_time_ns {
         roce.pacer_armed = true;
@@ -7841,7 +7937,6 @@ fn roce_sender_record(
             mtu_bytes: roce.pacer.mtu_bytes,
             total_bytes: roce.pacer.total_bytes,
             pacing_interval_ns: roce.pacer.pacing_interval_ns,
-            first_pacing_time_ns: roce.pacer.first_pacing_time_ns,
             rto_ns: roce.rto_ns,
             window_bytes: roce.window_bytes,
             variable_window: roce.variable_window,

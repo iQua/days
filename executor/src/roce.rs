@@ -98,7 +98,9 @@ pub(crate) fn settled_status(
 
 /// The grid point at which a parked pacer restarts after a rewind at `now_ns`: the first point of
 /// its pacing grid strictly after `now_ns` (design note D3), so a restart never shares the rewind's
-/// instant and no credit accrues while parked. `None` on overflow.
+/// instant and no credit accrues while parked. `None` on overflow. A pacer the window parked and
+/// an ACK or NACK restarts is the exception: it restarts at the feedback's instant, on a grid
+/// re-anchored there (P18 window-throttle design F2, `scalar::restart_roce_pacer`).
 pub(crate) fn restart_time_ns(roce: &RoceGenerator, now_ns: u64) -> Option<u64> {
     let first = roce.pacer.first_pacing_time_ns;
     let interval = roce.pacer.pacing_interval_ns;
@@ -254,6 +256,10 @@ pub struct RoceSenderView {
     /// The pending tick's time while armed, or the beyond-stop tick while stopped.
     pub next_tick_ns: Option<u64>,
     pub status: GeneratorStatus,
+    /// The pacing grid's anchor, `RocePacer::first_pacing_time_ns` (qp-schema Amendment 8): state,
+    /// since an ACK or NACK that restarts a window-parked pacer re-anchors it at its own instant
+    /// (P18 window-throttle design F2). It sits in the view's tail padding.
+    pub grid_anchor_ns: u64,
 }
 
 impl RoceSenderView {
@@ -277,6 +283,7 @@ impl RoceSenderView {
             next_tick_ns: (pacer != RocePacerState::Parked)
                 .then_some(generator.next_emission.departure_time_ns),
             status: generator.next_emission.status,
+            grid_anchor_ns: roce.pacer.first_pacing_time_ns,
         }
     }
 }
@@ -330,7 +337,6 @@ pub struct RoceSenderRecord {
     pub mtu_bytes: u64,
     pub total_bytes: u64,
     pub pacing_interval_ns: u64,
-    pub first_pacing_time_ns: u64,
     pub rto_ns: u64,
     /// The window configuration (Amendment 6): `window_bytes` (0: none), `variable_window`, and
     /// the controller's maximum rate, which scales a variable window.

@@ -11,7 +11,8 @@ A queue pair is a reliable DCQCN flow: its Mellanox-form controller stays DCQCN'
 amendments, with P16's ECN echo (`days-gpu/evidence/P16/dcqcn-design.md` §3, rulings D4-D6): the
 receiver sends no CNP, and each ACK or NACK echoes the CE mark of the data packet that triggered
 it. The record views mirror the schema pinned in `days-gpu/plans/briefs/p15/qp-schema.md` with
-its Amendment 6.
+its Amendments 6, 7 and 8 (P18: the pacing-grid anchor is sender state, re-anchored by the
+ACK-clocked restart of a window-parked pacer; `days-gpu/evidence/P18/ackfix/`).
 
 A PSN is the byte offset of a packet's first byte. Packet `psn` is `min(mtu, total - psn)` bytes,
 and every PSN the sender can name is a packet boundary (§1).
@@ -171,7 +172,6 @@ structure SenderConfig where
   mtuBytes : Nat
   totalBytes : Nat
   pacingIntervalNs : Nat
-  firstPacingTimeNs : Nat
   /-- The fixed retransmission timeout; `0` means the timeout is off (§5 step 11). -/
   rtoNs : Nat
   /-- P16 ruling D7 (Amendment 6): the window in bytes; `0` means no window. -/
@@ -194,6 +194,10 @@ The sender state exactly as one record views it (`RoceSenderView`).
 * `nextTickNs` is present iff the pacer is not parked: the pending tick while armed, the
   beyond-stop tick while stopped. A parked pacer's last departure is never read again (a restart
   overwrites it), so the view is the complete state of the reliability layer.
+* `gridAnchorNs` anchors the pacing grid (qp-schema Amendment 8, P18 window-throttle F2): the
+  configured first tick, until an ACK or NACK restarts a window-parked pacer and re-anchors the
+  grid at its own instant. The sender CSV carries it before the transition in
+  `first_pacing_time_ns` and after it in `after_grid_anchor_ns`.
 -/
 structure SenderState where
   nextPsn : Nat
@@ -206,6 +210,7 @@ structure SenderState where
   pacer : Pacer
   nextTickNs : Option Nat
   status : Status
+  gridAnchorNs : Nat
   deriving DecidableEq, Repr
 
 /-- The data packet a pacing tick sends. -/
@@ -233,9 +238,9 @@ def tickCredit (config : SenderConfig) (rateBps : Nat) : Nat :=
 def boundary (config : SenderConfig) (psn : Nat) : Bool :=
   psn % config.mtuBytes = 0 || psn = config.totalBytes
 
-def onGrid (config : SenderConfig) (timeNs : Nat) : Bool :=
-  config.firstPacingTimeNs ≤ timeNs &&
-    (timeNs - config.firstPacingTimeNs) % config.pacingIntervalNs = 0
+/-- `timeNs` lies on the pacing grid anchored at `anchorNs` (Amendment 8: the anchor is state). -/
+def onGrid (config : SenderConfig) (anchorNs timeNs : Nat) : Bool :=
+  anchorNs ≤ timeNs && (timeNs - anchorNs) % config.pacingIntervalNs = 0
 
 def validSenderConfig (config : SenderConfig) : Bool :=
   config.mtuBytes > 0 &&
@@ -244,7 +249,6 @@ def validSenderConfig (config : SenderConfig) : Bool :=
     config.totalBytes ≤ maxU64 &&
     config.pacingIntervalNs > 0 &&
     config.pacingIntervalNs ≤ maxU64 &&
-    config.firstPacingTimeNs ≤ maxU64 &&
     config.rtoNs ≤ maxU64 &&
     config.windowBytes ≤ maxU64 &&
     config.maximumRateBps ≤ maxU64 &&
@@ -265,8 +269,9 @@ def validSenderState (config : SenderConfig) (state : SenderState) : Bool :=
     state.creditQuanta ≤ maxU128 &&
     state.rtoDeadlineNs.isSome = (config.rtoNs != 0 && state.sndUna < state.bytesEmitted) &&
     state.rtoDeadlineNs.all (· ≤ maxU64) &&
+    state.gridAnchorNs ≤ maxU64 &&
     state.nextTickNs.isSome = (state.pacer != .parked) &&
-    state.nextTickNs.all (fun tick => tick ≤ maxU64 && onGrid config tick) &&
+    state.nextTickNs.all (fun tick => tick ≤ maxU64 && onGrid config state.gridAnchorNs tick) &&
     (state.pacer = .stopped) == (state.status = .stopped) &&
     (state.status = .finished) == (state.sndUna = config.totalBytes) &&
     (state.pacer != .parked || state.status = .blocked || state.status = .finished)
@@ -353,8 +358,9 @@ def statusThreshold (config : SenderConfig) (state : SenderState) : Option Nat :
   else
     none
 
-/-- §5 step 1: the state before the first pacing tick, at `first_pacing_time_ns`. -/
-def initialSender (config : SenderConfig) (rateBps : Nat) : SenderState :=
+/-- §5 step 1: the state before the first pacing tick, at the configured first tick
+`firstPacingTimeNs`, which anchors the grid. -/
+def initialSender (config : SenderConfig) (firstPacingTimeNs rateBps : Nat) : SenderState :=
   let state : SenderState :=
     { nextPsn := 0
       sndUna := 0
@@ -363,17 +369,17 @@ def initialSender (config : SenderConfig) (rateBps : Nat) : SenderState :=
       creditQuanta := 0
       rtoDeadlineNs := none
       pacer := .armed
-      nextTickNs := some config.firstPacingTimeNs
-      status := .blocked }
+      nextTickNs := some firstPacingTimeNs
+      status := .blocked
+      gridAnchorNs := firstPacingTimeNs }
   { state with status := armedStatus config rateBps state }
 
-/-- §5 step 3 (D3): the first grid point strictly after `timeNs`. -/
-def restartTime (config : SenderConfig) (timeNs : Nat) : Nat :=
-  if timeNs < config.firstPacingTimeNs then
-    config.firstPacingTimeNs
+/-- §5 step 3 (D3): the first point strictly after `timeNs` of the grid anchored at `anchorNs`. -/
+def restartTime (config : SenderConfig) (anchorNs timeNs : Nat) : Nat :=
+  if timeNs < anchorNs then
+    anchorNs
   else
-    config.firstPacingTimeNs +
-      ((timeNs - config.firstPacingTimeNs) / config.pacingIntervalNs + 1) * config.pacingIntervalNs
+    anchorNs + ((timeNs - anchorNs) / config.pacingIntervalNs + 1) * config.pacingIntervalNs
 
 /--
 The result of a sender transition. `stopQuery` is the one tick time the transition compared with
@@ -387,16 +393,22 @@ structure SenderResult where
 
 /--
 §5 step 3: a rewind restarts a pacer that is not armed and has packets to send again, on the next
-grid point after `timeNs`; beyond the stop time it stays `stopped` there. A completed queue pair
-never restarts.
+grid point after `timeNs` (D3); beyond the stop time it stays `stopped` there. A completed queue
+pair never restarts.
+
+Amendment 8 (P18 window-throttle F2): `ackClocked` (an ACK or NACK that moves `snd_una` finds the
+pacer parked by the window) restarts it at `timeNs` itself, on a grid re-anchored there; the tick
+runs after the feedback, a pacing timer being phase 1.
 -/
-def restart (config : SenderConfig) (timeNs : Nat) (withinStop : Bool) (state : SenderState) :
-    SenderState × Option Nat :=
+def restart (config : SenderConfig) (timeNs : Nat) (withinStop : Bool) (ackClocked : Bool)
+    (state : SenderState) : SenderState × Option Nat :=
   if state.pacer = .armed || state.nextPsn ≥ config.totalBytes ||
       state.sndUna ≥ config.totalBytes then
     (state, none)
   else
-    let tick := restartTime config timeNs
+    let anchor := if ackClocked then timeNs else state.gridAnchorNs
+    let tick := if ackClocked then timeNs else restartTime config anchor timeNs
+    let state := { state with gridAnchorNs := anchor }
     if withinStop then
       ({ state with pacer := .armed, nextTickNs := some tick }, some tick)
     else
@@ -469,8 +481,8 @@ def onPausedTick (config : SenderConfig) (rateBps : Nat) (state : SenderState) :
 /--
 P16 ruling D7 (Amendment 6): a pacing tick that finds the window closed at the rate as of the tick
 sends nothing, adds no credit and parks, as a paused tick does; only an ACK or NACK that moves
-`snd_una`, or a timeout, restarts it (`onFeedback`, `onTimeout`), never a host RESUME. The caller
-checks the window.
+`snd_una` (at its own instant, Amendment 8), or a timeout (on the grid), restarts it (`onFeedback`,
+`onTimeout`), never a host RESUME. The caller checks the window.
 -/
 def onWindowBlockedTick (config : SenderConfig) (rateBps : Nat) (state : SenderState) :
     SenderResult :=
@@ -485,7 +497,7 @@ caller checks that the pair was parked by a pause and that a restart happened (`
 -/
 def onResume (config : SenderConfig) (rateBps timeNs : Nat) (withinStop : Bool)
     (state : SenderState) : SenderResult :=
-  let (restarted, query) := restart config timeNs withinStop state
+  let (restarted, query) := restart config timeNs withinStop false state
   { state := settle config rateBps restarted restarted.status
     emission := none
     stopQuery := query }
@@ -496,10 +508,12 @@ def onResume (config : SenderConfig) (rateBps timeNs : Nat) (withinStop : Bool)
 * Stale (`a ≤ snd_una` for an ACK, `e < snd_una` for a NACK): nothing changes.
 * Otherwise the cumulative acknowledgment advances, `next_psn` follows it (an old copy may have
   advanced it past a rewound `next_psn`), a NACK rewinds `next_psn` to it, the timeout restarts
-  while data is outstanding and disarms otherwise, and a pacer that is not armed restarts.
+  while data is outstanding and disarms otherwise, and a pacer that is not armed restarts:
+  at `timeNs` on a grid re-anchored there when `windowParked` (a window-blocked tick parked it
+  and no restart has run since; Amendment 8, F2), else on its grid (D3).
 -/
 def onFeedback (config : SenderConfig) (rateBps timeNs acknowledgment : Nat) (nack : Bool)
-    (withinStop : Bool) (state : SenderState) : SenderResult :=
+    (withinStop : Bool) (windowParked : Bool) (state : SenderState) : SenderResult :=
   let stale := if nack then acknowledgment < state.sndUna else acknowledgment ≤ state.sndUna
   if stale then
     { state := settle config rateBps state state.status, emission := none, stopQuery := none }
@@ -508,7 +522,7 @@ def onFeedback (config : SenderConfig) (rateBps timeNs acknowledgment : Nat) (na
     let nextPsn := if nack then sndUna else max state.nextPsn sndUna
     let advanced := { state with sndUna := sndUna, nextPsn := nextPsn }
     let timed := withDeadline config advanced (some (timeNs + config.rtoNs))
-    let (restarted, query) := restart config timeNs withinStop timed
+    let (restarted, query) := restart config timeNs withinStop windowParked timed
     { state := settle config rateBps restarted restarted.status
       emission := none
       stopQuery := query }
@@ -521,7 +535,7 @@ def onTimeout (config : SenderConfig) (rateBps timeNs : Nat) (withinStop : Bool)
     (state : SenderState) : SenderResult :=
   let rewound := withDeadline config { state with nextPsn := state.sndUna }
     (some (timeNs + config.rtoNs))
-  let (restarted, query) := restart config timeNs withinStop rewound
+  let (restarted, query) := restart config timeNs withinStop false rewound
   { state := settle config rateBps restarted restarted.status
     emission := none
     stopQuery := query }

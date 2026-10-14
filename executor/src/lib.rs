@@ -181,6 +181,9 @@ pub use scalar::{
     ObservationMode, PacketArrivalObservation, PacketDeparture, RunResult, RunSummary,
     TcpTransitionInput, TcpTransitionRecord, run_scalar, run_scalar_with_observations,
 };
+#[cfg(feature = "planner-test-hooks")]
+#[doc(hidden)]
+pub use scalar::{ControlInsertScans, take_control_insert_scans_for_testing};
 pub use seeded_matrix::{RoutingSkew, SeededAllToAll};
 #[cfg(feature = "planner-test-hooks")]
 #[doc(hidden)]
